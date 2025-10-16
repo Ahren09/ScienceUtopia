@@ -58,11 +58,10 @@ class SimulationAgent:
     """Base class for simulation agents"""
 
     def __init__(self, reputation: int, funding_level: int,
-                 specializations: List[str], agent_id: str = None):
+                 agent_id: str = None):
         self.id = agent_id or f"agent_{int(time.time() * 1000)}"
         self.resources = funding_level  # Integer from 0-100 scale
         self.reputation = reputation    # 1-10 scale
-        self.specializations = specializations
         self.memory_bank = []  # Store experiences and thoughts from interactions
         self.review_experiences = []  # Track experiences as both author and reviewer
         

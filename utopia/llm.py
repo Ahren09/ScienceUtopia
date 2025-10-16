@@ -2,7 +2,6 @@ import json
 import os
 import re
 from typing import Any
-from utopia.utils.token_tracker import track_token_usage
 
 import anthropic
 import backoff
@@ -68,7 +67,6 @@ AVAILABLE_LLMS = [
         anthropic.RateLimitError,
     ),
 )
-@track_token_usage
 def get_batch_responses_from_llm(
     prompt,
     client,
@@ -180,7 +178,6 @@ def get_batch_responses_from_llm(
     return content, new_msg_history
 
 
-@track_token_usage
 def make_llm_call(client, model, temperature, system_message, prompt):
     if "gpt" in model:
         return client.chat.completions.create(

@@ -14,6 +14,7 @@ import json
 import os
 from typing import List, Dict
 import logging
+import random
 
 from utopia.agents.specialized_agents import (
     UniversityResearcher,
@@ -26,12 +27,18 @@ from utopia.agents.conference import (
     create_default_conference_system,
     Conference
 )
-from utopia.agents.research_direction import (
-    ResearchDirectionAssigner,
-    create_batch_assigner,
-    create_individual_assigner
-)
 from utopia.agents.base_agent import MultiAgentEcosystem
+
+from utopia.agents.research_direction import (
+    assign_directions_batch,
+    assign_directions_individual,
+    initialize_agent_expertise,
+    AVAILABLE_DIRECTIONS
+)
+
+from utopia.models.models import GPT
+
+from utopia.data.rag import RAG, RAGConfig
 
 # Setup logging
 logging.basicConfig(
@@ -46,25 +53,23 @@ class Simulation:
 
     def __init__(
         self,
+        llm,
         num_years: int = 5,
-        assignment_mode: str = "batch",
-        output_dir: str = "./simulation_output"
+        output_dir: str = "./simulation_output",
+        debug: bool = False
     ):
         """Initialize the simulation
 
         Args:
             num_years: Number of years to simulate
-            assignment_mode: Mode for research direction assignment - "batch" or "individual"
+            research_direction_selection_mode: Mode for research direction assignment - "batch" or "individual"
             output_dir: Directory to save simulation results
         """
-        if assignment_mode not in ["batch", "individual"]:
-            raise ValueError(f"assignment_mode must be 'batch' or 'individual', got: {assignment_mode}")
-
+        self.llm = llm
         self.num_years = num_years
-        self.assignment_mode = assignment_mode
         self.output_dir = output_dir
         self.current_year = 0
-
+        self.debug = debug
         # Create output directory
         os.makedirs(output_dir, exist_ok=True)
 
@@ -74,15 +79,6 @@ class Simulation:
             initial_paper_corpus=[]
         )
         self.conference_system = create_default_conference_system()
-        
-        research_directions
-
-        # Initialize research direction assigner based on mode
-        if assignment_mode == "batch":
-            self.direction_assigner = create_batch_assigner(research_directions)
-        else:
-            self.direction_assigner = create_individual_assigner(research_directions)
-
         # Storage for simulation data
         self.yearly_results: List[Dict] = []
 
@@ -94,7 +90,8 @@ class Simulation:
         logger.info("Initializing agent population...")
 
         # Create multiple university researchers mapped to same universities
-        universities = ["MIT", "Stanford", "Berkeley", "CMU", "Oxford"]
+        universities = ["MIT", "Stanford", "Berkeley", "CMU", "GeorgiaTech"]
+        
         
         counter = 0
         for university in universities:
@@ -103,14 +100,15 @@ class Simulation:
                 researcher = UniversityResearcher(
                     researcher_name=f"university_researcher_{counter}",
                     university_name=university,
-                    funding_level=70
+                    funding_level=70,
+                    expertise=random.sample(AVAILABLE_DIRECTIONS, 3)
                 )
                 self.ecosystem.add_agent(researcher)
                 counter += 1
-                logger.info(f"Added {researcher.researcher_name} from {university}")
+                logger.info(f"Added {researcher.id} from {university}")
 
         # Create multiple industry researchers mapped to same companies
-        companies = ["Google", "Meta", "OpenAI", "Microsoft", "DeepMind"]
+        companies = ["Google", "Meta", "OpenAI", "Microsoft", "Amazon", "IBM", "Apple", "Tesla"]
         
         counter = 0
         for company in companies:
@@ -119,10 +117,11 @@ class Simulation:
                 researcher = IndustryResearcher(
                     researcher_name=f"industry_researcher_{counter}",
                     company_name=company,
-                    funding_level=90
+                    funding_level=90,
+                    expertise=random.sample(AVAILABLE_DIRECTIONS, 3)
                 )
                 self.ecosystem.add_agent(researcher)
-                logger.info(f"Added {researcher.researcher_name} from {company}")
+                logger.info(f"Added {researcher.id} from {company}")
                 counter += 1
 
         """
@@ -130,10 +129,11 @@ class Simulation:
         for i in range(3):
             freelancer = FreelancerAgent(
                 researcher_name=f"freelancer_{counter}",
-                funding_level=5
+                funding_level=5,
+                expertise=random.sample(AVAILABLE_DIRECTIONS, 3)
             )
             self.ecosystem.add_agent(freelancer)
-            logger.info(f"Added {freelancer.researcher_name}")
+            logger.info(f"Added {freelancer.id}")
         """
 
         # Add funding agents
@@ -141,14 +141,20 @@ class Simulation:
         for agency in funding_agencies:
             funding_agent = FundingAgent(
                 agency_name=agency,
-                funding_level=100
+                funding_level=100,
+                
             )
             self.ecosystem.add_agent(funding_agent)
             logger.info(f"Added funding agent: {agency}")
 
         logger.info(f"Total agents initialized: {len(self.ecosystem.agent_population)}")
 
-    def run_year(self, year: int) -> Dict:
+        # Initialize expertise for all agents (3 research directions per agent)
+        all_agents = [agent for agent in self.ecosystem.agent_population if hasattr(agent, 'expertise_directions')]
+        initialize_agent_expertise(all_agents, num_expertise=3)
+        logger.info(f"Initialized expertise for {len(all_agents)} agents")
+
+    def run_one_round(self, year: int) -> Dict:
         """Run simulation for one year
 
         Args:
@@ -161,6 +167,9 @@ class Simulation:
         logger.info(f"YEAR {year}")
         logger.info(f"{'='*60}\n")
 
+        # Determine assignment mode based on year
+        research_direction_selection_mode = "batch" if year == 1 else "individual"
+
         year_results = {
             'year': year,
             'phases': {}
@@ -170,43 +179,81 @@ class Simulation:
         logger.info("Phase 1: Assigning research directions...")
         authors = self.ecosystem.get_available_authors()
         active_authors = [a for a in authors if a.resources >= 20]  # Filter by minimum funding
-        
-        research_directions = self.direction_assigner.available_directions
 
         if year == 1:
-            self.direction_assigner = create_batch_assigner(research_directions)
+            directions = assign_directions_batch(active_authors)
         else:
-            self.direction_assigner = create_individual_assigner(research_directions)
-            
-        assignments = self.direction_assigner.assign_directions(active_authors, year)
+            directions = assign_directions_individual(active_authors)
+
         year_results['phases']['research_assignment'] = {
-            'mode': self.assignment_mode,
-            'num_agents_assigned': len(assignments),
-            'assignment_stats': self.direction_assigner.get_assignment_statistics()
+            'mode': research_direction_selection_mode,
+            'num_agents_assigned': len(directions)
         }
 
         # Phase 2: Generate and submit papers
-        logger.info("Phase 2: Generating and submitting papers...")
+        logger.info("Phase 2: Submitting papers...")
         submitted_papers = []
-
+        
+        
+        research_ideas: List[str] = []
         for agent in active_authors:
-            if agent.id in assignments:
-                direction = assignments[agent.id]
+            idea = " ".join(directions[agent.id].keywords)
+            research_ideas.append(idea)
+            
+            
+            
+        # If RAG does not contain documents, load 
+        if year == 1:
+            self.rag.load_documents()
+        else:
+            raise NotImplementedError("Update documents")
+        
+        self.rag.build_knowledge_index()
+        
+        # Batch retrieve relevant documents for all research ideas
+        logger.info(f"Batch retrieving relevant documents for {len(research_ideas)} research ideas...")
+        batch_retrieval_results = self.rag.batch_retrieve(research_ideas, use_reranker=True)
+        
+            
+            
+        
+        
+        
+        
+        
+        
+
+        # Process each agent with their retrieved documents
+        for agent_idx, agent in enumerate(active_authors):
+            if agent.id in directions:
+                direction = directions[agent.id]
+                # Get retrieved documents for this agent's research idea
+                retrieved_docs = batch_retrieval_results[agent_idx] if agent_idx < len(batch_retrieval_results) else []
 
                 try:
                     # Generate paper based on assigned direction
                     logger.info(f"  {agent.id} researching {direction.topic}...")
+                    logger.info(f"    Retrieved {len(retrieved_docs)} relevant documents for context")
 
-                    # Create paper metadata (simplified for demonstration)
+                    # Create paper metadata with retrieved context
                     paper = {
                         'id': f"paper_{year}_{agent.id}_{int(__import__('time').time()*1000) % 10000}",
                         'title': f"Research on {direction.topic}",
                         'topics': [direction.topic] + direction.focus_areas,
                         'author_id': agent.id,
-                        'author_name': getattr(agent, 'researcher_name', agent.id),
-                        'affiliation': getattr(agent, 'university_name', None) or getattr(agent, 'company_name', 'Independent'),
+                        'author_name': getattr(agent, 'agent_id', agent.id),
+                        'affiliation': getattr(agent, 'university_name', None) or getattr(agent, 'company_name', None),
                         'year': year,
-                        'direction': direction
+                        'direction': direction,
+                        'retrieved_context': [
+                            {
+                                'title': doc.metadata.get('title', ''),
+                                'summary': doc.page_content[:200] + '...' if len(doc.page_content) > 200 else doc.page_content,
+                                'authors': doc.metadata.get('authors', ''),
+                                'relevance_score': getattr(doc, 'relevance_score', 0.0)
+                            }
+                            for doc in retrieved_docs[:3]  # Include top 3 most relevant documents
+                        ]
                     }
 
                     # Submit to appropriate conference
@@ -320,14 +367,19 @@ class Simulation:
     def run(self):
         """Run the complete simulation"""
         logger.info("Starting Academic Ecosystem Simulation")
-        logger.info(f"Configuration: {self.num_years} years, {self.assignment_mode} mode")
+        logger.info(f"Configuration: {self.num_years} years")
 
         # Initialize agents
         self.initialize_agents()
+        
+        
+        
+        self.rag = RAG(config=RAGConfig(), debug=self.debug)
+        
 
         # Run simulation for each year
         for year in range(1, self.num_years + 1):
-            year_results = self.run_year(year)
+            year_results = self.run_one_round(year)
             self.yearly_results.append(year_results)
 
         # Generate final report
@@ -354,7 +406,6 @@ class Simulation:
         report = {
             'configuration': {
                 'num_years': self.num_years,
-                'assignment_mode': self.assignment_mode,
                 'num_agents': len(self.ecosystem.agent_population)
             },
             'yearly_results': self.yearly_results,
@@ -366,8 +417,7 @@ class Simulation:
                 'total_papers_accepted': sum(
                     r['phases']['decisions']['total_accepted']
                     for r in self.yearly_results
-                ),
-                'assignment_mode': self.assignment_mode
+                )
             }
         }
 
@@ -387,26 +437,29 @@ def main():
         help='Number of years to simulate (default: 5)'
     )
     parser.add_argument(
-        '--mode',
-        type=str,
-        choices=['batch', 'individual'],
-        default='batch',
-        help='Research direction assignment mode (default: batch)'
-    )
-    parser.add_argument(
         '--output-dir',
         type=str,
         default='./simulation_output',
         help='Output directory for results (default: ./simulation_output)'
     )
-
+    
+    parser.add_argument(
+        '--debug',
+        action='store_true',
+        default=False,
+        help='Enable debug mode'
+    )
+    
     args = parser.parse_args()
+    
+    llm = GPT(model_name="gpt-4o")
 
     # Create and run simulation
     simulation = Simulation(
+        llm=llm,
         num_years=args.years,
-        assignment_mode=args.mode,
-        output_dir=args.output_dir
+        output_dir=args.output_dir,
+        debug=args.debug
     )
 
     simulation.run()

@@ -5,7 +5,7 @@ ai_scientist/ideas/
 DOC.md
 
 # Byte-compiled / optimized / DLL files
-__pycache__/
+*__pycache__/
 *.py[cod]
 *$py.class
 
@@ -22,6 +22,7 @@ eggs/
 .eggs/
 lib/
 lib64/
+outputs/
 parts/
 sdist/
 var/
@@ -169,12 +170,13 @@ cython_debug/
 .idea/
 .aider*
 *.DS_Store
+*.json
+*.jsonl
 
 # VS Code
 .vscode/
 
 # Misc folders
-data/
 *ckpt.pt
 *.zip
 templates/*/run_0/

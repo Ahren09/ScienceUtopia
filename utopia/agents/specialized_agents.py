@@ -5,7 +5,8 @@ EXTENDS base agent classes WITHOUT modifying existing AI-Scientist code
 """
 
 from .base_agent import SimulationAgent
-from typing import List, Dict
+from typing import List, Dict, Optional
+import random
 
 
 class UniversityResearcher(SimulationAgent):
@@ -15,27 +16,33 @@ class UniversityResearcher(SimulationAgent):
     The university affiliation is tracked separately from the researcher identity.
     """
 
-    def __init__(self, researcher_name: str, university_name: str, funding_level: int = 70, agent_id: str = None):
+    def __init__(
+        self,
+        researcher_name: str,
+        university_name: str,
+        funding_level: int = 70,
+        expertise: Optional[List] = None
+    ):
         """Initialize a university researcher
 
         Args:
             researcher_name: Name of the individual researcher
             university_name: Name of the university this researcher belongs to
             funding_level: Initial funding level (0-100)
-            agent_id: Optional custom agent ID
+            expertise_directions: List of 3 ResearchDirection objects representing inherent expertise.
+                                 If None, will be randomly sampled during initialization.
         """
-        
-        assert agent_id is not None, "agent_id is required"
         super().__init__(
             reputation=5,
             funding_level=funding_level,
-            specializations=["theoretical_ml", "foundational_research"],
-            agent_id=agent_id
+            agent_id=researcher_name
         )
-        self.researcher_name = researcher_name
         self.university_name = university_name
         self.can_author = True  # University researchers can write papers
         self.can_review = True  # University researchers can review papers
+
+        # Store inherent expertise (3 research directions)
+        self.expertise = expertise
         
     def _get_personality_prompt(self) -> str:
         return """You are a university researcher who both authors papers and reviews them for conferences. 
@@ -65,26 +72,34 @@ class IndustryResearcher(SimulationAgent):
     The company affiliation is tracked separately from the researcher identity.
     """
 
-    def __init__(self, researcher_name: str, company_name: str, funding_level: int = 90, agent_id: str = None):
+    def __init__(
+        self,
+        researcher_name: str,
+        company_name: str,
+        funding_level: int = 90,
+        expertise: Optional[List] = None
+    ):
         """Initialize an industry researcher
 
         Args:
             researcher_name: Name of the individual researcher
             company_name: Name of the company this researcher belongs to
             funding_level: Initial funding level (0-100)
-            agent_id: Optional custom agent ID
+            expertise_directions: List of 3 ResearchDirection objects representing inherent expertise.
+                                 If None, will be randomly sampled during initialization.
         """
-        assert agent_id is not None, "agent_id is required"
+
         super().__init__(
             reputation=6,
             funding_level=funding_level,
-            specializations=["applied_ml", "scalable_systems", "product_applications"],
-            agent_id=agent_id
+            agent_id=researcher_name
         )
-        self.researcher_name = researcher_name
+        self.expertise = expertise
         self.company_name = company_name
         self.can_author = True  # Industry researchers can write papers
         self.can_review = True  # Industry researchers can review papers
+
+        # Store inherent expertise (3 research directions)
         
     def _get_personality_prompt(self) -> str:
         return """You are an industry researcher who both authors papers and reviews them for conferences.
@@ -109,19 +124,27 @@ class IndustryResearcher(SimulationAgent):
 
 class FreelancerAgent(SimulationAgent):
     """Freelancer agents primarily focus on authoring but may occasionally review"""
-    
-    def __init__(self, researcher_name: str, funding_level: int = 30, agent_id: str = None):
-        
+
+    def __init__(
+        self,
+        researcher_name: str,
+        funding_level: int = 30,
+        agent_id: str = None,
+        expertise_directions: Optional[List] = None
+    ):
+
         assert agent_id is not None, "agent_id is required"
         super().__init__(
             reputation=4,
             funding_level=funding_level,
-            specializations=["unconventional_methods", "interdisciplinary_research"],
-            agent_id=agent_id
+            agent_id=researcher_name
         )
-        self.researcher_name = researcher_name
+
         self.can_author = True   # Freelancers primarily write papers
         self.can_review = True   # Freelancers can review, but less frequently invited
+
+        # Store inherent expertise (3 research directions)
+        self.expertise_directions = expertise_directions or []
         
     def _get_personality_prompt(self) -> str:
         return """You are an independent researcher who challenges conventional wisdom 
@@ -146,16 +169,14 @@ class FreelancerAgent(SimulationAgent):
 class FundingAgent(SimulationAgent):
     """Funding agents primarily review and allocate resources, occasionally author policy papers"""
     
-    def __init__(self, agency_name: str, funding_level: int = 100, agent_id: str = None):
+    def __init__(self, agency_name: str, funding_level: int = 100):
         
-        assert agent_id is not None, "agent_id is required"
+        
         super().__init__(
             reputation=8,
             funding_level=funding_level,
-            specializations=["research_evaluation", "strategic_planning"],
-            agent_id=agent_id
+            agent_id=agency_name
         )
-        self.agency_name = agency_name
         self.funding_priorities = []
         self.risk_aversion = "moderate"
         self.can_author = False  # Funding agents typically don't write research papers
