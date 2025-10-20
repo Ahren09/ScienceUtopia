@@ -9,7 +9,8 @@ DOC.md
 *.py[cod]
 *$py.class
 
-# C extensions
+# C 
+extensions
 *.so
 
 # Distribution / packaging

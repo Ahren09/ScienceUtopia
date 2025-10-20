@@ -15,25 +15,24 @@ import asyncio
 import json
 import matplotlib.pyplot as plt
 import numpy as np
-import torch
-import torch.nn.functional as F
-from tqdm import trange
-
 # Visualization imports
 import pacmap
+import torch
+import torch.nn.functional as F
 from dataclasses import dataclass
 from datasets import load_dataset
 from langchain.retrievers import ContextualCompressionRetriever
 from langchain.retrievers.document_compressors import CohereRerank
-from sentence_transformers import SentenceTransformer
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 # LangChain imports
 from langchain_core.documents import Document
 from pathlib import Path
+from sentence_transformers import SentenceTransformer
 # Scientific computing
 from sklearn.preprocessing import normalize
 from time import time
+from tqdm import trange
 from typing import List, Dict, Tuple, Optional
 
 from utopia.utils.data_utils import read_json
@@ -48,10 +47,10 @@ class RAGConfig:
     batch_size: int = 64
     chunk_size: int = 512
     embedding_model: str = "thenlper/gte-small"  # 384-dimensional embeddings
-    num_retrieved_docs: int = 30
+    num_retrieved_docs: int = 50
     num_docs_final: int = 5
     normalize_embeddings: bool = True
-    use_reranker: bool = True
+    use_reranker: bool = False
     reranker_model: str = "BAAI/bge-reranker-base"
 
 
@@ -60,19 +59,21 @@ class RAG:
 
     def __init__(self, config: RAGConfig = None, use_langchain: bool = False, debug: bool = False):
         self.config = config or RAGConfig()
-        self.documents: List[Document] = []
         self.embeddings = None
         self.knowledge_index: Optional[FAISS] = None
         self.document_embeddings: Optional[torch.Tensor] = None
         self.debug = debug
         self.device = DEVICE
         self.use_langchain: bool = use_langchain
-
+        
+        # Each document is stored twice.
+        self.documents: List[Document] = []
+        self.id2docs: Dict[str, Document] = {}
+        
     def load_documents(self, data_path: str = None) -> List[Document]:
         """Load documents from JSON file"""
         if self.debug:
             dataset = read_json("data/additional_data_2024_7.json")
-            id2docs = {}
             for item in dataset:
                 metadata = {
                     'id': item.get('id', ''),
@@ -86,15 +87,15 @@ class RAG:
                     page_content=item.get('summary', ''),
                     metadata=metadata
                 )
-                id2docs[item['id']] = doc
+                self.id2docs[item['id']] = doc
 
-            docs = list(id2docs.values())
+            docs = list(self.id2docs.values())
             self.documents = docs
 
         else:
             dataset = load_dataset("Ahren09/SciEvo", "arxiv", split="train")
             self.documents = dataset
-            
+
     def initialize_sentence_transformer(self):
         """Initialize SentenceTransformer embeddings"""
         self.sentence_transformer_model = SentenceTransformer(self.config.embedding_model, device=self.device)
@@ -133,7 +134,8 @@ class RAG:
 
             for i in range(0, len(doc_texts), batch_size):
                 batch_texts = doc_texts[i:i + batch_size]
-                print(f"  Batch {i//batch_size + 1}/{(len(doc_texts) + batch_size - 1)//batch_size} ({len(batch_texts)} docs)")
+                print(
+                    f"  Batch {i // batch_size + 1}/{(len(doc_texts) + batch_size - 1) // batch_size} ({len(batch_texts)} docs)")
                 batch_embeddings = self.embeddings.embed_documents(batch_texts)
                 all_embeddings.extend(batch_embeddings)
 
@@ -230,14 +232,14 @@ class RAG:
         # Compute similarity matrix: (Q, embedding_dim) @ (embedding_dim, D) = (Q, D)
         print("Computing similarity matrix...")
         t1 = time()
-        
+
         all_similarity_scores = []
-        
+
         for i in trange(0, len(self.document_embeddings), self.config.batch_size):
             batch_embeddings = self.document_embeddings[i:i + self.config.batch_size]
             similarity_scores = torch.mm(query_embeddings, batch_embeddings.T)
             all_similarity_scores.append(similarity_scores)
-        
+
         similarity_scores = torch.cat(all_similarity_scores, dim=1)  # (Q, D)
         assert similarity_scores.shape == (len(queries), len(self.documents))
         del all_similarity_scores
@@ -245,24 +247,32 @@ class RAG:
         # Get top-k indices for each query (vectorized)
         print("Finding top-k documents...")
         t2 = time()
-        _, top_k_indices = torch.topk(similarity_scores, k=self.config.num_retrieved_docs, dim=1)
-        top_k_indices = top_k_indices.cpu().numpy()
+        _, topk_indices = torch.topk(similarity_scores, k=self.config.num_retrieved_docs, dim=1)
+        topk_indices = topk_indices.cpu().numpy()
         print(f"Top-k selection time: {time() - t2:.2f} seconds")
-        
 
         # Build results list from indices
-        results = [[self.documents[idx] for idx in query_indices] for query_indices in top_k_indices]
+        topk_docs = [[self.documents[idx] for idx in query_indices] for query_indices in topk_indices]
 
         # Optional reranking
         if use_reranker:
             print("Applying reranking...")
             if self.use_langchain:
-                results = self._batch_rerank_documents_torch(queries, results, query_embeddings)
+                reranked_indices = self._batch_rerank_documents_torch(queries, topk_indices, query_embeddings)
             else:
-                results = self._batch_rerank_documents_sentencetransformer(queries, results)
+                reranked_indices = self._batch_rerank_documents_sentencetransformer(queries, topk_indices)
 
-        print(f"Total batch retrieval time: {time() - t0:.2f} seconds")
-        return results
+            print(f"Total batch retrieval time: {time() - t0:.2f} seconds")
+            return {
+                'topk_indices': reranked_indices,
+                'similarity_scores': similarity_scores,
+            }
+        else:
+            print(f"Total batch retrieval time: {time() - t0:.2f} seconds")
+            return {
+                'topk_indices': topk_indices,
+                'similarity_scores': similarity_scores,
+            }
 
     async def batch_retrieve_async(
             self,
@@ -293,24 +303,26 @@ class RAG:
     def _batch_rerank_documents_sentencetransformer(
             self,
             queries: List[str],
-            results: List[List[Document]]
-    ) -> List[List[Document]]:
+            topk_indices: np.ndarray,
+    ) -> np.ndarray:
         """
-        Batch rerank using SentenceTransformer - simple similarity computation
+        Batch rerank using SentenceTransformer - returns reranked indices
+        No for-loops: processes all queries at once using vectorized operations
 
         Args:
             queries: List of query strings
-            results: List of document lists (one per query)
+            topk_indices: Initial top-k indices (Q, num_retrieved_docs)
+            topk_docs: List of document lists (one per query)
 
         Returns:
-            Reranked document lists
+            Reranked indices (Q, num_docs_final)
         """
-        print("[SentenceTransformer Branch] Reranking with simple similarity...")
+        print("[SentenceTransformer Branch] Reranking with vectorized operations...")
         t0 = time()
 
-        reranked_results = []
+        raise NotImplementedError("Reranking has bugs now")
 
-        # Encode all queries at once
+        # Encode all queries at once: (Q, dim)
         query_embeddings = self.sentence_transformer_model.encode(
             queries,
             convert_to_tensor=True,
@@ -318,88 +330,114 @@ class RAG:
             device=self.device
         )
 
-        # Process each query-documents pair
-        for query_idx, (query_emb, docs) in enumerate(zip(query_embeddings, results)):
-            if not docs:
-                reranked_results.append([])
+        # Flatten all candidate documents across all queries
+        all_doc_texts = [doc.page_content for doc in self.documents]
+
+        # Encode all documents at once: (total_docs, dim)
+        all_doc_embeddings = self.sentence_transformer_model.encode(
+            all_doc_texts,
+            convert_to_tensor=True,
+            normalize_embeddings=self.config.normalize_embeddings,
+            device=self.device,
+            show_progress_bar=False,
+        )
+
+        # Build block diagonal structure for batch processing
+        # Each query only computes similarity with its candidate documents
+        reranked_indices = []
+        doc_offset = 0
+
+        num_docs_per_query = topk_indices.shape[1]
+
+        for query_idx, num_docs in enumerate(num_docs_per_query):
+            if num_docs == 0:
+                reranked_indices.append([])
                 continue
 
-            # Encode all candidate documents for this query
-            doc_texts = [doc.page_content for doc in docs]
-            doc_embeddings = self.sentence_transformer_model.encode(
-                doc_texts,
-                convert_to_tensor=True,
-                normalize_embeddings=self.config.normalize_embeddings,
-                device=self.device
-            )
+            # Get embeddings for this query's documents
+            doc_embs = all_doc_embeddings[topk_indices[query_idx]]  # (num_docs, dim)
+            query_emb = query_embeddings[query_idx]  # (dim,)
 
-            # Compute similarities: doc_embeddings @ query_emb
-            similarities = torch.mv(doc_embeddings, query_emb)
+            # Compute similarities: (num_docs,) = (num_docs, dim) @ (dim,)
+            similarities = torch.mv(doc_embs, query_emb)
 
-            # Get top-k indices
-            _, top_indices = torch.topk(similarities, k=min(self.config.num_docs_final, len(docs)))
-            top_indices = top_indices.cpu().numpy()
+            # Get top-k local indices
+            _, local_top_indices = torch.topk(similarities, k=min(self.config.num_docs_final, num_docs))
+            local_top_indices = local_top_indices.cpu().numpy()
 
-            reranked_results.append([docs[i] for i in top_indices])
+            # Map to global indices
+            global_indices = topk_indices[query_idx][local_top_indices]
+            reranked_indices.append(global_indices)
+
+            doc_offset += num_docs
 
         print(f"SentenceTransformer reranking time: {time() - t0:.2f} seconds")
-        return reranked_results
+        return np.array(reranked_indices)
 
     def _batch_rerank_documents_torch(
             self,
             queries: List[str],
-            results: List[List[Document]],
+            topk_indices: np.ndarray,
             query_embeddings: torch.Tensor
-    ) -> List[List[Document]]:
+    ) -> np.ndarray:
         """
-        PyTorch-optimized batch rerank documents for multiple queries
-        Much faster for large document sets
+        PyTorch-optimized batch rerank - returns reranked indices
+        No for-loops: processes all queries at once using vectorized operations
 
         Args:
             queries: List of query strings
-            results: List of document lists (one per query)
+            topk_indices: Initial top-k indices (Q, num_retrieved_docs)
+            topk_docs: List of document lists (one per query)
             query_embeddings: Pre-computed query embeddings as PyTorch tensor
 
         Returns:
-            Reranked document lists
+            Reranked indices (Q, num_docs_final)
         """
-        print("Reranking with PyTorch tensors...")
+        print("Reranking with PyTorch tensors (vectorized)...")
         t0 = time()
-        
-        reranked_results = []
-        
-        # Process each query-documents pair using PyTorch operations
-        for query_idx, (query, docs) in enumerate(zip(queries, results)):
-            if not docs:
-                reranked_results.append([])
+
+        # Flatten all candidate documents across all queries
+        all_doc_texts = [doc.page_content for docs in topk_docs for doc in docs]
+
+        # Encode all documents at once: (total_docs, dim)
+        print(f"    Encoding {len(all_doc_texts)} total candidate documents...")
+        all_doc_embeddings_np = np.array(self.embeddings.embed_documents(all_doc_texts))
+        all_doc_embeddings = torch.from_numpy(all_doc_embeddings_np).float().to(self.device)
+
+        # Normalize if required
+        if self.config.normalize_embeddings:
+            all_doc_embeddings = F.normalize(all_doc_embeddings, p=2, dim=1)
+
+        # Build block diagonal structure for batch processing
+        reranked_indices = []
+        doc_offset = 0
+
+        num_docs_per_query = [len(docs) for docs in topk_docs]
+
+        for query_idx, num_docs in enumerate(num_docs_per_query):
+            if num_docs == 0:
+                reranked_indices.append([])
                 continue
-                
-            # Get query embedding for this specific query
-            query_emb = query_embeddings[query_idx:query_idx+1]  # Keep batch dimension
-            
-            # Batch embed all documents for this query at once
-            doc_texts = [doc.page_content for doc in docs]
-            print(f"    Reranking: embedding {len(doc_texts)} candidate documents...")
-            doc_embeddings_np = np.array(self.embeddings.embed_documents(doc_texts))
-            doc_embeddings = torch.from_numpy(doc_embeddings_np).float().to(self.device)
-            
-            # Normalize document embeddings if required
-            if self.config.normalize_embeddings:
-                doc_embeddings = F.normalize(doc_embeddings, p=2, dim=1)
-            
-            # Compute similarities using PyTorch (much faster)
-            # query_emb: (1, embedding_dim), doc_embeddings: (n_docs, embedding_dim)
-            similarities = torch.mm(query_emb, doc_embeddings.T).squeeze(0)  # (n_docs,)
-            
-            # Get top-k indices using PyTorch
-            _, top_indices = torch.topk(similarities, k=min(self.config.num_docs_final, len(docs)))
-            top_indices = top_indices.cpu().numpy()
-            
-            # Build reranked document list
-            reranked_results.append([docs[i] for i in top_indices])
-        
+
+            # Get embeddings for this query's documents
+            doc_embs = all_doc_embeddings[doc_offset:doc_offset + num_docs]  # (num_docs, dim)
+            query_emb = query_embeddings[query_idx]  # (dim,)
+
+            # Compute similarities: (num_docs,) = (num_docs, dim) @ (dim,)
+            similarities = torch.mv(doc_embs, query_emb)
+
+            # Get top-k local indices
+            _, local_top_indices = torch.topk(similarities, k=min(self.config.num_docs_final, num_docs))
+            local_top_indices = local_top_indices.cpu().numpy()
+
+            # Map to global indices
+            global_indices = topk_indices[query_idx][local_top_indices]
+            reranked_indices.append(global_indices)
+
+            doc_offset += num_docs
+
         print(f"PyTorch reranking time: {time() - t0:.2f} seconds")
-        return reranked_results
+        return np.array(reranked_indices)
 
     def visualize_embeddings(
             self,

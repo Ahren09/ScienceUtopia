@@ -11,40 +11,41 @@ This script runs the full multi-agent simulation with:
 
 import argparse
 import json
-import os
-from typing import List, Dict
 import logging
+import os
 import random
+from typing import List, Dict
 
-from utopia.agents.specialized_agents import (
-    UniversityResearcher,
-    IndustryResearcher,
-    FreelancerAgent,
-    FundingAgent
-)
+
+
+from utopia.agents.base_agent import MultiAgentEcosystem
 from utopia.agents.conference import (
     ConferenceSystem,
     create_default_conference_system,
     Conference
 )
-from utopia.agents.base_agent import MultiAgentEcosystem
-
 from utopia.agents.research_direction import (
     assign_directions_batch,
     assign_directions_individual,
     initialize_agent_expertise,
     AVAILABLE_DIRECTIONS
 )
-
-from utopia.models.models import GPT
-
+from utopia.agents.specialized_agents import (
+    UniversityResearcher,
+    IndustryResearcher,
+    FreelancerAgent,
+    FundingAgent
+)
 from utopia.data.rag import RAG, RAGConfig
+from utopia.models.models import GPT, LLM
 
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+logging.getLogger("httpx").setLevel(logging.ERROR)
+
 logger = logging.getLogger(__name__)
 
 
@@ -52,11 +53,11 @@ class Simulation:
     """Main simulation orchestrator for the academic ecosystem"""
 
     def __init__(
-        self,
-        llm,
-        num_years: int = 5,
-        output_dir: str = "./simulation_output",
-        debug: bool = False
+            self,
+            llm,
+            num_years: int = 5,
+            output_dir: str = "./simulation_output",
+            debug: bool = False
     ):
         """Initialize the simulation
 
@@ -65,7 +66,7 @@ class Simulation:
             research_direction_selection_mode: Mode for research direction assignment - "batch" or "individual"
             output_dir: Directory to save simulation results
         """
-        self.llm = llm
+        self.llm: LLM = llm
         self.num_years = num_years
         self.output_dir = output_dir
         self.current_year = 0
@@ -91,8 +92,7 @@ class Simulation:
 
         # Create multiple university researchers mapped to same universities
         universities = ["MIT", "Stanford", "Berkeley", "CMU", "GeorgiaTech"]
-        
-        
+
         counter = 0
         for university in universities:
             # Create 2-3 researchers per university
@@ -101,7 +101,8 @@ class Simulation:
                     researcher_name=f"university_researcher_{counter}",
                     university_name=university,
                     funding_level=70,
-                    expertise=random.sample(AVAILABLE_DIRECTIONS, 3)
+                    expertise=random.sample(AVAILABLE_DIRECTIONS, 3),
+                    llm=self.llm
                 )
                 self.ecosystem.add_agent(researcher)
                 counter += 1
@@ -109,7 +110,7 @@ class Simulation:
 
         # Create multiple industry researchers mapped to same companies
         companies = ["Google", "Meta", "OpenAI", "Microsoft", "Amazon", "IBM", "Apple", "Tesla"]
-        
+
         counter = 0
         for company in companies:
             # Create 2-3 researchers per company
@@ -118,7 +119,8 @@ class Simulation:
                     researcher_name=f"industry_researcher_{counter}",
                     company_name=company,
                     funding_level=90,
-                    expertise=random.sample(AVAILABLE_DIRECTIONS, 3)
+                    expertise=random.sample(AVAILABLE_DIRECTIONS, 3),
+                    llm=self.llm
                 )
                 self.ecosystem.add_agent(researcher)
                 logger.info(f"Added {researcher.id} from {company}")
@@ -130,7 +132,8 @@ class Simulation:
             freelancer = FreelancerAgent(
                 researcher_name=f"freelancer_{counter}",
                 funding_level=5,
-                expertise=random.sample(AVAILABLE_DIRECTIONS, 3)
+                expertise=random.sample(AVAILABLE_DIRECTIONS, 3),
+                llm=self.llm
             )
             self.ecosystem.add_agent(freelancer)
             logger.info(f"Added {freelancer.id}")
@@ -142,7 +145,7 @@ class Simulation:
             funding_agent = FundingAgent(
                 agency_name=agency,
                 funding_level=100,
-                
+
             )
             self.ecosystem.add_agent(funding_agent)
             logger.info(f"Added funding agent: {agency}")
@@ -154,6 +157,9 @@ class Simulation:
         initialize_agent_expertise(all_agents, num_expertise=3)
         logger.info(f"Initialized expertise for {len(all_agents)} agents")
 
+        # Keep track of the submitted papers so that they are not submitted again
+        self.submitted_papers = set()
+
     def run_one_round(self, year: int) -> Dict:
         """Run simulation for one year
 
@@ -163,9 +169,9 @@ class Simulation:
         Returns:
             Dictionary with year results
         """
-        logger.info(f"\n{'='*60}")
+        logger.info(f"\n{'=' * 60}")
         logger.info(f"YEAR {year}")
-        logger.info(f"{'='*60}\n")
+        logger.info(f"{'=' * 60}\n")
 
         # Determine assignment mode based on year
         research_direction_selection_mode = "batch" if year == 1 else "individual"
@@ -192,82 +198,54 @@ class Simulation:
 
         # Phase 2: Generate and submit papers
         logger.info("Phase 2: Submitting papers...")
-        submitted_papers = []
-        
-        
+        submitted_papers = {}
+
         research_ideas: List[str] = []
         for agent in active_authors:
             idea = " ".join(directions[agent.id].keywords)
             research_ideas.append(idea)
-            
-            
-            
+
         # If RAG does not contain documents, load 
         if year == 1:
             self.rag.load_documents()
         else:
             raise NotImplementedError("Update documents")
-        
+
         self.rag.build_knowledge_index()
-        
+
         # Batch retrieve relevant documents for all research ideas
         logger.info(f"Batch retrieving relevant documents for {len(research_ideas)} research ideas...")
-        batch_retrieval_results = self.rag.batch_retrieve(research_ideas, use_reranker=True)
+        retrieval_results = self.rag.batch_retrieve(research_ideas, use_reranker=self.rag.config.use_reranker)
+
+        topk_indices = retrieval_results['topk_indices']
+
+        assert topk_indices.shape[0] == len(active_authors)
         
-            
-            
-        
-        
-        
-        
-        
-        
+        # Make sure there is no duplicate submission
+        submitted_paper_arxiv_ids = set()
 
         # Process each agent with their retrieved documents
         for agent_idx, agent in enumerate(active_authors):
-            if agent.id in directions:
-                direction = directions[agent.id]
-                # Get retrieved documents for this agent's research idea
-                retrieved_docs = batch_retrieval_results[agent_idx] if agent_idx < len(batch_retrieval_results) else []
+            candidate_paper_indices = topk_indices[agent_idx]
+            candidate_papers = [self.rag.documents[idx] for idx in candidate_paper_indices if self.rag.documents[idx].metadata['id'] not in submitted_paper_arxiv_ids]
+            candidate_papers_arxiv_ids = set([paper.metadata['id'] for paper in candidate_papers])
+            prompt, response_format = agent.get_paper_submission_prompt(candidate_papers)
+            
+            
+            
+            
+            
 
-                try:
-                    # Generate paper based on assigned direction
-                    logger.info(f"  {agent.id} researching {direction.topic}...")
-                    logger.info(f"    Retrieved {len(retrieved_docs)} relevant documents for context")
 
-                    # Create paper metadata with retrieved context
-                    paper = {
-                        'id': f"paper_{year}_{agent.id}_{int(__import__('time').time()*1000) % 10000}",
-                        'title': f"Research on {direction.topic}",
-                        'topics': [direction.topic] + direction.focus_areas,
-                        'author_id': agent.id,
-                        'author_name': getattr(agent, 'agent_id', agent.id),
-                        'affiliation': getattr(agent, 'university_name', None) or getattr(agent, 'company_name', None),
-                        'year': year,
-                        'direction': direction,
-                        'retrieved_context': [
-                            {
-                                'title': doc.metadata.get('title', ''),
-                                'summary': doc.page_content[:200] + '...' if len(doc.page_content) > 200 else doc.page_content,
-                                'authors': doc.metadata.get('authors', ''),
-                                'relevance_score': getattr(doc, 'relevance_score', 0.0)
-                            }
-                            for doc in retrieved_docs[:3]  # Include top 3 most relevant documents
-                        ]
-                    }
-
-                    # Submit to appropriate conference
-                    conference = self.conference_system.submit_paper_to_best_match(paper)
-
-                    if conference:
-                        submitted_papers.append(paper)
-                        logger.info(f"    -> Submitted to {conference.name}")
-                    else:
-                        logger.info(f"    -> No matching conference found")
-
-                except Exception as e:
-                    logger.error(f"  Error with {agent.id}: {e}")
-
+            submission_metadata = self.llm.generate(prompt=prompt, response_format=response_format)
+            submission_metadata = json.loads(submission_metadata)
+            assert submission_metadata['arxiv_id'] in candidate_papers_arxiv_ids, f"Proposed submission ({submission_metadata['arxiv_id']}) not in candidate papers {candidate_papers_arxiv_ids}"
+            
+            submitted_paper_arxiv_ids.add(submission_metadata['arxiv_id'])
+            
+            submitted_papers[agent.id] = self.rag.id2docs[submission_metadata['arxiv_id']]
+            
+            
         year_results['phases']['paper_submission'] = {
             'num_papers_submitted': len(submitted_papers),
             'papers': submitted_papers
@@ -348,7 +326,8 @@ class Simulation:
         year_results['phases']['funding_update'] = funding_updates
 
         # Eliminate agents with zero funding
-        eliminated_agents = [a.id for a in self.ecosystem.agent_population if a.resources <= 0 and hasattr(a, 'can_author') and a.can_author]
+        eliminated_agents = [a.id for a in self.ecosystem.agent_population if
+                             a.resources <= 0 and hasattr(a, 'can_author') and a.can_author]
         if eliminated_agents:
             logger.info(f"  Eliminated {len(eliminated_agents)} agents due to funding depletion")
             year_results['eliminated_agents'] = eliminated_agents
@@ -371,11 +350,8 @@ class Simulation:
 
         # Initialize agents
         self.initialize_agents()
-        
-        
-        
+
         self.rag = RAG(config=RAGConfig(), debug=self.debug)
-        
 
         # Run simulation for each year
         for year in range(1, self.num_years + 1):
@@ -442,7 +418,7 @@ def main():
         default='./simulation_output',
         help='Output directory for results (default: ./simulation_output)'
     )
-    
+
     parser.add_argument(
         '--debug',
         action='store_true',
@@ -450,9 +426,16 @@ def main():
         help='Enable debug mode'
     )
     
+    parser.add_argument(
+        '--model',
+        type=str,
+        default='gpt-4o',
+        help='Model to use for LLM (default: gpt-4o)'
+    )
+
     args = parser.parse_args()
-    
-    llm = GPT(model_name="gpt-4o")
+
+    llm = GPT(model_name=args.model)
 
     # Create and run simulation
     simulation = Simulation(

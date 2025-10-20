@@ -13,6 +13,8 @@ import hashlib
 import networkx as nx
 from typing import List, Dict
 from const import RESEARCH_COST, PAPER_SUBMISSION_COST
+from langchain_core.documents import Document
+from utopia.models.models import LLM, GPT
 
 
 class MultiAgentEcosystem:
@@ -58,12 +60,13 @@ class SimulationAgent:
     """Base class for simulation agents"""
 
     def __init__(self, reputation: int, funding_level: int,
-                 agent_id: str = None):
+                 agent_id: str = None, llm: LLM = None):
         self.id = agent_id or f"agent_{int(time.time() * 1000)}"
         self.resources = funding_level  # Integer from 0-100 scale
         self.reputation = reputation    # 1-10 scale
         self.memory_bank = []  # Store experiences and thoughts from interactions
         self.review_experiences = []  # Track experiences as both author and reviewer
+        self.llm = llm
         
     def generate_research_idea(self, citation_context: List, research_focus: str = None) -> Dict:
         """
@@ -438,3 +441,72 @@ class SimulationAgent:
             elif self._is_toxic_review(review):
                 return "negative"
         return "neutral"
+    
+    def get_paper_submission_prompt(self, candidate_papers: List[Document], max_papers: int = 10) -> str:
+        """Get research idea prompt for this agent"""
+        
+        expertise = [research_direction.topic for research_direction in self.expertise]
+        prompt = f"""
+You are a researcher specializing in {', '.join(expertise)}. 
+You plan to do a project and submit a paper to a conference. 
+From the following candidate papers, please give me a paper ID that you want to submit.
+
+## Candidate Papers
+"""
+        for i, paper in enumerate(candidate_papers[:max_papers]):
+            prompt += f"""### Paper {i+1}
+ID: {i+1}
+arXiv ID: {paper.metadata['id']}
+Title: {paper.metadata['title']}
+Abstract: {paper.page_content}
+
+"""
+        prompt += f"""
+## Your Task
+Please respond with a paper ID you want to submit.
+
+## Sample Response
+```json
+{{
+    "id": 1,
+    "arxiv_id": "http://arxiv.org/abs/2407.00005v1"
+}}
+```
+"""
+
+        schema = {
+            "name": "city_weather_schema",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "number",
+                        "description": "ID of the paper"
+                    },
+                    "arxiv_id": {
+                        "type": "string",
+                        "description": "arXiv ID of the paper"
+                    },
+                },
+                "required": ["id", "arxiv_id"],
+                "additionalProperties": False
+            },
+            "strict": True  # ensures model cannot output extra fields
+        }
+
+        # Note: as of 2025-10-20, gpt-4o dose not support the response_format parameter. "gpt-4o-2024-08-06" does.
+        response_format = {
+            'type': 'json_schema',
+            'json_object': {
+                'name': 'paper_submission',
+                'strict': True,
+                'schema': {
+                    'type': 'object',
+                    'properties': {'arxiv_id': {'type': 'string'}, 'id': {'type': 'number'}},
+                    'required': ['id', 'arxiv_id'],
+                }
+            },
+        }
+        return prompt, response_format
+    
+    

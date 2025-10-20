@@ -422,12 +422,12 @@ AVAILABLE_DIRECTIONS = [
                   "conditional generation", "data augmentation", "synthetic data", "likelihood estimation"]
     ),
     ResearchDirection(
-        topic="meta_learning",
-        focus_areas=["few shot learning", "learning to learn", "task adaptation"],
+        topic="meta-learning",
+        focus_areas=["few-shot learning", "meta-learning", "learning to learn", "task adaptation"],
         years=1,
         keywords=["rapid adaptation", "MAML", "prototypical networks", "metric learning", "transfer learning",
                   "multi task learning", "continual learning", "neural architecture search", "hyperparameter optimization",
-                  "zero shot learning", "cross domain learning", "model agnostic methods"]
+                  "zero-shot learning", "cross domain learning", "model agnostic methods"]
     ),
     ResearchDirection(
         topic="interpretable_ml",

@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 from typing import Any
@@ -8,6 +9,9 @@ import backoff
 import openai
 from typing import Optional
 from pydantic import BaseModel
+
+# Disable httpx logging
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 MAX_NUM_TOKENS = 4096
 

@@ -7,7 +7,7 @@ EXTENDS base agent classes WITHOUT modifying existing AI-Scientist code
 from .base_agent import SimulationAgent
 from typing import List, Dict, Optional
 import random
-
+from utopia.models.models import LLM, GPT
 
 class UniversityResearcher(SimulationAgent):
     """University researchers serve as both authors and reviewers in the ecosystem
@@ -21,7 +21,8 @@ class UniversityResearcher(SimulationAgent):
         researcher_name: str,
         university_name: str,
         funding_level: int = 70,
-        expertise: Optional[List] = None
+        expertise: Optional[List] = None,
+        llm = None
     ):
         """Initialize a university researcher
 
@@ -77,7 +78,8 @@ class IndustryResearcher(SimulationAgent):
         researcher_name: str,
         company_name: str,
         funding_level: int = 90,
-        expertise: Optional[List] = None
+        expertise: Optional[List] = None,
+        llm: LLM = None
     ):
         """Initialize an industry researcher
 
@@ -92,7 +94,8 @@ class IndustryResearcher(SimulationAgent):
         super().__init__(
             reputation=6,
             funding_level=funding_level,
-            agent_id=researcher_name
+            agent_id=researcher_name,
+            llm=llm
         )
         self.expertise = expertise
         self.company_name = company_name
@@ -169,14 +172,16 @@ class FreelancerAgent(SimulationAgent):
 class FundingAgent(SimulationAgent):
     """Funding agents primarily review and allocate resources, occasionally author policy papers"""
     
-    def __init__(self, agency_name: str, funding_level: int = 100):
+    def __init__(self, agency_name: str, funding_level: int = 100, llm: LLM = None):
         
         
         super().__init__(
             reputation=8,
             funding_level=funding_level,
-            agent_id=agency_name
+            agent_id=agency_name,
+            llm=llm
         )
+        self.llm = llm
         self.funding_priorities = []
         self.risk_aversion = "moderate"
         self.can_author = False  # Funding agents typically don't write research papers

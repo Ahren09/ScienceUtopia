@@ -9,11 +9,18 @@ from io import BytesIO
 from openai import AzureOpenAI, OpenAI, BadRequestError
 from typing import List, Optional, Union
 
-
-class GPT:
-
+class LLM:
     def __init__(self, model_name):
         self.model_name = model_name
+        
+    def generate(self, **kwargs):
+        raise NotImplementedError("Subclasses must implement this method")
+    
+
+class GPT(LLM):
+
+    def __init__(self, model_name):
+        super().__init__(model_name)
         if os.getenv("AZURE_OPENAI_ENDPOINT", None) is not None:
             azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
             if azure_endpoint is None:
@@ -29,7 +36,7 @@ class GPT:
         else:
             raise ValueError("No API key found")
 
-    def generate(self, prompt: Optional[str] = None, image: Optional[List[Union[str, Image.Image]]] = None, temperature: float = 0.7, system_prompt: Optional[str] = ""):
+    def generate(self, prompt: Optional[str] = None, image: Optional[List[Union[str, Image.Image]]] = None, temperature: float = 0.7, system_prompt: Optional[str] = "", response_format = None):
         # System instructions for the GPT model
 
         try:
@@ -70,9 +77,10 @@ class GPT:
             ]
 
             response = self.client.chat.completions.create(
-                model="gpt-4o",
+                model=self.model_name,
                 messages=messages,
                 temperature=temperature,
+                response_format={"type": "json_object"} # response_format
             )
 
             response_content = response.choices[0].message.content
@@ -86,8 +94,9 @@ class GPT:
             return None
 
 
-class Gemini:
+class Gemini(LLM):
     def __init__(self, model_name, **kwargs):
+        super().__init__(model_name)
         self.model_name = model_name
         self.max_tokens = kwargs.get('max_tokens', 1024)
         self.temperature = kwargs.get('temperature', 0.0)
