@@ -16,6 +16,8 @@ from const import RESEARCH_COST, PAPER_SUBMISSION_COST
 from langchain_core.documents import Document
 from utopia.models.models import LLM, GPT
 
+from utopia.agents.conference import Conference
+
 
 class MultiAgentEcosystem:
     """
@@ -442,14 +444,14 @@ class SimulationAgent:
                 return "negative"
         return "neutral"
     
-    def get_paper_submission_prompt(self, candidate_papers: List[Document], max_papers: int = 10) -> str:
+    def get_paper_submission_prompt(self, candidate_papers: List[Document], conferences: List[Conference], max_papers: int = 10) -> str:
         """Get research idea prompt for this agent"""
         
         expertise = [research_direction.topic for research_direction in self.expertise]
         prompt = f"""
 You are a researcher specializing in {', '.join(expertise)}. 
 You plan to do a project and submit a paper to a conference. 
-From the following candidate papers, please give me a paper ID that you want to submit.
+From the following candidate papers, please give me a paper ID that you want to submit. Then, give a conference name that you want to submit to.
 
 ## Candidate Papers
 """
@@ -460,6 +462,11 @@ arXiv ID: {paper.metadata['id']}
 Title: {paper.metadata['title']}
 Abstract: {paper.page_content}
 
+## Candidate Conferences
+Below are the candidate conferences you can submit to. Please choose one of them that suits the paper. Submitting to a conference with mismatch topics has a high chance of getting rejected, although not always.
+"""
+        for conference in conferences:
+            prompt += f"""- \"{conference.conference_id}\": topics: {', '.join(conference.topics)}
 """
         prompt += f"""
 ## Your Task
@@ -469,7 +476,8 @@ Please respond with a paper ID you want to submit.
 ```json
 {{
     "id": 1,
-    "arxiv_id": "http://arxiv.org/abs/2407.00005v1"
+    "arxiv_id": "http://arxiv.org/abs/2407.00005v1",
+    "conference": "NeurIPS"
 }}
 ```
 """

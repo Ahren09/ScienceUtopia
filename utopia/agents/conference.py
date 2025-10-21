@@ -25,12 +25,22 @@ class Conference:
 
     Multiple conferences can run in parallel, each targeting different topics.
     This enables specialization and realistic simulation of academic ecosystem diversity.
+
+    Attributes:
+        name: Conference name
+        topics: All arXiv categories accepted (sorted by preference, top 3 are most preferred)
+        most_preferred_topics: Top 3 most preferred topics (auto-extracted from first 3 in topics)
+        acceptance_rate: Target acceptance rate (0-1)
+        review_criteria: Criteria weights for review scoring
+        conference_id: Unique identifier
+        year: Current conference year
+        status: Current status in the conference cycle
     """
 
     name: str
-    topics: List[str]  # Research topics this conference focuses on
+    topics: List[str]  # All research topics (first 3 are most preferred, sorted by preference)
+    category: str = None  # General research category (e.g., "Artificial Intelligence", "Computer Networks")
     acceptance_rate: float = 0.3  # Target acceptance rate (0-1)
-    review_criteria: Dict[str, float] = field(default_factory=dict)  # Criteria weights
     conference_id: str = None
     year: int = 0
     status: ConferenceStatus = ConferenceStatus.ACCEPTING_SUBMISSIONS
@@ -43,18 +53,14 @@ class Conference:
     # Review tracking
     reviews: Dict[str, List[Dict]] = field(default_factory=dict)  # paper_id -> [reviews]
 
+    @property
+    def most_preferred_topics(self) -> List[str]:
+        """Get the top 3 most preferred topics for this conference"""
+        return self.topics[:3] if len(self.topics) >= 3 else self.topics
+
     def __post_init__(self):
         if self.conference_id is None:
             self.conference_id = f"conf_{self.name.lower().replace(' ', '_')}_{int(time.time() * 1000) % 10000}"
-
-        # Set default review criteria if not provided
-        if not self.review_criteria:
-            self.review_criteria = {
-                'novelty': 0.3,
-                'technical_quality': 0.3,
-                'clarity': 0.2,
-                'relevance': 0.2
-            }
 
     def is_topic_match(self, paper_topics: List[str]) -> bool:
         """Check if paper topics match conference topics
@@ -246,15 +252,6 @@ class ConferenceSystem:
         for conf in self.conferences:
             self.conference_map[conf.conference_id] = conf
 
-    def add_conference(self, conference: Conference):
-        """Add a conference to the system
-
-        Args:
-            conference: Conference object to add
-        """
-        self.conferences.append(conference)
-        self.conference_map[conference.conference_id] = conference
-
     def get_matching_conferences(self, paper_topics: List[str]) -> List[Conference]:
         """Find conferences that match paper topics
 
@@ -345,39 +342,554 @@ class ConferenceSystem:
         return self.conference_map.get(conference_id)
 
 
-# Predefined conference templates for common research areas
-PREDEFINED_CONFERENCES = {
+# Predefined conference templates - CCF Tier-A conferences
+CONFERENCES = {
+    # Computer Architecture / Parallel & Distributed Computing / Storage Systems
+    'ASPLOS': Conference(
+        name='Architectural Support for Programming Languages and Operating Systems',
+        topics=['cs.AR', 'cs.OS', 'cs.PL', 'cs.DC', 'cs.PF', 'cs.SE', 'cs.LG', 'cs.NI'],
+        category='Computer Architecture',
+        acceptance_rate=0.18,
+        conference_id='ASPLOS'
+    ),
+    'FAST': Conference(
+        name='Conference on File and Storage Technologies',
+        topics=['cs.DC', 'cs.AR', 'cs.OS', 'cs.DB', 'cs.PF', 'cs.NI', 'cs.CR', 'cs.SE'],
+        category='Computer Architecture',
+        acceptance_rate=0.20,
+        conference_id='FAST'
+    ),
+    'HPCA': Conference(
+        name='High-Performance Computer Architecture',
+        topics=['cs.AR', 'cs.DC', 'cs.PF', 'cs.OS', 'cs.ET', 'cs.NE', 'cs.LG', 'cs.CR'],
+        category='Computer Architecture',
+        acceptance_rate=0.22,
+        conference_id='HPCA'
+    ),
+    'ISCA': Conference(
+        name='International Symposium on Computer Architecture',
+        topics=['cs.AR', 'cs.DC', 'cs.PF', 'cs.ET', 'cs.OS', 'cs.CR', 'cs.LG', 'cs.NE'],
+        category='Computer Architecture',
+        acceptance_rate=0.17,
+        conference_id='ISCA'
+    ),
+    'MICRO': Conference(
+        name='IEEE/ACM International Symposium on Microarchitecture',
+        topics=['cs.AR', 'cs.PF', 'cs.DC', 'cs.ET', 'cs.OS', 'cs.CR', 'cs.LG', 'cs.NE'],
+        category='Computer Architecture',
+        acceptance_rate=0.19,
+        conference_id='MICRO'
+    ),
+    'PPoPP': Conference(
+        name='Principles and Practice of Parallel Programming',
+        topics=['cs.DC', 'cs.PL', 'cs.AR', 'cs.PF', 'cs.DS', 'cs.OS', 'cs.LG', 'cs.CR'],
+        category='Computer Architecture',
+        acceptance_rate=0.21,
+        conference_id='PPoPP'
+    ),
+    'SC': Conference(
+        name='International Conference for High Performance Computing, Networking, Storage and Analysis',
+        topics=['cs.DC', 'cs.AR', 'cs.PF', 'cs.NI', 'cs.OS', 'cs.LG', 'cs.NA', 'cs.CE'],
+        category='Computer Architecture',
+        acceptance_rate=0.23,
+        conference_id='SC'
+    ),
+
+    # Computer Networks
+    'INFOCOM': Conference(
+        name='IEEE International Conference on Computer Communications',
+        topics=['cs.NI', 'cs.DC', 'cs.CR', 'cs.PF', 'cs.LG', 'cs.IT', 'cs.SY', 'cs.MA'],
+        category='Computer Networks',
+        acceptance_rate=0.19,
+        conference_id='INFOCOM'
+    ),
+    'MobiCom': Conference(
+        name='ACM International Conference on Mobile Computing and Networking',
+        topics=['cs.NI', 'cs.DC', 'cs.HC', 'cs.CR', 'cs.LG', 'eess.SP', 'cs.IT', 'cs.SY'],
+        category='Computer Networks',
+        acceptance_rate=0.16,
+        conference_id='MobiCom'
+    ),
+    'NSDI': Conference(
+        name='Symposium on Networked Systems Design and Implementation',
+        topics=['cs.NI', 'cs.DC', 'cs.OS', 'cs.CR', 'cs.DB', 'cs.LG', 'cs.PF', 'cs.SE'],
+        category='Computer Networks',
+        acceptance_rate=0.15,
+        conference_id='NSDI'
+    ),
+    'SIGCOMM': Conference(
+        name='ACM SIGCOMM Conference',
+        topics=['cs.NI', 'cs.DC', 'cs.CR', 'cs.PF', 'cs.LG', 'cs.IT', 'cs.OS', 'cs.SY'],
+        category='Computer Networks',
+        acceptance_rate=0.14,
+        conference_id='SIGCOMM'
+    ),
+
+    # Network & Information Security
+    'ACM CCS': Conference(
+        name='ACM Conference on Computer and Communications Security',
+        topics=['cs.CR', 'cs.CY', 'cs.AI', 'cs.NI', 'cs.SE', 'cs.LG', 'cs.DB', 'cs.PL'],
+        category='Network and Information Security',
+        acceptance_rate=0.19,
+        conference_id='ACM CCS'
+    ),
+    'CRYPTO': Conference(
+        name='International Cryptology Conference',
+        topics=['cs.CR', 'cs.IT', 'math.NT', 'cs.CC', 'quant-ph', 'cs.DS', 'math.CO', 'cs.LO'],
+        category='Network and Information Security',
+        acceptance_rate=0.21,
+        conference_id='CRYPTO'
+    ),
+    'EUROCRYPT': Conference(
+        name='European Cryptology Conference',
+        topics=['cs.CR', 'math.NT', 'cs.IT', 'cs.CC', 'quant-ph', 'cs.DS', 'math.CO', 'cs.LO'],
+        category='Network and Information Security',
+        acceptance_rate=0.22,
+        conference_id='EUROCRYPT'
+    ),
+    'S&P': Conference(
+        name='IEEE Symposium on Security and Privacy',
+        topics=['cs.CR', 'cs.CY', 'cs.AI', 'cs.SE', 'cs.NI', 'cs.DB', 'cs.LG', 'cs.PL'],
+        category='Network and Information Security',
+        acceptance_rate=0.12,
+        conference_id='S&P'
+    ),
+    'USENIX Security': Conference(
+        name='USENIX Security Symposium',
+        topics=['cs.CR', 'cs.SE', 'cs.CY', 'cs.NI', 'cs.OS', 'cs.LG', 'cs.AI', 'cs.PL'],
+        category='Network and Information Security',
+        acceptance_rate=0.16,
+        conference_id='USENIX Security'
+    ),
+
+    # Software Engineering / Programming Languages
+    'ASE': Conference(
+        name='Automated Software Engineering',
+        topics=['cs.SE', 'cs.AI', 'cs.LG', 'cs.PL', 'cs.LO', 'cs.FL', 'cs.CY', 'cs.HC'],
+        category='Software Engineering',
+        acceptance_rate=0.20,
+        conference_id='ASE'
+    ),
+    'FSE': Conference(
+        name='Foundations of Software Engineering',
+        topics=['cs.SE', 'cs.PL', 'cs.LO', 'cs.AI', 'cs.LG', 'cs.CY', 'cs.HC', 'cs.CR'],
+        category='Software Engineering',
+        acceptance_rate=0.18,
+        conference_id='FSE'
+    ),
+    'ICSE': Conference(
+        name='International Conference on Software Engineering',
+        topics=['cs.SE', 'cs.AI', 'cs.HC', 'cs.PL', 'cs.LG', 'cs.CY', 'cs.CR', 'cs.LO'],
+        category='Software Engineering',
+        acceptance_rate=0.20,
+        conference_id='ICSE'
+    ),
+    'OOPSLA': Conference(
+        name='Object-Oriented Programming, Systems, Languages, and Applications',
+        topics=['cs.PL', 'cs.SE', 'cs.LO', 'cs.FL', 'cs.DS', 'cs.AI', 'cs.LG', 'cs.CR'],
+        category='Software Engineering',
+        acceptance_rate=0.22,
+        conference_id='OOPSLA'
+    ),
+    'PLDI': Conference(
+        name='Programming Language Design and Implementation',
+        topics=['cs.PL', 'cs.SE', 'cs.LO', 'cs.FL', 'cs.AR', 'cs.DS', 'cs.CR', 'cs.AI'],
+        category='Software Engineering',
+        acceptance_rate=0.18,
+        conference_id='PPLDI'
+    ),
+    'POPL': Conference(
+        name='Principles of Programming Languages',
+        topics=['cs.PL', 'cs.LO', 'cs.FL', 'math.LO', 'cs.SE', 'math.CT', 'cs.DS', 'cs.AI'],
+        category='Software Engineering',
+        acceptance_rate=0.19,
+        conference_id='POPL'
+    ),
+
+    # Databases / Data Mining / Content Retrieval
+    'ICDE': Conference(
+        name='IEEE International Conference on Data Engineering',
+        topics=['cs.DB', 'cs.LG', 'cs.IR', 'cs.AI', 'cs.DC', 'cs.SI', 'stat.ML', 'cs.DS'],
+        category='Databases and Data Mining',
+        acceptance_rate=0.18,
+        conference_id='ICDE'
+    ),
+    'KDD': Conference(
+        name='ACM SIGKDD Conference on Knowledge Discovery and Data Mining',
+        topics=['cs.LG', 'cs.DB', 'stat.ML', 'cs.AI', 'cs.SI', 'stat.AP', 'cs.IR', 'cs.CY'],
+        category='Databases and Data Mining',
+        acceptance_rate=0.15,
+        conference_id='KDD'
+    ),
+    'SIGIR': Conference(
+        name='International ACM SIGIR Conference on Research and Development in Information Retrieval',
+        topics=['cs.IR', 'cs.LG', 'cs.AI', 'cs.CL', 'cs.DB', 'cs.SI', 'stat.ML', 'cs.HC'],
+        category='Databases and Data Mining',
+        acceptance_rate=0.20,
+        conference_id='SIGIR'
+    ),
+    'SIGMOD': Conference(
+        name='ACM SIGMOD Conference',
+        topics=['cs.DB', 'cs.LG', 'cs.DS', 'cs.DC', 'cs.AI', 'cs.IR', 'stat.ML', 'cs.CR'],
+        category='Databases and Data Mining',
+        acceptance_rate=0.17,
+        conference_id='SIGMOD'
+    ),
+    'VLDB': Conference(
+        name='International Conference on Very Large Data Bases',
+        topics=['cs.DB', 'cs.LG', 'cs.DS', 'cs.DC', 'cs.AI', 'cs.IR', 'stat.ML', 'cs.CR'],
+        category='Databases and Data Mining',
+        acceptance_rate=0.18,
+        conference_id='VLDB'
+    ),
+
+    # Computer Graphics & Multimedia
+    'ACM MM': Conference(
+        name='ACM International Conference on Multimedia',
+        topics=['cs.MM', 'cs.CV', 'cs.LG', 'cs.AI', 'cs.HC', 'cs.IR', 'eess.IV', 'eess.AS'],
+        category='Computer Graphics and Multimedia',
+        acceptance_rate=0.24,
+        conference_id='ACM MM'
+    ),
+    'SIGGRAPH': Conference(
+        name='ACM SIGGRAPH Annual Conference',
+        topics=['cs.GR', 'cs.CV', 'cs.LG', 'cs.HC', 'cs.AI', 'cs.RO', 'physics.comp-ph', 'math.NA'],
+        category='Computer Graphics and Multimedia',
+        acceptance_rate=0.26,
+        conference_id='SIGGRAPH'
+    ),
+    'VR': Conference(
+        name='IEEE Virtual Reality',
+        topics=['cs.HC', 'cs.GR', 'cs.CV', 'cs.RO', 'cs.AI', 'cs.LG', 'eess.IV', 'cs.MM'],
+        category='Computer Graphics and Multimedia',
+        acceptance_rate=0.23,
+        conference_id='VR'
+    ),
+
+    # Artificial Intelligence
+    'AAAI': Conference(
+        name='AAAI Conference on Artificial Intelligence',
+        topics=['cs.AI', 'cs.LG', 'cs.MA', 'cs.RO', 'cs.CV', 'cs.CL', 'cs.GT', 'cs.HC'],
+        category='Artificial Intelligence',
+        acceptance_rate=0.20,
+        conference_id='AAAI'
+    ),
+    'AAMAS': Conference(
+        name='International Conference on Autonomous Agents and Multiagent Systems',
+        topics=['cs.MA', 'cs.AI', 'cs.GT', 'cs.LG', 'cs.RO', 'econ.TH', 'cs.CY', 'cs.SY'],
+        category='Artificial Intelligence',
+        acceptance_rate=0.24,
+        conference_id='AAMAS'
+    ),
+    'IJCAI': Conference(
+        name='International Joint Conference on Artificial Intelligence',
+        topics=['cs.AI', 'cs.LG', 'cs.MA', 'cs.RO', 'cs.CV', 'cs.CL', 'cs.GT', 'cs.HC'],
+        category='Artificial Intelligence',
+        acceptance_rate=0.21,
+        conference_id='IJCAI'
+    ),
+
+    # Computer Vision & Pattern Recognition
+    'CVPR': Conference(
+        name='IEEE/CVF Computer Vision and Pattern Recognition Conference',
+        topics=['cs.CV', 'cs.LG', 'cs.AI', 'cs.RO', 'cs.GR', 'cs.MM', 'eess.IV', 'stat.ML'],
+        category='Artificial Intelligence',
+        acceptance_rate=0.29,
+        conference_id='CVPR'
+    ),
+    'ECCV': Conference(
+        name='European Conference on Computer Vision',
+        topics=['cs.CV', 'cs.LG', 'cs.AI', 'cs.RO', 'cs.GR', 'cs.MM', 'stat.ML', 'eess.IV'],
+        category='Artificial Intelligence',
+        acceptance_rate=0.27,
+        conference_id='ECCV'
+    ),
+    'ICCV': Conference(
+        name='IEEE/CVF International Conference on Computer Vision',
+        topics=['cs.CV', 'cs.LG', 'cs.AI', 'cs.RO', 'cs.GR', 'cs.MM', 'stat.ML', 'eess.IV'],
+        category='Artificial Intelligence',
+        acceptance_rate=0.25,
+        conference_id='ICCV'
+    ),
+
+    # Machine Learning & Data Mining
+    'COLT': Conference(
+        name='Annual Conference on Learning Theory',
+        topics=['cs.LG', 'stat.ML', 'math.ST', 'cs.IT', 'stat.TH', 'math.OC', 'cs.CC', 'math.PR'],
+        category='Artificial Intelligence',
+        acceptance_rate=0.30,
+        conference_id='COLT'
+    ),
     'ICML': Conference(
         name='International Conference on Machine Learning',
-        topics=['machine_learning', 'deep_learning', 'neural_networks', 'reinforcement_learning', 'optimization'],
-        acceptance_rate=0.25
-    ),
-    'NeurIPS': Conference(
-        name='Neural Information Processing Systems',
-        topics=['neural_networks', 'deep_learning', 'neuroscience', 'theoretical_ml', 'reinforcement_learning'],
-        acceptance_rate=0.20
+        topics=['cs.LG', 'stat.ML', 'cs.AI', 'cs.NE', 'stat.ME', 'math.OC', 'cs.IT', 'stat.TH'],
+        category='Artificial Intelligence',
+        acceptance_rate=0.25,
+        conference_id='ICML'
     ),
     'ICLR': Conference(
         name='International Conference on Learning Representations',
-        topics=['representation_learning', 'deep_learning', 'neural_networks', 'generative_models'],
-        acceptance_rate=0.27
+        topics=['cs.LG', 'cs.AI', 'stat.ML', 'cs.NE', 'cs.CV', 'cs.CL', 'cs.RO', 'math.OC'],
+        category='Artificial Intelligence',
+        acceptance_rate=0.27,
+        conference_id='ICLR'
     ),
-    'CVPR': Conference(
-        name='Computer Vision and Pattern Recognition',
-        topics=['computer_vision', 'image_recognition', 'video_analysis', 'visual_perception'],
-        acceptance_rate=0.29
+    'NeurIPS': Conference(
+        name='Conference on Neural Information Processing Systems',
+        topics=['cs.LG', 'cs.AI', 'stat.ML', 'cs.NE', 'q-bio.NC', 'stat.TH', 'math.OC', 'cs.CV'],
+        category='Artificial Intelligence',
+        acceptance_rate=0.20,
+        conference_id='NeurIPS'
     ),
-    'NLP': Conference(
-        name='Natural Language Processing Conference',
-        topics=['natural_language_processing', 'language_models', 'text_mining', 'linguistics'],
-        acceptance_rate=0.30
+
+    # Natural Language Processing & Computational Linguistics
+    'ACL': Conference(
+        name='Annual Meeting of the Association for Computational Linguistics',
+        topics=['cs.CL', 'cs.AI', 'cs.LG', 'cs.IR', 'cs.HC', 'stat.ML', 'cs.CY', 'cs.SI'],
+        category='Artificial Intelligence',
+        acceptance_rate=0.23,
+        conference_id='ACL'
     ),
-    'KDD': Conference(
-        name='Knowledge Discovery and Data Mining',
-        topics=['data_mining', 'knowledge_discovery', 'applied_ml', 'data_science'],
-        acceptance_rate=0.15
-    )
+    'EMNLP': Conference(
+        name='Conference on Empirical Methods in Natural Language Processing',
+        topics=['cs.CL', 'cs.LG', 'cs.AI', 'cs.IR', 'stat.ML', 'cs.SI', 'cs.HC', 'cs.CY'],
+        category='Artificial Intelligence',
+        acceptance_rate=0.26,
+        conference_id='EMNLP'
+    ),
+
+    # Human-Computer Interaction & Ubiquitous Computing
+    'CHI': Conference(
+        name='ACM Conference on Human Factors in Computing Systems',
+        topics=['cs.HC', 'cs.AI', 'cs.CY', 'cs.LG', 'cs.SI', 'cs.CV', 'cs.RO', 'stat.AP'],
+        category='Human-Computer Interaction',
+        acceptance_rate=0.24,
+        conference_id='CHI'
+    ),
+    'UbiComp': Conference(
+        name='ACM International Joint Conference on Pervasive and Ubiquitous Computing',
+        topics=['cs.HC', 'cs.NI', 'cs.AI', 'cs.LG', 'cs.CY', 'eess.SP', 'cs.SI', 'stat.AP'],
+        category='Human-Computer Interaction',
+        acceptance_rate=0.21,
+        conference_id='UbiComp'
+    ),
+
+    # Robotics
+    'ICRA': Conference(
+        name='IEEE International Conference on Robotics and Automation',
+        topics=['cs.RO', 'cs.CV', 'cs.AI', 'cs.LG', 'cs.SY', 'cs.HC', 'eess.SY', 'stat.ML'],
+        category='Artificial Intelligence',
+        acceptance_rate=0.43,
+        conference_id='ICRA'
+    ),
+    'IROS': Conference(
+        name='IEEE/RSJ International Conference on Intelligent Robots and Systems',
+        topics=['cs.RO', 'cs.CV', 'cs.AI', 'cs.LG', 'cs.SY', 'cs.HC', 'eess.SY', 'stat.ML'],
+        category='Artificial Intelligence',
+        acceptance_rate=0.45,
+        conference_id='IROS'
+    ),
+    'RSS': Conference(
+        name='Robotics: Science and Systems',
+        topics=['cs.RO', 'cs.CV', 'cs.LG', 'cs.AI', 'cs.SY', 'cs.HC', 'stat.ML', 'eess.SY'],
+        category='Artificial Intelligence',
+        acceptance_rate=0.27,
+        conference_id='RSS'
+    ),
+
+    # Theoretical Computer Science
+    'FOCS': Conference(
+        name='IEEE Symposium on Foundations of Computer Science',
+        topics=['cs.CC', 'cs.DS', 'math.CO', 'cs.DM', 'quant-ph', 'cs.GT', 'math.OC', 'cs.IT'],
+        category='Theoretical Computer Science',
+        acceptance_rate=0.30,
+        conference_id='FOCS'
+    ),
+    'LICS': Conference(
+        name='Logic in Computer Science',
+        topics=['cs.LO', 'math.LO', 'cs.PL', 'cs.FL', 'math.CT', 'cs.AI', 'cs.CC', 'cs.CR'],
+        category='Theoretical Computer Science',
+        acceptance_rate=0.32,
+        conference_id='LICS'
+    ),
+    'SODA': Conference(
+        name='ACM-SIAM Symposium on Discrete Algorithms',
+        topics=['cs.DS', 'math.CO', 'cs.DM', 'cs.CC', 'math.OC', 'cs.CG', 'cs.IT', 'math.PR'],
+        category='Theoretical Computer Science',
+        acceptance_rate=0.29,
+        conference_id='SODA'
+    ),
+    'STOC': Conference(
+        name='ACM Symposium on Theory of Computing',
+        topics=['cs.CC', 'cs.DS', 'math.CO', 'cs.DM', 'quant-ph', 'cs.GT', 'cs.IT', 'math.OC'],
+        category='Theoretical Computer Science',
+        acceptance_rate=0.31,
+        conference_id='STOC'
+    ),
+
+    # Interdisciplinary / Web & Information Retrieval
+    'CSCW': Conference(
+        name='ACM Conference on Computer Supported Cooperative Work and Social Computing',
+        topics=['cs.HC', 'cs.SI', 'cs.CY', 'cs.AI', 'cs.LG', 'stat.AP', 'cs.IR', 'econ.GN'],
+        category='Interdisciplinary',
+        acceptance_rate=0.25,
+        conference_id='CSCW'
+    ),
+    'RTSS': Conference(
+        name='IEEE Real-Time Systems Symposium',
+        topics=['cs.OS', 'cs.DC', 'cs.AR', 'cs.PF', 'cs.SY', 'eess.SY', 'cs.NI', 'cs.SE'],
+        category='Interdisciplinary',
+        acceptance_rate=0.26,
+        conference_id='RTSS'
+    ),
+    'WWW': Conference(
+        name='The Web Conference',
+        topics=['cs.SI', 'cs.IR', 'cs.LG', 'cs.CY', 'cs.AI', 'cs.HC', 'cs.DB', 'stat.ML'],
+        category='Interdisciplinary',
+        acceptance_rate=0.17,
+        conference_id='WWW'
+    ),
 }
+
+CONFERENCES_BY_CATEGORY = {}
+for conference in CONFERENCES.values():
+    if conference.category not in CONFERENCES_BY_CATEGORY:
+        CONFERENCES_BY_CATEGORY[conference.category] = []
+    CONFERENCES_BY_CATEGORY[conference.category].append(conference)
+
+
+# Mapping from research direction topics to conference categories
+# This maps the topics in ResearchDirection to the conference categories
+TOPIC_TO_CATEGORY_MAPPING = {
+    # Artificial Intelligence category
+    'knowledge_representation': 'Artificial Intelligence',
+    'planning_and_scheduling': 'Artificial Intelligence',
+    'neural_symbolic_ai': 'Artificial Intelligence',
+    'natural_language_processing': 'Artificial Intelligence',
+    'dialogue_systems': 'Artificial Intelligence',
+    'image_recognition': 'Artificial Intelligence',
+    '3d_vision': 'Artificial Intelligence',
+    'video_understanding': 'Artificial Intelligence',
+    'deep_learning': 'Artificial Intelligence',
+    'reinforcement_learning': 'Artificial Intelligence',
+    'generative_models': 'Artificial Intelligence',
+    'meta-learning': 'Artificial Intelligence',
+    'interpretable_ml': 'Artificial Intelligence',
+    'robotics': 'Artificial Intelligence',
+
+    # Computer Architecture category
+    'computer_architecture': 'Computer Architecture',
+    'parallel_computing': 'Computer Architecture',
+    'distributed_systems': 'Computer Architecture',
+
+    # Computer Graphics and Multimedia category
+    'computer_graphics': 'Computer Graphics and Multimedia',
+    'multimedia_systems': 'Computer Graphics and Multimedia',
+    'audio_computing': 'Computer Graphics and Multimedia',
+
+    # Computer Networks category
+    'computer_networks': 'Computer Networks',
+
+    # Databases and Data Mining category
+    'database_systems': 'Databases and Data Mining',
+    'information_retrieval': 'Databases and Data Mining',
+    'digital_libraries': 'Databases and Data Mining',
+
+    # Human-Computer Interaction category
+    'human_computer_interaction': 'Human-Computer Interaction',
+
+    # Interdisciplinary category
+    'interdisciplinary_cs': 'Interdisciplinary',
+    'ai_ethics': 'Interdisciplinary',
+    'computational_science': 'Interdisciplinary',
+    'social_networks': 'Interdisciplinary',
+
+    # Network and Information Security category
+    'cryptography': 'Network and Information Security',
+    'cybersecurity': 'Network and Information Security',
+
+    # Software Engineering category
+    'software_engineering': 'Software Engineering',
+    'programming_languages': 'Software Engineering',
+    'operating_systems': 'Software Engineering',
+    'formal_methods': 'Software Engineering',
+
+    # Theoretical Computer Science category
+    'complexity_theory': 'Theoretical Computer Science',
+    'geometric_algorithms': 'Theoretical Computer Science',
+    'computational_topology': 'Theoretical Computer Science',
+    'discrete_mathematics': 'Theoretical Computer Science',
+    'algorithms': 'Theoretical Computer Science',
+    'data_structures': 'Theoretical Computer Science',
+    'logic_in_cs': 'Theoretical Computer Science',
+    'algorithmic_game_theory': 'Theoretical Computer Science',
+    'information_theory': 'Theoretical Computer Science',
+    'numerical_analysis': 'Theoretical Computer Science',
+    'symbolic_computation': 'Theoretical Computer Science',
+
+    # Special topics that don't fit clearly - assign to most relevant
+    'quantum_computing': 'Theoretical Computer Science',
+    'evolutionary_computation': 'Artificial Intelligence',
+    'multiagent_systems': 'Artificial Intelligence',
+    'mathematical_software': 'Theoretical Computer Science',
+    'performance_analysis': 'Computer Architecture',
+    'control_systems': 'Interdisciplinary',
+    'computing_education': 'Interdisciplinary',
+}
+
+
+def select_conferences_for_simulation(
+    agents: List,
+    num_conferences: int = 5,
+    
+) -> List[Conference]:
+    """Select conferences based on agent research interests
+
+    This function analyzes the distribution of agent expertise and selects
+    conferences proportionally to match research demand.
+
+    Args:
+        agents: List of agents with expertise_directions attribute
+        min_conferences_per_category: Minimum conferences per active category
+        max_conferences_per_category: Maximum conferences per category
+        total_conference_budget: Total number of conferences to include
+
+    Returns:
+        List of selected Conference objects
+    """
+    from collections import Counter
+
+    # Count agents per category based on their expertise
+    category_counts = Counter()
+
+    for agent in agents:
+        if hasattr(agent, 'expertise'):
+            # Get the topics from agent's expertise (which are ResearchDirection objects)
+            for expertise_item in agent.expertise:
+                # Handle both string topics and ResearchDirection objects
+                if isinstance(expertise_item, str):
+                    topic = expertise_item
+                else:
+                    topic = expertise_item.topic if hasattr(expertise_item, 'topic') else str(expertise_item)
+
+                # Map topic to category
+                category = TOPIC_TO_CATEGORY_MAPPING.get(topic, 'Interdisciplinary')
+                category_counts[category] += 1
+                
+    
+
+    num_agents = sum(category_counts.values())
+    selected_conferences = []
+    for category, count in category_counts.items():
+        ratio = count / num_agents
+        num_conferences_under_category = round(ratio * num_conferences)
+        print(f"Category {category} has {count} agents, {ratio * num_conferences:.2f} => {num_conferences_under_category} conferences")
+        selected_conferences.extend(CONFERENCES_BY_CATEGORY[category][:num_conferences_under_category])
+        
+    return selected_conferences
+
+    
+    
 
 
 def create_default_conference_system() -> ConferenceSystem:
@@ -386,5 +898,5 @@ def create_default_conference_system() -> ConferenceSystem:
     Returns:
         ConferenceSystem with standard ML/AI conferences
     """
-    conferences = list(PREDEFINED_CONFERENCES.values())
+    conferences = list(CONFERENCES.values())
     return ConferenceSystem(conferences)

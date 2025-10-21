@@ -22,7 +22,8 @@ from utopia.agents.base_agent import MultiAgentEcosystem
 from utopia.agents.conference import (
     ConferenceSystem,
     create_default_conference_system,
-    Conference
+    Conference,
+    select_conferences_for_simulation
 )
 from utopia.agents.research_direction import (
     assign_directions_batch,
@@ -79,9 +80,11 @@ class Simulation:
             agent_configs={},
             initial_paper_corpus=[]
         )
-        self.conference_system = create_default_conference_system()
+        self.conference_system = None  # Will be initialized after agents are created
         # Storage for simulation data
         self.yearly_results: List[Dict] = []
+        
+        self.conference_system: ConferenceSystem = None
 
     def initialize_agents(self):
         """Initialize the agent population
@@ -223,24 +226,19 @@ class Simulation:
         
         # Make sure there is no duplicate submission
         submitted_paper_arxiv_ids = set()
+        
+        
 
         # Process each agent with their retrieved documents
         for agent_idx, agent in enumerate(active_authors):
             candidate_paper_indices = topk_indices[agent_idx]
             candidate_papers = [self.rag.documents[idx] for idx in candidate_paper_indices if self.rag.documents[idx].metadata['id'] not in submitted_paper_arxiv_ids]
             candidate_papers_arxiv_ids = set([paper.metadata['id'] for paper in candidate_papers])
-            prompt, response_format = agent.get_paper_submission_prompt(candidate_papers)
-            
-            
-            
-            
-            
-
-
+            prompt, response_format = agent.get_paper_submission_prompt(candidate_papers, self.conference_system.conferences)
             submission_metadata = self.llm.generate(prompt=prompt, response_format=response_format)
             submission_metadata = json.loads(submission_metadata)
             assert submission_metadata['arxiv_id'] in candidate_papers_arxiv_ids, f"Proposed submission ({submission_metadata['arxiv_id']}) not in candidate papers {candidate_papers_arxiv_ids}"
-            
+            assert submission_metadata['conference'] in self.conference_system.conference_map, f"Proposed submission ({submission_metadata['conference']}) not in candidate conferences {self.conference_system.conference_map.keys()}"
             submitted_paper_arxiv_ids.add(submission_metadata['arxiv_id'])
             
             submitted_papers[agent.id] = self.rag.id2docs[submission_metadata['arxiv_id']]
@@ -352,6 +350,44 @@ class Simulation:
         self.initialize_agents()
 
         self.rag = RAG(config=RAGConfig(), debug=self.debug)
+
+        # Select conferences based on agent expertise distribution
+        logger.info("\n" + "=" * 60)
+        logger.info("CONFERENCE SELECTION")
+        logger.info("=" * 60)
+
+        # Get all agents with research capability
+        research_agents = [
+            agent for agent in self.ecosystem.agent_population
+            if hasattr(agent, 'expertise') and agent.expertise
+        ]
+
+        # Select conferences proportionally to agent expertise
+        selected_conferences = select_conferences_for_simulation(
+            agents=research_agents,
+            num_conferences=5
+        )
+        
+       
+
+        # Create conference system with selected conferences
+        self.conference_system = ConferenceSystem(conferences=selected_conferences)
+
+        # Log conference selection results
+        logger.info(f"\nSelected {len(selected_conferences)} conferences:")
+
+        from collections import Counter
+        category_distribution = Counter(conf.category for conf in selected_conferences)
+
+        for category, count in sorted(category_distribution.items()):
+            logger.info(f"  {category}: {count} conferences")
+            conferences_in_category = [
+                conf.name for conf in selected_conferences if conf.category == category
+            ]
+            for conf_name in conferences_in_category:
+                logger.info(f"    - {conf_name}")
+
+        logger.info("")
 
         # Run simulation for each year
         for year in range(1, self.num_years + 1):
