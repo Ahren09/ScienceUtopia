@@ -36,7 +36,8 @@ class UniversityResearcher(SimulationAgent):
         super().__init__(
             reputation=5,
             funding_level=funding_level,
-            agent_id=researcher_name
+            agent_id=researcher_name,
+            llm=llm
         )
         self.university_name = university_name
         self.can_author = True  # University researchers can write papers
@@ -133,14 +134,16 @@ class FreelancerAgent(SimulationAgent):
         researcher_name: str,
         funding_level: int = 30,
         agent_id: str = None,
-        expertise_directions: Optional[List] = None
+        expertise_directions: Optional[List] = None,
+        llm: LLM = None
     ):
 
         assert agent_id is not None, "agent_id is required"
         super().__init__(
             reputation=4,
             funding_level=funding_level,
-            agent_id=researcher_name
+            agent_id=researcher_name,
+            llm=llm
         )
 
         self.can_author = True   # Freelancers primarily write papers

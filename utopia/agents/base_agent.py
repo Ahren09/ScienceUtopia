@@ -147,33 +147,64 @@ class SimulationAgent:
         return paper_output
         
     def review_paper(self, paper: Dict) -> Dict:
+        """Generate review for a paper using LLM
+
+        Args:
+            paper: Paper dictionary with 'title', 'content', 'topics', etc.
+
+        Returns:
+            Review dictionary with 'overall_score', 'strengths', 'weaknesses', 'summary'
         """
-        Use internal AgentReview pipeline for comprehensive paper review functionality
-        """
-        from utopia.review import AgentReviewPipeline
-        
-        # Create agent-specific reviewer prompt incorporating past experiences
+        expertise = [e.topic if hasattr(e, 'topic') else str(e) for e in getattr(self, 'expertise', [])]
         memory_context = self._extract_review_memory_context()
         
-        # Use internal AgentReview pipeline with agent-specific configuration
-        agent_review_pipeline = AgentReviewPipeline(
-            client=getattr(self, '_llm_client', None),
-            model=self._get_review_model()
-        )
-        
-        # Generate review using internal review infrastructure
-        review = agent_review_pipeline.generate_review(
-            paper_content=paper.get('content', ''),
-            specializations=self.specializations,
-            memory_context=memory_context
-        )
-        
-        # Apply agent-specific biases and record review experience
+        # TODO: Generate topics for the papers
+
+        prompt = f"""You are a peer reviewer for an academic conference. Review the following paper based on your expertise and past experiences (e.g. your own past submissions, received reviews, your funding situations, your status level).
+
+Your Expertise: {', '.join(expertise)}
+
+## Paper
+
+Title: {paper.get('title', 'Unknown')}
+
+Abstract:
+{paper.get('content', '')}
+
+Paper Topics: {', '.join(paper.get('topics', []))}
+
+{f"**Memory Context**: {memory_context}" if memory_context else ""}
+
+## Review Instructions
+Provide an  comprehensive review with:
+1. Overall Score (1-5 scale):
+   - 5: Award-worthy (top 2.5%)
+   - 4: Strong accept
+   - 3: Borderline accept
+   - 2: Needs major revisions
+   - 1: Reject
+   
+2. A succinct, 1-sentence justification for the score.
+
+## Sample Response
+```json
+{{
+    "justification": "The paper has critical flaws and needs major revisions."
+    "overall_score": 2,
+}}
+```
+"""
+
+        review_json = self.llm.generate(prompt=prompt)
+        review = json.loads(review_json)
+
+        # Apply agent-specific biases
         final_review = self._apply_agent_review_biases(review)
-        
-        # Record this review experience in memory
+        final_review['reviewer_id'] = self.id
+
+        # Record review experience
         self._record_review_experience(paper, final_review, role="reviewer")
-        
+
         return final_review
         
     def process_received_reviews(self, reviews: List[Dict]):
@@ -345,35 +376,6 @@ class SimulationAgent:
             """
             return enhanced_prompt
         return base_prompt
-        
-    def _record_review_experience(self, paper: Dict, review: Dict, role: str = "reviewer"):
-        """Record experience from review interaction"""
-        experience = {
-            'role': role,
-            'paper_id': paper.get('id', 'unknown') if paper else 'unknown',
-            'review_quality': self._assess_review_quality(review),
-            'timestamp': time.time(),
-            'emotional_response': self._generate_emotional_response(review, role)
-        }
-        self.review_experiences.append(experience)
-        
-        # Update memory bank with thoughts/reflections
-        if role == "author" and self._is_toxic_review(review):
-            toxic_thought = f"Received harsh/toxic review. Consider being more critical when reviewing others' work."
-            self.memory_bank.append({
-                'type': 'toxic_review_received',
-                'thought': toxic_thought,
-                'timestamp': time.time(),
-                'trigger': 'negative_review_experience'
-            })
-        elif role == "reviewer" and self._had_recent_negative_experience():
-            retaliatory_thought = f"After my recent negative review experiences, I'm inclined to be more critical."
-            self.memory_bank.append({
-                'type': 'retaliatory_bias',
-                'thought': retaliatory_thought, 
-                'timestamp': time.time(),
-                'trigger': 'past_negative_experience'
-            })
             
     def _extract_review_memory_context(self) -> str:
         """Extract relevant behavioral context from memory bank"""
@@ -397,18 +399,7 @@ class SimulationAgent:
     def _apply_agent_review_biases(self, review: Dict) -> Dict:
         """Apply agent-specific biases to review - override in subclasses"""
         return review
-        
-    def _assess_idea_novelty(self, idea: Dict) -> float:
-        """Assess novelty of research idea"""
-        return 0.5  # Placeholder implementation
-        
-    def _assess_confidence(self, paper_output: Dict) -> float:
-        """Assess confidence in paper quality"""
-        return 0.7 if paper_output.get('success', False) else 0.3
-        
-    def _generate_review_expectations(self) -> str:
-        """Generate expectations about upcoming reviews"""
-        return "fair and constructive"
+    
         
     def _had_recent_negative_experience(self) -> bool:
         """Check if agent had recent negative review experiences"""

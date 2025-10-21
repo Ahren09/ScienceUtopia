@@ -15,7 +15,8 @@ import logging
 import os
 import random
 from typing import List, Dict
-
+import pickle
+from tqdm import tqdm
 
 
 from utopia.agents.base_agent import MultiAgentEcosystem
@@ -39,6 +40,8 @@ from utopia.agents.specialized_agents import (
 )
 from utopia.data.rag import RAG, RAGConfig
 from utopia.models.models import GPT, LLM
+
+from utopia.utils.generail_utils import project_setup
 
 # Setup logging
 logging.basicConfig(
@@ -224,25 +227,48 @@ class Simulation:
 
         assert topk_indices.shape[0] == len(active_authors)
         
-        # Make sure there is no duplicate submission
-        submitted_paper_arxiv_ids = set()
-        
-        
+        cache_path = os.path.join(self.output_dir, f"year_{year}_submitted_papers.pkl")
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
 
-        # Process each agent with their retrieved documents
-        for agent_idx, agent in enumerate(active_authors):
-            candidate_paper_indices = topk_indices[agent_idx]
-            candidate_papers = [self.rag.documents[idx] for idx in candidate_paper_indices if self.rag.documents[idx].metadata['id'] not in submitted_paper_arxiv_ids]
-            candidate_papers_arxiv_ids = set([paper.metadata['id'] for paper in candidate_papers])
-            prompt, response_format = agent.get_paper_submission_prompt(candidate_papers, self.conference_system.conferences)
-            submission_metadata = self.llm.generate(prompt=prompt, response_format=response_format)
-            submission_metadata = json.loads(submission_metadata)
-            assert submission_metadata['arxiv_id'] in candidate_papers_arxiv_ids, f"Proposed submission ({submission_metadata['arxiv_id']}) not in candidate papers {candidate_papers_arxiv_ids}"
-            assert submission_metadata['conference'] in self.conference_system.conference_map, f"Proposed submission ({submission_metadata['conference']}) not in candidate conferences {self.conference_system.conference_map.keys()}"
-            submitted_paper_arxiv_ids.add(submission_metadata['arxiv_id'])
+        submitted_papers, submitted_paper_arxiv_ids = {}, set()
+        submitted_papers_list = []
+        if self.debug and os.path.exists(cache_path):
+            with open(cache_path, "rb") as f:
+                submitted_papers_list = pickle.load(f)
+        else:
             
-            submitted_papers[agent.id] = self.rag.id2docs[submission_metadata['arxiv_id']]
             
+            for agent_idx, agent in enumerate(tqdm(active_authors, desc="Submitting papers")):
+                candidate_paper_indices = topk_indices[agent_idx]
+                candidate_papers = [self.rag.documents[idx] for idx in candidate_paper_indices if self.rag.documents[idx].metadata['id'] not in submitted_paper_arxiv_ids]
+                prompt, response_format = agent.get_paper_submission_prompt(candidate_papers, self.conference_system.conferences)
+                submission_metadata = json.loads(self.llm.generate(prompt=prompt, response_format=response_format))
+                arxiv_id = submission_metadata['arxiv_id']
+                assert arxiv_id in [p.metadata['id'] for p in candidate_papers]
+                assert submission_metadata['conference'] in self.conference_system.conference_map
+                paper_doc = self.rag.id2docs[arxiv_id]
+                paper_dict = {
+                    'id': arxiv_id,
+                    'author_id': agent.id,
+                    'title': paper_doc.metadata['title'],
+                    'content': paper_doc.page_content,
+                    'topics': paper_doc.metadata.get('categories', '').split(),
+                    'conference': submission_metadata['conference']
+                }
+                submitted_papers_list.append(paper_dict)
+                
+
+            with open(cache_path, "wb") as f:
+                pickle.dump(submitted_papers_list, f)
+            
+        for paper_dict in submitted_papers_list:
+            
+            conf: Conference = self.conference_system.conference_map[paper_dict['conference']]
+            if conf.submit_paper(paper_dict):
+                submitted_papers[paper_dict['author_id']] = paper_dict
+                submitted_paper_arxiv_ids.add(paper_dict['id'])
+            else:
+                raise ValueError(f"Paper {arxiv_id} submission to conference {paper_dict['conference']} failed")
             
         year_results['phases']['paper_submission'] = {
             'num_papers_submitted': len(submitted_papers),
@@ -261,24 +287,12 @@ class Simulation:
                 )
 
                 # Select 3 random reviewers
-                import random
+                
                 selected_reviewers = random.sample(reviewers, min(3, len(reviewers)))
 
                 for reviewer in selected_reviewers:
-                    try:
-                        # Generate review (simplified for demonstration)
-                        review = {
-                            'reviewer_id': reviewer.id,
-                            'paper_id': paper['id'],
-                            'overall_score': random.uniform(4.0, 9.0),  # Placeholder
-                            'strengths': ['Interesting approach', 'Well-motivated'],
-                            'weaknesses': ['Limited evaluation', 'Could improve clarity']
-                        }
-
-                        conference.add_review(paper['id'], review)
-
-                    except Exception as e:
-                        logger.error(f"  Review error: {e}")
+                    review = reviewer.review_paper(paper)
+                    conference.add_review(paper['id'], review)
 
         year_results['phases']['peer_review'] = {
             'reviews_conducted': sum(len(c.reviews) for c in self.conference_system.conferences)
@@ -470,6 +484,8 @@ def main():
     )
 
     args = parser.parse_args()
+    
+    project_setup()    
 
     llm = GPT(model_name=args.model)
 

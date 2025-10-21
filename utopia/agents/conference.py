@@ -37,11 +37,11 @@ class Conference:
         status: Current status in the conference cycle
     """
 
+    conference_id: str
     name: str
     topics: List[str]  # All research topics (first 3 are most preferred, sorted by preference)
     category: str = None  # General research category (e.g., "Artificial Intelligence", "Computer Networks")
     acceptance_rate: float = 0.3  # Target acceptance rate (0-1)
-    conference_id: str = None
     year: int = 0
     status: ConferenceStatus = ConferenceStatus.ACCEPTING_SUBMISSIONS
 
@@ -841,52 +841,38 @@ TOPIC_TO_CATEGORY_MAPPING = {
 def select_conferences_for_simulation(
     agents: List,
     num_conferences: int = 5,
-    
+    min_submissions_per_conf: int = 3
 ) -> List[Conference]:
-    """Select conferences based on agent research interests
-
-    This function analyzes the distribution of agent expertise and selects
-    conferences proportionally to match research demand.
+    """Select conferences ensuring each gets sufficient submissions
 
     Args:
-        agents: List of agents with expertise_directions attribute
-        min_conferences_per_category: Minimum conferences per active category
-        max_conferences_per_category: Maximum conferences per category
-        total_conference_budget: Total number of conferences to include
+        agents: List of agents with expertise
+        num_conferences: Target number of conferences
+        min_submissions_per_conf: Minimum expected submissions per conference
 
     Returns:
         List of selected Conference objects
     """
     from collections import Counter
 
-    # Count agents per category based on their expertise
     category_counts = Counter()
-
     for agent in agents:
         if hasattr(agent, 'expertise'):
-            # Get the topics from agent's expertise (which are ResearchDirection objects)
             for expertise_item in agent.expertise:
-                # Handle both string topics and ResearchDirection objects
-                if isinstance(expertise_item, str):
-                    topic = expertise_item
-                else:
-                    topic = expertise_item.topic if hasattr(expertise_item, 'topic') else str(expertise_item)
-
-                # Map topic to category
-                category = TOPIC_TO_CATEGORY_MAPPING.get(topic, 'Interdisciplinary')
-                category_counts[category] += 1
-                
-    
+                topic = expertise_item.topic if hasattr(expertise_item, 'topic') else str(expertise_item) if not isinstance(expertise_item, str) else expertise_item
+                category_counts[TOPIC_TO_CATEGORY_MAPPING.get(topic, 'Interdisciplinary')] += 1
 
     num_agents = sum(category_counts.values())
+    max_conferences = max(1, num_agents // min_submissions_per_conf)
+    num_conferences = min(num_conferences, max_conferences)
+
     selected_conferences = []
     for category, count in category_counts.items():
-        ratio = count / num_agents
-        num_conferences_under_category = round(ratio * num_conferences)
-        print(f"Category {category} has {count} agents, {ratio * num_conferences:.2f} => {num_conferences_under_category} conferences")
-        selected_conferences.extend(CONFERENCES_BY_CATEGORY[category][:num_conferences_under_category])
-        
-    return selected_conferences
+        num_confs = max(1, round((count / num_agents) * num_conferences))
+        print(f"Category {category}: {count} agents -> {num_confs} conference(s)")
+        selected_conferences.extend(CONFERENCES_BY_CATEGORY[category][:num_confs])
+
+    return selected_conferences[:num_conferences]
 
     
     
