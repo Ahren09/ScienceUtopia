@@ -35,8 +35,8 @@ from utopia.agents.research_direction import (
 from utopia.agents.specialized_agents import (
     UniversityResearcher,
     IndustryResearcher,
-    FreelancerAgent,
-    FundingAgent
+    FundingAgent,
+    FundingProgram
 )
 from utopia.data.rag import RAG, RAGConfig
 from utopia.models.models import GPT, LLM
@@ -61,20 +61,23 @@ class Simulation:
             llm,
             num_years: int = 5,
             output_dir: str = "./simulation_output",
-            debug: bool = False
+            debug: bool = False,
+            industry_funding_mode: str = "performance"
     ):
         """Initialize the simulation
 
         Args:
             num_years: Number of years to simulate
-            research_direction_selection_mode: Mode for research direction assignment - "batch" or "individual"
             output_dir: Directory to save simulation results
+            debug: Enable debug mode
+            industry_funding_mode: Funding mode for industry researchers - "performance" or "consistent"
         """
         self.llm: LLM = llm
         self.num_years = num_years
         self.output_dir = output_dir
         self.current_year = 0
         self.debug = debug
+        self.industry_funding_mode = industry_funding_mode
         # Create output directory
         os.makedirs(output_dir, exist_ok=True)
 
@@ -126,10 +129,11 @@ class Simulation:
                     company_name=company,
                     funding_level=90,
                     expertise=random.sample(AVAILABLE_DIRECTIONS, 3),
-                    llm=self.llm
+                    llm=self.llm,
+                    funding_mode=self.industry_funding_mode
                 )
                 self.ecosystem.add_agent(researcher)
-                logger.info(f"Added {researcher.id} from {company}")
+                logger.info(f"Added {researcher.id} from {company} (funding mode: {self.industry_funding_mode})")
                 counter += 1
 
         """
@@ -146,7 +150,9 @@ class Simulation:
         """
 
         # Add funding agents
-        funding_agencies = ["NSF", "NIH", "DARPA"]
+        # NSF: Foundational scientific advancement (patient, lower thresholds)
+        # DARPA: Application-driven projects (demanding, higher thresholds)
+        funding_agencies = ["NSF", "DARPA"]
         for agency in funding_agencies:
             funding_agent = FundingAgent(
                 agency_name=agency,
@@ -188,7 +194,7 @@ class Simulation:
         }
 
         # Phase 1: Assign research directions
-        logger.info("Phase 1: Assigning research directions...")
+        logger.info(f"Year {year} Phase 1: Assigning research directions...")
         authors = self.ecosystem.get_available_authors()
         active_authors = [a for a in authors if a.resources >= 20]  # Filter by minimum funding
 
@@ -203,7 +209,7 @@ class Simulation:
         }
 
         # Phase 2: Generate and submit papers
-        logger.info("Phase 2: Submitting papers...")
+        logger.info(f"Year {year} Phase 2: Submitting papers...")
         submitted_papers = {}
 
         research_ideas: List[str] = []
@@ -276,10 +282,10 @@ class Simulation:
         }
 
         # Phase 3: Peer review
-        
-        
-        
-        logger.info("Phase 3: Conducting peer reviews...")
+
+
+
+        logger.info(f"Year {year} Phase 3: Conducting peer reviews...")
         self.conference_system.start_all_review_processes()
         
         if self.debug:
@@ -310,7 +316,7 @@ class Simulation:
         }
 
         # Process received reviews for authors
-        logger.info("Processing author experiences from received reviews...")
+        logger.info(f"Year {year} Phase 3: Processing author experiences from received reviews...")
         for conference in self.conference_system.conferences:
             for paper in conference.submitted_papers:
                 paper_reviews = conference.reviews.get(paper['id'], [])
@@ -323,7 +329,7 @@ class Simulation:
         
 
         # Phase 4: Make acceptance decisions
-        logger.info("Phase 4: Making acceptance decisions...")
+        logger.info(f"Year {year} Phase 4: Making acceptance decisions...")
         decisions = {}
         for conf in self.conference_system.conferences:
             decision_one_conf = conf.make_acceptance_decisions()
@@ -341,28 +347,90 @@ class Simulation:
         logger.info(f"  Accepted: {total_accepted}, Rejected: {total_rejected}")
 
         # Phase 5: Update funding
-        logger.info("Phase 5: Updating agent funding...")
+        logger.info(f"Year {year} Phase 5: Updating agent funding...")
         funding_updates = {}
 
-        for agent in self.ecosystem.get_available_authors():
-            # Check if agent had papers accepted
-            agent_accepted = sum(
-                1 for conf_decisions in decisions.values()
-                for paper in conf_decisions['accepted']
-                if paper['author_id'] == agent.id
-            )
+        # Get funding agents
+        funding_agents = [
+            agent for agent in self.ecosystem.agent_population
+            if isinstance(agent, FundingAgent)
+        ]
 
-            # Simple funding model: gain funding for accepted papers, lose funding otherwise
-            if agent_accepted > 0:
-                funding_gain = 30 * agent_accepted
-                agent.resources = min(100, agent.resources + funding_gain)
-                funding_updates[agent.id] = f"+{funding_gain}"
-            else:
-                funding_loss = 10
-                agent.resources = max(0, agent.resources - funding_loss)
-                funding_updates[agent.id] = f"-{funding_loss}"
+        # Reset funding programs for new year
+        for funding_agent in funding_agents:
+            funding_agent.reset_programs_for_new_year()
+
+        # Process university researchers - apply for funding
+        university_applications = []
+        for agent in self.ecosystem.get_available_authors():
+            if isinstance(agent, UniversityResearcher):
+                # Count accepted papers
+                agent_accepted = sum(
+                    1 for conf_decisions in decisions.values()
+                    for paper in conf_decisions['accepted']
+                    if paper['author_id'] == agent.id
+                )
+
+                # Prepare funding application
+                research_direction = directions.get(agent.id)
+                if research_direction:
+                    proposal = f"Research in {', '.join(research_direction.keywords)}"
+                else:
+                    proposal = f"Research in {', '.join(agent.expertise if agent.expertise else ['general AI'])}"
+
+                application = agent.prepare_funding_application(
+                    past_performance=agent_accepted,
+                    current_research_direction=proposal
+                )
+                university_applications.append(application)
+
+        # Evaluate applications across all funding agencies
+        all_funding_decisions = []
+        for funding_agent in funding_agents:
+            decisions_from_agent = funding_agent.evaluate_funding_applications(
+                university_applications,
+                self.llm
+            )
+            all_funding_decisions.extend(decisions_from_agent)
+
+        # Apply funding decisions to university researchers
+        for decision in all_funding_decisions:
+            if decision['decision'] == 'fund':
+                agent = next(
+                    (a for a in self.ecosystem.agent_population if a.id == decision['applicant_id']),
+                    None
+                )
+                if agent:
+                    funding_amount = decision['funding_amount']
+                    agent.resources = min(100, agent.resources + funding_amount)
+                    funding_updates[agent.id] = {
+                        'type': 'grant',
+                        'amount': f"+{funding_amount}",
+                        'source': decision.get('program', 'Unknown')
+                    }
+
+        # Process industry researchers - apply funding mode
+        for agent in self.ecosystem.get_available_authors():
+            if isinstance(agent, IndustryResearcher):
+                # Count accepted papers
+                agent_accepted = sum(
+                    1 for conf_decisions in decisions.values()
+                    for paper in conf_decisions['accepted']
+                    if paper['author_id'] == agent.id
+                )
+
+                # Get funding allocation based on mode
+                funding_change = agent.get_funding_allocation(agent_accepted)
+                agent.resources = max(0, min(100, agent.resources + funding_change))
+
+                funding_updates[agent.id] = {
+                    'type': agent.funding_mode,
+                    'amount': f"+{funding_change}" if funding_change > 0 else str(funding_change),
+                    'papers': agent_accepted
+                }
 
         year_results['phases']['funding_update'] = funding_updates
+        year_results['phases']['funding_decisions'] = all_funding_decisions
 
         # Eliminate agents with zero funding
         eliminated_agents = [a.id for a in self.ecosystem.agent_population if
@@ -510,9 +578,17 @@ def main():
         help='Model to use for LLM (default: gpt-4o)'
     )
 
+    parser.add_argument(
+        '--industry-funding-mode',
+        type=str,
+        default='performance',
+        choices=['performance', 'consistent'],
+        help='Funding mode for industry researchers: "performance" (based on papers) or "consistent" (fixed allocation) (default: performance)'
+    )
+
     args = parser.parse_args()
-    
-    project_setup()    
+
+    project_setup()
 
     llm = GPT(model_name=args.model)
 
@@ -521,7 +597,8 @@ def main():
         llm=llm,
         num_years=args.years,
         output_dir=args.output_dir,
-        debug=args.debug
+        debug=args.debug,
+        industry_funding_mode=args.industry_funding_mode
     )
 
     simulation.run()

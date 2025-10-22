@@ -168,6 +168,8 @@ class Conference:
                 self.rejected_papers.append(paper)
 
         self.status = ConferenceStatus.DECISIONS_MADE
+        
+        print(f"Conference {self.conference_id}: Total: {len(self.submitted_papers)}. Accepted: {len(self.accepted_papers)}. Reject: {len(self.rejected_papers)}. ")
 
         return {
             'accepted': self.accepted_papers,

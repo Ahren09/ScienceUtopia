@@ -6,13 +6,13 @@ WITHOUT modifying any original files. All classes extend existing AI-Scientist c
 """
 
 from .base_agent import MultiAgentEcosystem, SimulationAgent
-from .specialized_agents import UniversityAgent, IndustryAgent, FreelancerAgent, FundingAgent
+from .specialized_agents import UniversityResearcher, IndustryResearcher, FreelancerAgent, FundingAgent
 
 __all__ = [
     'MultiAgentEcosystem',
     'SimulationAgent', 
-    'UniversityAgent',
-    'IndustryAgent',
+    'UniversityResearcher',
+    'IndustryResearcher',
     'FreelancerAgent',
     'FundingAgent'
 ]

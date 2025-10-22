@@ -608,3 +608,7 @@ AVAILABLE_DIRECTIONS = [
                   "embedded systems", "real time control", "sensor networks", "actuator control", "system identification"]
     ),
 ]
+
+
+# Create a dictionary mapping from topic to ResearchDirection for easy lookup
+DIRECTIONS_DICT = {direction.topic: direction for direction in AVAILABLE_DIRECTIONS}

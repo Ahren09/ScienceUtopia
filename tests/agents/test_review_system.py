@@ -7,7 +7,7 @@ import sys
 sys.path.append('/nethome/yjin328/Workspace/PeerReview/AI-Scientist-v2')
 
 from utopia.review import AgentReviewPipeline, ReviewPrompts
-from utopia.agents.specialized_agents import UniversityAgent, IndustryAgent
+from utopia.agents.specialized_agents import UniversityResearcher, IndustryResearcher
 
 
 def test_review_pipeline_initialization():
@@ -86,8 +86,8 @@ def test_agent_integration():
     print("Testing agent integration...")
     
     # Create agents
-    uni_agent = UniversityAgent("TestU", funding_level=100)
-    ind_agent = IndustryAgent("TestCorp", funding_level=100)
+    uni_agent = UniversityResearcher("TestU", funding_level=100)
+    ind_agent = IndustryResearcher("TestCorp", funding_level=100)
     
     # Test paper review
     test_paper = {

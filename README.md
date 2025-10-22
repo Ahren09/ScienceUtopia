@@ -15,13 +15,13 @@ This system creates a multi-agent simulation where different types of academic e
 
 ## 🤖 Agent Personality Types
 
-### 1. **Academic Rigorous** (`UniversityAgent`)
+### 1. **Academic Rigorous** (`UniversityResearcher`)
 - **Focus**: Theoretical contributions, fundamental knowledge advancement
 - **Values**: Reproducibility, peer review rigor, long-term scientific impact
 - **Biases**: Favors theoretical work, penalizes reproducibility concerns
 - **Funding Level**: 70/100
 
-### 2. **Commercial Practical** (`IndustryAgent`)
+### 2. **Commercial Practical** (`IndustryResearcher`)
 - **Focus**: Practical applications, scalable solutions, market viability
 - **Values**: Efficiency, real-world impact, competitive advantages  
 - **Biases**: Rewards practical/scalable work, less penalty for theoretical gaps
@@ -76,11 +76,11 @@ python tests/agents/test_review_system.py
 
 ### Basic Agent Creation
 ```python
-from ai_scientist.agents.specialized_agents import UniversityAgent, IndustryAgent
+from ai_scientist.agents.specialized_agents import UniversityResearcher, IndustryResearcher
 
 # Create different agent types
-uni_agent = UniversityAgent("MIT", funding_level=75)
-industry_agent = IndustryAgent("OpenAI", funding_level=95)
+uni_agent = UniversityResearcher("MIT", funding_level=75)
+industry_agent = IndustryResearcher("OpenAI", funding_level=95)
 
 # Generate paper review
 test_paper = {'content': 'Research paper content...', 'metadata': {...}}
@@ -98,8 +98,8 @@ ecosystem = MultiAgentEcosystem({}, [])
 
 # Add diverse agent population
 agents = [
-    UniversityAgent("Harvard", funding_level=80),
-    IndustryAgent("Google", funding_level=95),
+    UniversityResearcher("Harvard", funding_level=80),
+    IndustryResearcher("Google", funding_level=95),
     FreelancerAgent("IndependentResearcher", funding_level=25),
     FundingAgent("NSF", funding_level=100)
 ]
@@ -132,7 +132,7 @@ This framework enables investigation of:
 ai_scientist/
 ├── agents/                    # Multi-agent system
 │   ├── base_agent.py         # Core SimulationAgent and MultiAgentEcosystem
-│   └── specialized_agents.py # UniversityAgent, IndustryAgent, etc.
+│   └── specialized_agents.py # UniversityResearcher, IndustryResearcher, etc.
 ├── review/                   # Internal review system
 │   ├── __init__.py
 │   ├── prompts.py           # Personality-specific review prompts
