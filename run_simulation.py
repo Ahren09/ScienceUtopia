@@ -17,7 +17,7 @@ import random
 from typing import List, Dict
 import pickle
 from tqdm import tqdm
-
+from collections import Counter
 
 from utopia.agents.base_agent import MultiAgentEcosystem
 from utopia.agents.conference import (
@@ -111,7 +111,8 @@ class Simulation:
                     university_name=university,
                     funding_level=70,
                     expertise=random.sample(AVAILABLE_DIRECTIONS, 3),
-                    llm=self.llm
+                    llm=self.llm,
+                    generate_research_proposal=True
                 )
                 self.ecosystem.add_agent(researcher)
                 counter += 1
@@ -485,7 +486,7 @@ class Simulation:
         # Log conference selection results
         logger.info(f"\nSelected {len(selected_conferences)} conferences:")
 
-        from collections import Counter
+        
         category_distribution = Counter(conf.category for conf in selected_conferences)
 
         for category, count in sorted(category_distribution.items()):

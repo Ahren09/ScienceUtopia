@@ -25,7 +25,8 @@ class UniversityResearcher(SimulationAgent):
         university_name: str,
         funding_level: int = 70,
         expertise: Optional[List] = None,
-        llm = None
+        llm = None,
+        generate_research_proposal: bool = True
     ):
         """Initialize a university researcher
 
@@ -45,6 +46,9 @@ class UniversityResearcher(SimulationAgent):
         self.university_name = university_name
         self.can_author = True  # University researchers can write papers
         self.can_review = True  # University researchers can review papers
+        
+        # Do we use LLM to generate research proposal?
+        self.generate_research_proposal = generate_research_proposal
 
         # Store inherent expertise (3 research directions)
         self.expertise = expertise
@@ -72,7 +76,7 @@ class UniversityResearcher(SimulationAgent):
     def prepare_funding_application(
         self,
         past_performance: int,
-        current_research_direction: str
+        available_fundings: str
     ) -> Dict:
         """Prepare a funding application for submission to funding agencies
 
@@ -84,6 +88,36 @@ class UniversityResearcher(SimulationAgent):
             Dictionary with application details
         """
         # University researchers create detailed research proposals
+        if self.generate_research_proposal:
+            prompt = f"""You are a university researcher applying for a research funding.
+
+## About Yourself
+
+Your expertise lies in: {self.expertise}.
+You have a past performance of {past_performance} accepted papers.
+You have a current funding level of {self.resources}.
+
+## List of Available Fundings
+
+{available_fundings}
+
+## Your Task
+Generate a short research funding proposal (around 100 words) tailored for this funding application.
+
+## Sample Response
+```json
+{{
+    "research_direction": "theoretical_foundations",
+    "research_proposal": "We propose to study the theoretical foundations of {current_research_direction}."
+}}
+```
+"""
+            research_proposal = self.llm.generate(prompt=prompt)
+            current_research_direction = research_proposal.get('research_proposal', '')
+        else:
+            current_research_direction = current_research_direction
+        
+        
         application = {
             'applicant_id': self.id,
             'affiliation': self.university_name,
@@ -240,28 +274,41 @@ class FundingProgram:
         self,
         program_id: str,
         name: str,
-        budget: int,
         focus_areas: List[ResearchDirection],
-        min_score: float = 6.0,
-        max_awards: int = 5
+        funding_mode: str = "fixed_rate",  # "fixed_budget" or "fixed_rate"
+        budget: int = 100,  # Total budget for fixed_budget mode
+        funding_rate: float = 0.3  # Percentage of proposals to fund for fixed_rate mode
     ):
         self.program_id = program_id
         self.name = name
-        self.budget = budget  # Total budget available
-        self.focus_areas = focus_areas  # Research areas (ResearchDirection objects) this program targets
-        self.min_score = min_score  # Minimum score to be eligible
-        self.max_awards = max_awards  # Maximum number of awards per cycle
-        self.awarded_this_cycle = 0
-        self.remaining_budget = budget
+        self.focus_areas = focus_areas  # Research areas this program targets
+        self.funding_mode = funding_mode
+        
+        if funding_mode == "fixed_budget":
+            assert budget is not None, "budget is required for fixed_budget mode"
+            self.budget = budget  # Total budget available (for fixed_budget mode)
+        elif funding_mode == "fixed_rate":
+            assert funding_rate is not None, "funding_rate is required for fixed_rate mode"
+            self.funding_rate = funding_rate  # Percentage to fund (for fixed_rate mode)
+        else:
+            raise ValueError(f"Unknown funding mode: {funding_mode}")
 
     def reset_for_new_cycle(self):
         """Reset program state for a new funding cycle"""
-        self.awarded_this_cycle = 0
-        self.remaining_budget = self.budget
+        if self.funding_mode == "fixed_budget":
+            self.remaining_budget = self.budget
+        elif self.funding_mode == "fixed_rate":
+            pass
+        else:
+            raise ValueError(f"Unknown funding mode: {self.funding_mode}")
 
-    def can_award(self) -> bool:
-        """Check if program can still award funding"""
-        return self.awarded_this_cycle < self.max_awards and self.remaining_budget > 0
+
+    def calculate_funding_amount(self, num_winners: int) -> float:
+        """Calculate equal funding amount per winner"""
+        if self.funding_mode == "fixed_budget":
+            return self.budget / max(num_winners, 1) if num_winners > 0 else 0
+        else:  # fixed_rate mode
+            return self.budget / max(num_winners, 1) if num_winners > 0 else 0
 
 
 class FundingAgent(SimulationAgent):
@@ -306,15 +353,6 @@ class FundingAgent(SimulationAgent):
             
         return review
         
-    def allocate_funding(self, proposals: List[Dict]) -> List[Dict]:
-        """Use existing review infrastructure for funding decisions"""
-        funding_decisions = []
-        for proposal in proposals:
-            # Use review pipeline to evaluate funding proposals
-            evaluation = self.review_paper(proposal)  # Reuse review infrastructure
-            funding_decision = self._make_funding_decision(evaluation, proposal)
-            funding_decisions.append(funding_decision)
-        return funding_decisions
         
     def _initialize_funding_programs(self, agency_name: str):
         """Initialize funding programs based on agency type
@@ -326,16 +364,13 @@ class FundingAgent(SimulationAgent):
         """
         from .research_direction import DIRECTIONS_DICT
 
-        # Different agencies have different focus areas and budgets
+        # Different agencies have different focus areas and funding modes
         if agency_name == "NSF":
-            # NSF: Foundational scientific advancement
-            # Focus on theory, algorithms, and fundamental understanding
-            # More patient with longer-term research (lower min_score, higher budgets)
+            # NSF: Foundational scientific advancement - uses fixed budget mode
             self.funding_programs = [
                 FundingProgram(
                     program_id="NSF_THEORY",
                     name="NSF Standard Grant: Theoretical Foundations",
-                    budget=45,
                     focus_areas=[
                         DIRECTIONS_DICT["complexity_theory"],
                         DIRECTIONS_DICT["algorithms"],
@@ -344,13 +379,12 @@ class FundingAgent(SimulationAgent):
                         DIRECTIONS_DICT["discrete_mathematics"],
                         DIRECTIONS_DICT["geometric_algorithms"]
                     ],
-                    min_score=5.5,  # Lower threshold for fundamental research
-                    max_awards=5
+                    funding_mode="fixed_budget",
+                    budget=100
                 ),
                 FundingProgram(
                     program_id="NSF_AI_FOUNDATIONS",
                     name="NSF Standard Grant: AI Foundations",
-                    budget=50,
                     focus_areas=[
                         DIRECTIONS_DICT["knowledge_representation"],
                         DIRECTIONS_DICT["neural_symbolic_ai"],
@@ -359,13 +393,12 @@ class FundingAgent(SimulationAgent):
                         DIRECTIONS_DICT["interpretable_ml"],
                         DIRECTIONS_DICT["ai_ethics"]
                     ],
-                    min_score=5.5,
-                    max_awards=5
+                    funding_mode="fixed_budget",
+                    budget=120
                 ),
                 FundingProgram(
-                    program_id="NSF_SYSTEMS_THEORY",
+                    program_id="NSF_SYSTEM",
                     name="NSF Standard Grant: Systems & Architecture",
-                    budget=40,
                     focus_areas=[
                         DIRECTIONS_DICT["computer_architecture"],
                         DIRECTIONS_DICT["operating_systems"],
@@ -374,19 +407,16 @@ class FundingAgent(SimulationAgent):
                         DIRECTIONS_DICT["performance_analysis"],
                         DIRECTIONS_DICT["parallel_computing"]
                     ],
-                    min_score=6.0,
-                    max_awards=4
+                    funding_mode="fixed_budget",
+                    budget=80
                 )
             ]
         elif agency_name == "DARPA":
-            # DARPA: Application-driven, shorter-term projects
-            # Focus on deployment-ready systems, practical applications
-            # More demanding (higher min_score, smaller budgets but focused)
+            # DARPA: Application-driven - uses fixed rate mode (more selective)
             self.funding_programs = [
                 FundingProgram(
                     program_id="DARPA_AUTONOMOUS",
                     name="DARPA Program: Autonomous Systems Deployment",
-                    budget=50,
                     focus_areas=[
                         DIRECTIONS_DICT["robotics"],
                         DIRECTIONS_DICT["image_recognition"],
@@ -395,13 +425,13 @@ class FundingAgent(SimulationAgent):
                         DIRECTIONS_DICT["control_systems"],
                         DIRECTIONS_DICT["multiagent_systems"]
                     ],
-                    min_score=7.5,  # Higher threshold for application-readiness
-                    max_awards=3
+                    funding_mode="fixed_rate",
+                    funding_rate=0.2,  # Fund top 20%
+                    budget=100
                 ),
                 FundingProgram(
                     program_id="DARPA_SECURITY",
                     name="DARPA Program: Cybersecurity Applications",
-                    budget=45,
                     focus_areas=[
                         DIRECTIONS_DICT["cybersecurity"],
                         DIRECTIONS_DICT["cryptography"],
@@ -409,13 +439,13 @@ class FundingAgent(SimulationAgent):
                         DIRECTIONS_DICT["distributed_systems"],
                         DIRECTIONS_DICT["software_engineering"]
                     ],
-                    min_score=7.5,
-                    max_awards=3
+                    funding_mode="fixed_rate",
+                    funding_rate=0.25,  # Fund top 25%
+                    budget=90
                 ),
                 FundingProgram(
                     program_id="DARPA_AI_APPS",
                     name="DARPA Program: Applied AI Systems",
-                    budget=55,
                     focus_areas=[
                         DIRECTIONS_DICT["deep_learning"],
                         DIRECTIONS_DICT["natural_language_processing"],
@@ -424,25 +454,25 @@ class FundingAgent(SimulationAgent):
                         DIRECTIONS_DICT["reinforcement_learning"],
                         DIRECTIONS_DICT["human_computer_interaction"]
                     ],
-                    min_score=7.0,
-                    max_awards=4
+                    funding_mode="fixed_rate",
+                    funding_rate=0.3,  # Fund top 30%
+                    budget=110
                 )
             ]
         else:
-            # Default programs for other agencies
+            # Default programs for other agencies - mixed mode
             self.funding_programs = [
                 FundingProgram(
                     program_id=f"{agency_name}_GENERAL",
                     name=f"{agency_name} Standard Grant: General Computing",
-                    budget=40,
                     focus_areas=[
                         DIRECTIONS_DICT["deep_learning"],
                         DIRECTIONS_DICT["reinforcement_learning"],
                         DIRECTIONS_DICT["algorithms"],
                         DIRECTIONS_DICT["software_engineering"]
                     ],
-                    min_score=6.5,
-                    max_awards=4
+                    funding_mode="fixed_budget",
+                    budget=80
                 )
             ]
 
@@ -451,7 +481,7 @@ class FundingAgent(SimulationAgent):
         applications: List[Dict],
         llm: LLM
     ) -> List[Dict]:
-        """Evaluate funding applications from university researchers
+        """Evaluate funding applications using simplified funding modes
 
         Args:
             applications: List of funding application dicts with keys:
@@ -463,20 +493,18 @@ class FundingAgent(SimulationAgent):
         Returns:
             List of funding decisions
         """
-        
         decisions = []
-
+        
+        # Group applications by matching programs
+        program_applications = {}
         for app in applications:
             # Find matching programs based on expertise
-            # Compare ResearchDirection objects (app['expertise'] is a list of ResearchDirection objects)
             matching_programs = [
                 prog for prog in self.funding_programs
                 if any(expert_area in prog.focus_areas for expert_area in app.get('expertise', []))
-                and prog.can_award()
             ]
-
+            
             if not matching_programs:
-                # No matching programs available
                 decisions.append({
                     'applicant_id': app['applicant_id'],
                     'decision': 'reject',
@@ -485,18 +513,82 @@ class FundingAgent(SimulationAgent):
                     'rationale': 'No matching funding programs available'
                 })
                 continue
+                
+            # Use the first matching program (simplified)
+            selected_program = matching_programs[0]
+            if selected_program.program_id not in program_applications:
+                program_applications[selected_program.program_id] = {
+                    'program': selected_program,
+                    'applications': []
+                }
+            program_applications[selected_program.program_id]['applications'].append(app)
+        
+        # Process each program's applications
+        for program_id, data in program_applications.items():
+            program = data['program']
+            apps = data['applications']
+            
+            # Score all applications for this program
+            scored_apps = []
+            for app in apps:
+                score = self._score_application(app, program, llm)
+                scored_apps.append((app, score))
+            
+            # Sort by score (highest first)
+            scored_apps.sort(key=lambda x: x[1], reverse=True)
+            
+            # Determine winners based on funding mode
+            if program.funding_mode == "fixed_rate":
+                num_winners = max(1, int(len(scored_apps) * program.funding_rate))
+            else:  # fixed_budget mode
+                # Fund all proposals until budget runs out
+                num_winners = min(len(scored_apps), len([app for app, score in scored_apps if program.remaining_budget > 0]))
+            
+            # Calculate equal funding amount
+            if num_winners > 0:
+                funding_per_winner = program.calculate_funding_amount(num_winners)
+                
+                # Award funding to winners
+                for i, (app, score) in enumerate(scored_apps):
+                    if i < num_winners:
+                        decisions.append({
+                            'applicant_id': app['applicant_id'],
+                            'decision': 'fund',
+                            'funding_amount': funding_per_winner,
+                            'program': program.name,
+                            'rationale': f"Score {score:.1f} - Selected for funding"
+                        })
+                        program.remaining_budget -= funding_per_winner
+                    else:
+                        decisions.append({
+                            'applicant_id': app['applicant_id'],
+                            'decision': 'reject',
+                            'funding_amount': 0,
+                            'program': program.name,
+                            'rationale': f"Score {score:.1f} - Not selected for funding"
+                        })
+            else:
+                # No winners
+                for app, score in scored_apps:
+                    decisions.append({
+                        'applicant_id': app['applicant_id'],
+                        'decision': 'reject',
+                        'funding_amount': 0,
+                        'program': program.name,
+                        'rationale': f"Score {score:.1f} - No funding available"
+                    })
 
-            # Use LLM to evaluate the application
-            # Extract topic names from ResearchDirection objects for display
-            expertise_topics = [rd.topic if isinstance(rd, ResearchDirection) else str(rd)
-                              for rd in app.get('expertise', [])]
+        return decisions
 
-            program_descriptions = []
-            for p in matching_programs:
-                focus_topics = [rd.topic for rd in p.focus_areas]
-                program_descriptions.append(f"- {p.name}: Focus on {', '.join(focus_topics)}, Min Score: {p.min_score}")
-
-            prompt = f"""You are evaluating a funding application for {self.id}.
+    def _score_application(self, app: Dict, program: 'FundingProgram', llm: LLM) -> float:
+        """Score a single application for a specific program"""
+        # Extract topic names from ResearchDirection objects for display
+        expertise_topics = [rd.topic if isinstance(rd, ResearchDirection) else str(rd)
+                          for rd in app.get('expertise', [])]
+        
+        focus_topics = [rd.topic for rd in program.focus_areas]
+        
+        prompt = f"""You are evaluating a funding application for {program.name}.
 
 Application Details:
 - Applicant: {app['applicant_id']}
@@ -504,8 +596,7 @@ Application Details:
 - Expertise Areas: {', '.join(expertise_topics)}
 - Past Performance: {app.get('past_performance', 0)} accepted papers last year
 
-Available Programs:
-{chr(10).join(program_descriptions)}
+Program Focus: {', '.join(focus_topics)}
 
 Evaluate this application on a scale of 1-10 considering:
 1. Alignment with program focus areas
@@ -515,69 +606,16 @@ Evaluate this application on a scale of 1-10 considering:
 
 Return your evaluation in JSON format with "score" (number) and "rationale" (string) fields."""
 
+        try:
             evaluation = json.loads(llm.generate(prompt=prompt))
-            score = evaluation.get('score', 5.0)
-
-            # Find best matching program that applicant qualifies for
-            selected_program = None
-            for prog in sorted(matching_programs, key=lambda p: p.budget, reverse=True):
-                if score >= prog.min_score:
-                    selected_program = prog
-                    break
-
-            if selected_program:
-                # Award funding
-                funding_amount = int(selected_program.budget / selected_program.max_awards)
-                selected_program.awarded_this_cycle += 1
-                selected_program.remaining_budget -= funding_amount
-
-                decisions.append({
-                    'applicant_id': app['applicant_id'],
-                    'decision': 'fund',
-                    'funding_amount': funding_amount,
-                    'program': selected_program.name,
-                    'rationale': evaluation['rationale']
-                })
-            else:
-                decisions.append({
-                    'applicant_id': app['applicant_id'],
-                    'decision': 'reject',
-                    'funding_amount': 0,
-                    'program': None,
-                    'rationale': f"Score {score:.1f} below minimum threshold"
-                })
-
-        return decisions
+            return evaluation.get('score', 5.0)
+        except:
+            # Fallback scoring if LLM fails
+            return 5.0
 
     def reset_programs_for_new_year(self):
         """Reset all funding programs for a new funding cycle"""
         for program in self.funding_programs:
             program.reset_for_new_cycle()
 
-    def _make_funding_decision(self, evaluation: Dict, proposal: Dict) -> Dict:
-        """Make funding decision based on evaluation"""
-        score = evaluation.get('overall_score', 0)
-
-        # Conservative funding thresholds
-        if score >= 8.0:
-            decision = "fund"
-            amount = "high"
-        elif score >= 6.5:
-            decision = "fund"
-            amount = "medium"
-        elif score >= 5.5:
-            decision = "conditional_fund"
-            amount = "low"
-        else:
-            decision = "reject"
-            amount = "none"
-
-        return {
-            'proposal_id': proposal.get('id', 'unknown'),
-            'decision': decision,
-            'funding_amount': amount,
-            'evaluation_score': score,
-            'reviewer_id': self.id,
-            'rationale': evaluation.get('summary', 'No rationale provided')
-        }
 
