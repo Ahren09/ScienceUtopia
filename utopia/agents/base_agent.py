@@ -159,6 +159,14 @@ class SimulationAgent:
         memory_context = self._extract_review_memory_context()
         
         # TODO: Generate topics for the papers
+        
+        if memory_context:
+            memory_context = f"""## Memory Context
+{memory_context}
+"""
+            
+        else:
+            memory_context = ""
 
         prompt = f"""You are a peer reviewer for an academic conference. Review the following paper based on your expertise and past experiences (e.g. your own past submissions, received reviews, your funding situations, your status level).
 
@@ -173,7 +181,7 @@ Abstract:
 
 Paper Topics: {', '.join(paper.get('topics', []))}
 
-{f"**Memory Context**: {memory_context}" if memory_context else ""}
+{memory_context}
 
 ## Review Instructions
 Provide an  comprehensive review with:
@@ -202,60 +210,48 @@ Provide an  comprehensive review with:
         final_review = self._apply_agent_review_biases(review)
         final_review['reviewer_id'] = self.id
 
-        # Record review experience
-        self._record_review_experience(paper, final_review, role="reviewer")
-
         return final_review
         
-    def process_received_reviews(self, reviews: List[Dict]):
-        """Process reviews received for submitted paper and update memory"""
-        for review in reviews:
-            # Record experience as author receiving review
-            self._record_review_experience(None, review, role="author")
+    def process_received_reviews(self, reviews: List[Dict], paper_id: str = None):
+        """Process reviews received for submitted paper and update memory
+
+        Args:
+            reviews: List of review dictionaries
+            paper_id: ID of the paper that was reviewed
+        """
+        if not reviews:
+            return
+
+        # Calculate average score
+        avg_score = sum(r.get('overall_score', 0) for r in reviews) / len(reviews)
+
+        # Determine emotional response based on average score
+        if avg_score >= 4.0:
             
-            # Generate reflective thoughts about the review experience
-            if self._is_constructive_review(review):
-                positive_thought = f"Received constructive feedback. This motivates me to provide helpful reviews to others."
-                self.memory_bank.append({
-                    'type': 'positive_review_received',
-                    'thought': positive_thought,
-                    'timestamp': time.time(),
-                    'trigger': 'constructive_review'
-                })
-            elif self._is_toxic_review(review):
-                negative_thought = f"Received unnecessarily harsh review. This experience makes me question the review process."
-                self.memory_bank.append({
-                    'type': 'toxic_review_received', 
-                    'thought': negative_thought,
-                    'timestamp': time.time(),
-                    'trigger': 'toxic_review'
-                })
-    
+            thought = f"My paper received excellent reviews (avg: {avg_score:.2f})! This validates my research direction and boosts my confidence."
+            memory_type = 'excellent_reviews_received'
+        elif avg_score >= 3.0:
+            thought = f"My paper received moderately good reviews (avg: {avg_score:.2f}). There's room for improvement, but overall positive."
+            memory_type = 'good_reviews_received'
+        elif avg_score >= 2.0:
+            thought = f"My paper received average reviews (avg: {avg_score:.2f}). I need to work harder to improve my research quality."
+            memory_type = 'average_reviews_received'
+        else:
+            thought = f"My paper received very poor reviews (avg: {avg_score:.2f}). This is disappointing and frustrating."
+            memory_type = 'poor_reviews_received'
+
+        # Record overall experience
+        self.memory_bank.append({
+            'type': memory_type,
+            'thought': thought,
+            'timestamp': time.time(),
+            'avg_score': avg_score,
+            'num_reviews': len(reviews),
+            'paper_id': paper_id,
+        })
+
     # Helper methods (private)
     
-    def _get_agent_model(self) -> str:
-        """Get model for this agent type"""
-        return "gpt-4o"  # Default model
-        
-    def _get_writeup_model(self) -> str:
-        """Get writeup model for this agent"""
-        return "o1-preview"
-        
-    def _get_review_model(self) -> str:
-        """Get review model for this agent"""
-        return "gpt-4o"
-        
-    def _get_agent_output_dir(self) -> str:
-        """Get output directory for this agent"""
-        return f"/tmp/agent_{self.id}_output"
-        
-    def _filter_ideas_by_specialization(self, ideas: List) -> List:
-        """Filter ideas based on agent specializations"""
-        # Simple implementation - in practice would use more sophisticated filtering
-        if not ideas:
-            return []
-        return ideas  # Return all ideas for now
-        
     def _parse_pipeline_output(self, result: subprocess.CompletedProcess, output_dir: str) -> Dict:
         """Parse output from AI-Scientist pipeline"""
         if result.returncode != 0:
@@ -340,56 +336,35 @@ Provide an  comprehensive review with:
         return unique_venues / total_citations if total_citations > 0 else 0.0
         
     def _record_authoring_experience(self, idea: Dict, paper_output: Dict):
-        """Record thoughts and experiences from paper writing process"""
-        authoring_experience = {
-            'type': 'paper_authored',
-            'idea_novelty': self._assess_idea_novelty(idea),
-            'confidence_level': self._assess_confidence(paper_output),
-            'timestamp': time.time(),
-            'expectations': self._generate_review_expectations()
-        }
-        self.review_experiences.append(authoring_experience)
-        
-        # Add anticipatory thoughts about potential reviews
-        anticipation_thought = f"Completed paper on {idea.get('title', 'research topic')}. Expecting {'harsh' if self._had_recent_negative_experience() else 'fair'} reviews based on past experiences."
+        """Record paper authoring experience"""
         self.memory_bank.append({
             'type': 'paper_submission',
-            'thought': anticipation_thought,
             'timestamp': time.time(),
-            'trigger': 'paper_completion'
+            'expects_harsh': self._had_recent_negative_experience()
         })
-        
-    def _create_reviewer_prompt_with_memory(self) -> str:
-        """Create reviewer prompt that incorporates past experiences"""
-        base_prompt = self._get_personality_prompt()
-        
-        # Add memory-based behavioral modifications
-        memory_context = self._extract_review_memory_context()
-        if memory_context:
-            enhanced_prompt = f"""
-            {base_prompt}
-            
-            MEMORY CONTEXT: Based on your past experiences in the academic ecosystem:
-            {memory_context}
-            
-            Apply these learned behaviors when reviewing this paper.
-            """
-            return enhanced_prompt
-        return base_prompt
             
     def _extract_review_memory_context(self) -> str:
         """Extract relevant behavioral context from memory bank"""
         recent_memories = [m for m in self.memory_bank if time.time() - m['timestamp'] < 86400*30]  # Last 30 days
-        
+
         context_elements = []
         for memory in recent_memories[-5:]:  # Last 5 relevant memories
-            if memory['type'] == 'toxic_review_received':
+            mtype = memory.get('type', '')
+            if mtype == 'excellent_reviews_received':
+                context_elements.append("- Your recent paper received excellent reviews, making you feel confident and generous")
+            elif mtype == 'good_reviews_received':
+                context_elements.append("- Your recent paper received good reviews, putting you in a positive mood")
+            elif mtype == 'average_reviews_received':
+                context_elements.append("- Your recent paper received mixed reviews, making you more critical in your evaluations")
+            elif mtype == 'poor_reviews_received':
+                context_elements.append("- Your recent paper received poor reviews, making you frustrated and potentially harsher on others")
+            elif mtype == 'toxic_review_received':
                 context_elements.append("- You've received harsh reviews recently, making you more critical of others")
-            elif memory['type'] == 'retaliatory_bias':
+            elif mtype == 'retaliatory_bias':
                 context_elements.append("- You tend to give stricter reviews after negative experiences")
-            elif memory['type'] == 'positive_collaboration':
+            elif mtype == 'positive_collaboration':
                 context_elements.append("- Recent positive interactions make you more constructive")
-                
+
         return "\n".join(context_elements) if context_elements else ""
         
     def _get_personality_prompt(self) -> str:
@@ -403,37 +378,8 @@ Provide an  comprehensive review with:
         
     def _had_recent_negative_experience(self) -> bool:
         """Check if agent had recent negative review experiences"""
-        recent_experiences = [exp for exp in self.review_experiences 
-                            if time.time() - exp['timestamp'] < 86400*7]  # Last week
-        return any(exp.get('emotional_response') == 'negative' for exp in recent_experiences)
-        
-    def _is_constructive_review(self, review: Dict) -> bool:
-        """Check if review is constructive"""
-        # Simple heuristic - could be more sophisticated
-        return review.get('overall_score', 0) >= 6 and len(review.get('strengths', [])) > 0
-        
-    def _is_toxic_review(self, review: Dict) -> bool:
-        """Check if review is toxic/harsh"""
-        # Simple heuristic - could be more sophisticated
-        return review.get('overall_score', 10) <= 3 and len(review.get('weaknesses', [])) > 3
-        
-    def _assess_review_quality(self, review: Dict) -> str:
-        """Assess quality of review"""
-        if self._is_constructive_review(review):
-            return "constructive"
-        elif self._is_toxic_review(review):
-            return "toxic"
-        else:
-            return "neutral"
-            
-    def _generate_emotional_response(self, review: Dict, role: str) -> str:
-        """Generate emotional response to review experience"""
-        if role == "author":
-            if self._is_constructive_review(review):
-                return "positive"
-            elif self._is_toxic_review(review):
-                return "negative"
-        return "neutral"
+        recent = [e for e in self.review_experiences if time.time() - e['timestamp'] < 86400*7]
+        return any(e.get('emotional_response') == 'negative' for e in recent)
     
     def get_paper_submission_prompt(self, candidate_papers: List[Document], conferences: List[Conference], max_papers: int = 10) -> str:
         """Get research idea prompt for this agent"""

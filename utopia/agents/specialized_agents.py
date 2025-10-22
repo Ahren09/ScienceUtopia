@@ -188,7 +188,7 @@ class FundingAgent(SimulationAgent):
         self.funding_priorities = []
         self.risk_aversion = "moderate"
         self.can_author = False  # Funding agents typically don't write research papers
-        self.can_review = True   # Funding agents frequently serve as reviewers
+        self.can_review = False 
         
     def _get_personality_prompt(self) -> str:
         return """You are a funding agency representative who primarily serves as a reviewer

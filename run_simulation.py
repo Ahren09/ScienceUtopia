@@ -276,31 +276,58 @@ class Simulation:
         }
 
         # Phase 3: Peer review
+        
+        
+        
         logger.info("Phase 3: Conducting peer reviews...")
         self.conference_system.start_all_review_processes()
+        
+        if self.debug:
+            with open(os.path.join(self.output_dir, f"conference_system.pkl"), "rb") as f:
+                self.conference_system = pickle.load(f)
+            
 
-        for conference in self.conference_system.conferences:
-            for paper in conference.submitted_papers:
-                # Assign reviewers (excluding paper author)
-                reviewers = self.ecosystem.get_available_reviewers(
-                    exclude_agent_ids=[paper['author_id']]
-                )
+        else:
+            for conference in tqdm(self.conference_system.conferences, desc="Peer reviews"):
+                for paper in conference.submitted_papers:
+                    # Assign reviewers (excluding paper author)
+                    reviewers = self.ecosystem.get_available_reviewers(
+                        exclude_agent_ids=[paper['author_id']]
+                    )
 
-                # Select 3 random reviewers
-                
-                selected_reviewers = random.sample(reviewers, min(3, len(reviewers)))
+                    # Select 3 random reviewers
+                    selected_reviewers = random.sample(reviewers, min(3, len(reviewers)))
 
-                for reviewer in selected_reviewers:
-                    review = reviewer.review_paper(paper)
-                    conference.add_review(paper['id'], review)
+                    for reviewer in selected_reviewers:
+                        review = reviewer.review_paper(paper)
+                        conference.add_review(paper['id'], review)
+            
+            with open(os.path.join(self.output_dir, f"conference_system.pkl"), "wb") as f:
+                pickle.dump(self.conference_system, f)
 
         year_results['phases']['peer_review'] = {
             'reviews_conducted': sum(len(c.reviews) for c in self.conference_system.conferences)
         }
 
+        # Process received reviews for authors
+        logger.info("Processing author experiences from received reviews...")
+        for conference in self.conference_system.conferences:
+            for paper in conference.submitted_papers:
+                paper_reviews = conference.reviews.get(paper['id'], [])
+                if paper_reviews:
+                    # Find the author agent
+                    author = next((a for a in self.ecosystem.agent_population if a.id == paper['author_id']), None)
+                    if author and hasattr(author, 'process_received_reviews'):
+                        author.process_received_reviews(paper_reviews, paper_id=paper['id'])
+
+        
+
         # Phase 4: Make acceptance decisions
         logger.info("Phase 4: Making acceptance decisions...")
-        decisions = self.conference_system.make_all_decisions()
+        decisions = {}
+        for conf in self.conference_system.conferences:
+            decision_one_conf = conf.make_acceptance_decisions()
+            decisions[conf.conference_id] = decision_one_conf
 
         total_accepted = sum(len(d['accepted']) for d in decisions.values())
         total_rejected = sum(len(d['rejected']) for d in decisions.values())

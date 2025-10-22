@@ -138,7 +138,7 @@ class Conference:
 
             if not paper_reviews:
                 # No reviews - reject by default
-                avg_score = 0.0
+                raise ValueError(f"Paper {paper_id} has no reviews")
             else:
                 # Calculate weighted average score
                 avg_score = self._calculate_paper_score(paper_reviews)
@@ -153,7 +153,7 @@ class Conference:
         paper_scores.sort(key=lambda x: x['score'], reverse=True)
 
         # Accept top papers according to acceptance rate
-        num_to_accept = int(len(paper_scores) * self.acceptance_rate)
+        num_to_accept = min(1, round(len(paper_scores) * self.acceptance_rate))
 
         for i, item in enumerate(paper_scores):
             paper = item['paper']
@@ -189,8 +189,8 @@ class Conference:
         # Extract scores from reviews
         scores = []
         for review in reviews:
-            overall_score = review.get('overall_score', 5.0)
-            scores.append(overall_score)
+            
+            scores.append(review['overall_score'])
 
         # Calculate average
         return sum(scores) / len(scores)
