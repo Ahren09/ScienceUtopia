@@ -78,6 +78,7 @@ class Simulation:
         self.current_year = 0
         self.debug = debug
         self.industry_funding_mode = industry_funding_mode
+      
         # Create output directory
         os.makedirs(output_dir, exist_ok=True)
 
@@ -86,11 +87,10 @@ class Simulation:
             agent_configs={},
             initial_paper_corpus=[]
         )
-        self.conference_system = None  # Will be initialized after agents are created
+        self.conference_system: ConferenceSystem = None  # Will be initialized after agents are created
         # Storage for simulation data
         self.yearly_results: List[Dict] = []
         
-        self.conference_system: ConferenceSystem = None
 
     def initialize_agents(self):
         """Initialize the agent population
@@ -158,7 +158,7 @@ class Simulation:
             funding_agent = FundingAgent(
                 agency_name=agency,
                 funding_level=100,
-
+                llm=self.llm
             )
             self.ecosystem.add_agent(funding_agent)
             logger.info(f"Added funding agent: {agency}")
@@ -239,6 +239,7 @@ class Simulation:
 
         submitted_papers, submitted_paper_arxiv_ids = {}, set()
         submitted_papers_list = []
+        
         if self.debug and os.path.exists(cache_path):
             with open(cache_path, "rb") as f:
                 submitted_papers_list = pickle.load(f)
@@ -267,6 +268,9 @@ class Simulation:
 
             with open(cache_path, "wb") as f:
                 pickle.dump(submitted_papers_list, f)
+                
+                
+        submitted_papers_dict = {paper['id']: paper for paper in submitted_papers_list}
             
         for paper_dict in submitted_papers_list:
             
@@ -332,9 +336,21 @@ class Simulation:
         # Phase 4: Make acceptance decisions
         logger.info(f"Year {year} Phase 4: Making acceptance decisions...")
         decisions = {}
+        authors_to_accepted_papers = {}
+        authors_to_rejected_papers = {}
+        
+        print("TODO: store all accepted papers over years for each author")
         for conf in self.conference_system.conferences:
             decision_one_conf = conf.make_acceptance_decisions()
             decisions[conf.conference_id] = decision_one_conf
+            for paper in decision_one_conf['accepted']:
+                if paper['author_id'] not in authors_to_accepted_papers:
+                    authors_to_accepted_papers[paper['author_id']] = []
+                authors_to_accepted_papers[paper['author_id']].append(paper)
+            for paper in decision_one_conf['rejected']:
+                if paper['author_id'] not in authors_to_rejected_papers:
+                    authors_to_rejected_papers[paper['author_id']] = []
+                authors_to_rejected_papers[paper['author_id']].append(paper)
 
         total_accepted = sum(len(d['accepted']) for d in decisions.values())
         total_rejected = sum(len(d['rejected']) for d in decisions.values())
@@ -358,50 +374,66 @@ class Simulation:
         ]
 
         # Reset funding programs for new year
+        all_funding_programs = {}
         for funding_agent in funding_agents:
             funding_agent.reset_programs_for_new_year()
+            for program_id, program in funding_agent.funding_programs.items():
+                all_funding_programs[program_id] = program
 
         # Process university researchers - apply for funding
         university_applications = []
         for agent in self.ecosystem.get_available_authors():
             if isinstance(agent, UniversityResearcher):
-                # Count accepted papers
-                agent_accepted = sum(
-                    1 for conf_decisions in decisions.values()
-                    for paper in conf_decisions['accepted']
-                    if paper['author_id'] == agent.id
-                )
+                
 
-                # Prepare funding application
-                research_direction = directions.get(agent.id)
-                if research_direction:
-                    proposal = f"Research in {', '.join(research_direction.keywords)}"
-                else:
-                    proposal = f"Research in {', '.join(agent.expertise if agent.expertise else ['general AI'])}"
-
-                application = agent.prepare_funding_application(
-                    past_performance=agent_accepted,
-                    current_research_direction=proposal
+                # Step 1: Select funding programs based on expertise
+                success_history = agent.funding_success_history
+                selected_program_ids = agent.select_funding_programs(
+                    all_funding_programs,
+                    success_history,
+                    num_submitted_proposals=3
                 )
-                university_applications.append(application)
+                # Step 2: Prepare applications for selected programs
+                if selected_program_ids:
+                    application = agent.prepare_funding_application(
+                        past_accepted_papers=authors_to_accepted_papers.get(agent.id, []),
+                        past_rejected_papers=authors_to_rejected_papers.get(agent.id, []),
+                        programs=all_funding_programs,
+                        selected_program_ids=selected_program_ids,
+                        success_history=success_history
+                    )
+                    
+                    if application:
+                        application['author'] = agent
+                        university_applications.append(application)
 
         # Evaluate applications across all funding agencies
-        all_funding_decisions = []
+        all_funding_winners = []
         for funding_agent in funding_agents:
-            decisions_from_agent = funding_agent.evaluate_funding_applications(
+            winners_for_program = funding_agent.evaluate_funding_applications(
                 university_applications,
-                self.llm
+                submitted_papers_dict=submitted_papers_dict
             )
-            all_funding_decisions.extend(decisions_from_agent)
+            all_funding_winners.extend(winners_for_program)
 
-        # Apply funding decisions to university researchers
+        # Apply funding decisions to university researchers and update success history
         for decision in all_funding_decisions:
-            if decision['decision'] == 'fund':
-                agent = next(
-                    (a for a in self.ecosystem.agent_population if a.id == decision['applicant_id']),
-                    None
-                )
-                if agent:
+            agent = next(
+                (a for a in self.ecosystem.agent_population if a.id == decision['applicant_id']),
+                None
+            )
+            if agent and isinstance(agent, UniversityResearcher):
+                # Initialize success history if not exists
+                # Update success history for the program
+                program_id = decision.get('program_id')
+                if program_id:
+                    current_rate = agent.funding_success_history.get(program_id, 0.5)
+                    # Update with exponential moving average (alpha=0.3)
+                    new_success = 1.0 if decision['decision'] == 'fund' else 0.0
+                    agent.funding_success_history[program_id] = 0.7 * current_rate + 0.3 * new_success
+
+                # Apply funding if approved
+                if decision['decision'] == 'fund':
                     funding_amount = decision['funding_amount']
                     agent.resources = min(100, agent.resources + funding_amount)
                     funding_updates[agent.id] = {

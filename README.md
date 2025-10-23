@@ -108,8 +108,8 @@ for agent in agents:
     ecosystem.add_agent(agent)
 
 # Get available authors and reviewers
-authors = ecosystem.get_available_authors()    # 3 agents can author
-reviewers = ecosystem.get_available_reviewers() # 4 agents can review
+authors = ecosystem.get_available_authors()  
+reviewers = ecosystem.get_available_reviewers() 
 ```
 
 ## 🔬 Research Applications

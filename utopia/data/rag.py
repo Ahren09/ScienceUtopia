@@ -15,7 +15,7 @@ import asyncio
 import json
 import matplotlib.pyplot as plt
 import numpy as np
-# Visualization imports
+import re
 import pacmap
 import torch
 import torch.nn.functional as F
@@ -75,16 +75,21 @@ class RAG:
         if self.debug:
             dataset = read_json("data/additional_data_2024_7.json")
             for item in dataset:
+
+                
+                title = re.sub(r'\s+', ' ', item.get('title', '').replace('\n', ' ')).strip()
+                abstract = re.sub(r'\s+', ' ', item.get('summary', '').replace('\n', ' ')).strip()
+                
                 metadata = {
                     'id': item.get('id', ''),
-                    'title': item.get('title', ''),
+                    'title': title,
                     'tags': ', '.join(item.get('tags', [])),
                     'published': item.get('published', ''),
                 }
 
                 # Create document with summary as content
                 doc = Document(
-                    page_content=item.get('summary', ''),
+                    page_content=abstract,
                     metadata=metadata
                 )
                 self.id2docs[item['id']] = doc
