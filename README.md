@@ -33,7 +33,7 @@ This system creates a multi-agent simulation where different types of academic e
 - **Biases**: Strong rewards for novelty, heavy penalties for incremental work
 - **Funding Level**: 30/100
 
-### 4. **Conservative Strategic** (`FundingAgent`)
+### 4. **Conservative Strategic** (`FundingAgency`)
 - **Focus**: Strategic resource allocation, long-term impact assessment
 - **Values**: Solid execution, funding alignment, proven approaches
 - **Biases**: Slight bonus for strategic impact, penalty for high-risk work
@@ -76,7 +76,7 @@ python tests/agents/test_review_system.py
 
 ### Basic Agent Creation
 ```python
-from ai_scientist.agents.specialized_agents import UniversityResearcher, IndustryResearcher
+from ai_scientist.agents.researcher_agents import UniversityResearcher, IndustryResearcher
 
 # Create different agent types
 uni_agent = UniversityResearcher("MIT", funding_level=75)
@@ -91,7 +91,7 @@ print(f"Score: {review['overall_score']}/10")
 ### Multi-Agent Ecosystem
 ```python
 from ai_scientist.agents.base_agent import MultiAgentEcosystem
-from ai_scientist.agents.specialized_agents import *
+from ai_scientist.agents.researcher_agents import *
 
 # Create ecosystem
 ecosystem = MultiAgentEcosystem({}, [])
@@ -101,7 +101,7 @@ agents = [
     UniversityResearcher("Harvard", funding_level=80),
     IndustryResearcher("Google", funding_level=95),
     FreelancerAgent("IndependentResearcher", funding_level=25),
-    FundingAgent("NSF", funding_level=100)
+    FundingAgency("NSF", funding_level=100)
 ]
 
 for agent in agents:
@@ -132,7 +132,7 @@ This framework enables investigation of:
 ai_scientist/
 ├── agents/                    # Multi-agent system
 │   ├── base_agent.py         # Core SimulationAgent and MultiAgentEcosystem
-│   └── specialized_agents.py # UniversityResearcher, IndustryResearcher, etc.
+│   └── researcher_agents.py # UniversityResearcher, IndustryResearcher, etc.
 ├── review/                   # Internal review system
 │   ├── __init__.py
 │   ├── prompts.py           # Personality-specific review prompts

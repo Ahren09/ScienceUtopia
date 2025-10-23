@@ -7,7 +7,7 @@ import sys
 sys.path.append('/nethome/yjin328/Workspace/PeerReview/AI-Scientist-v2')
 
 from utopia.review import AgentReviewPipeline, ReviewPrompts
-from utopia.agents.specialized_agents import UniversityResearcher, IndustryResearcher
+from utopia.agents.researcher_agents import UniversityResearcher, IndustryResearcher
 
 
 def test_review_pipeline_initialization():

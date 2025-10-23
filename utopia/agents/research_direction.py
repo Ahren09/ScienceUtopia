@@ -22,6 +22,25 @@ class ResearchDirection:
     years: int = 2  # Years needed to complete research (1-4)
     keywords: List[str] = None  # 10-15 keywords describing the research area
 
+    def to_dict(self) -> Dict:
+        """Serialize to dictionary"""
+        return {
+            'topic': self.topic,
+            'focus_areas': self.focus_areas,
+            'years': self.years,
+            'keywords': self.keywords
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'ResearchDirection':
+        """Deserialize from dictionary"""
+        return cls(
+            topic=data['topic'],
+            focus_areas=data['focus_areas'],
+            years=data.get('years', 2),
+            keywords=data.get('keywords')
+        )
+
 
 def initialize_agent_expertise(
     agents: List,
@@ -102,7 +121,7 @@ AVAILABLE_DIRECTIONS = [
     # cs.AI - Artificial Intelligence (hot topic - multiple directions)
     # Fast-moving applied AI: 1-2 years
     ResearchDirection(
-        topic="knowledge_representation",
+        topic="artificial_intelligence",
         focus_areas=["ontologies", "semantic networks", "reasoning systems"],
         years=1,
         keywords=["knowledge graphs", "semantic web", "ontology engineering", "description logic",

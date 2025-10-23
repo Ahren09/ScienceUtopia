@@ -3,7 +3,7 @@ demo/
 tmp*
 ai_scientist/ideas/
 DOC.md
-
+thoughts.md
 # Byte-compiled / optimized / DLL files
 *__pycache__/
 *.py[cod]

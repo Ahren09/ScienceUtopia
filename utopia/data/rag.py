@@ -3,7 +3,6 @@ Advanced RAG Demo with Batch Retrieval and Visualization
 
 This demo implements advanced RAG techniques based on HuggingFace cookbook:
 - Batch retrieval from scientific paper summaries
-- Reranking with cross-encoder
 - Visualization with PaCMAP dimensionality reduction
 - Interactive scatter plots showing document clusters
 
@@ -21,8 +20,6 @@ import torch
 import torch.nn.functional as F
 from dataclasses import dataclass
 from datasets import load_dataset
-from langchain.retrievers import ContextualCompressionRetriever
-from langchain.retrievers.document_compressors import CohereRerank
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 # LangChain imports
@@ -37,8 +34,7 @@ from typing import List, Dict, Tuple, Optional
 
 from utopia.utils.data_utils import read_json
 
-# Set device for PyTorch operations
-DEVICE = "mps:0" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
+import pandas as pd
 
 
 @dataclass
@@ -50,31 +46,46 @@ class RAGConfig:
     num_retrieved_docs: int = 50
     num_docs_final: int = 5
     normalize_embeddings: bool = True
-    use_reranker: bool = False
-    reranker_model: str = "BAAI/bge-reranker-base"
+    use_langchain: bool = False
+    device: str = "mps:0" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
 
 
 class RAG:
-    """Advanced RAG system with batch retrieval, reranking, and visualization"""
+    """Advanced RAG system with batch retrieval, and visualization"""
 
-    def __init__(self, config: RAGConfig = None, use_langchain: bool = False, debug: bool = False):
-        self.config = config or RAGConfig()
+    def __init__(self, config: RAGConfig = None, use_langchain: bool = False, debug: bool = False, **kwargs):
+        self.config = config
         self.embeddings = None
         self.knowledge_index: Optional[FAISS] = None
-        self.document_embeddings: Optional[torch.Tensor] = None
         self.debug = debug
-        self.device = DEVICE
+        self.device = config.device
         self.use_langchain: bool = use_langchain
-        
-        # Each document is stored twice.
-        self.documents: List[Document] = []
+
+        # All documents and their mappings
+        self.documents: List[Document] = []  # All documents
+        self.document_embeddings: Optional[torch.Tensor] = None
         self.id2docs: Dict[str, Document] = {}
+
+        
+        self.document_status = pd.DataFrame(columns=['id', 'status'])
+        
+        
+        
+        # Track original document count (for separating external vs simulation papers)
+        self.original_doc_count: int = 0
+
+        if self.use_langchain:
+            pass
+
+        else:
+            assert kwargs.get('model') is not None, "Model must be provided if use_langchain is False"
+            self.sentence_transformer_model = kwargs.get('model')
         
     def load_documents(self, data_path: str = None) -> List[Document]:
         """Load documents from JSON file"""
         if self.debug:
             dataset = read_json("data/additional_data_2024_7.json")
-            for item in dataset:
+            for item in dataset[:128]:
 
                 
                 title = re.sub(r'\s+', ' ', item.get('title', '').replace('\n', ' ')).strip()
@@ -96,26 +107,43 @@ class RAG:
 
             docs = list(self.id2docs.values())
             self.documents = docs
+            self.document_status = pd.DataFrame(columns=['id', 'status'], data=[{'id': doc.metadata['id'], 'status': 'unsubmitted'} for doc in docs])
 
         else:
             dataset = load_dataset("Ahren09/SciEvo", "arxiv", split="train")
             self.documents = dataset
+            
+        
+    def mark_papers_as_submitted(self, paper_ids: List[str]):
+        """Mark papers as submitted"""
+        self.document_status.loc[self.document_status['id'].isin(paper_ids), 'status'] = 'submitted'
+        
 
-    def initialize_sentence_transformer(self):
+    def initialize_sentence_transformer(self, model):
         """Initialize SentenceTransformer embeddings"""
-        self.sentence_transformer_model = SentenceTransformer(self.config.embedding_model, device=self.device)
+        assert isinstance(model, SentenceTransformer), "Model must be a SentenceTransformer instance"
+        self.sentence_transformer_model = model
 
     def build_knowledge_index(self) -> FAISS:
-        """Build FAISS index with normalized embeddings using PyTorch tensors"""
-        print(f"Building knowledge index with {self.config.embedding_model}...")
+        """Build FAISS index with normalized embeddings using PyTorch tensors
+
+        Builds TWO separate indices:
+        1. Submission Index: For finding papers to submit
+        2. Citation Index: For finding papers to cite (superset of submission index)
+
+        Initially both indices contain the same documents since no papers are submitted yet.
+        """
+        print(f"Building dual knowledge indices with {self.config.embedding_model}...")
         print(f"Using device: {self.device}")
 
+        # Store original document count for tracking
+        self.original_doc_count = len(self.documents)
         t0 = time()
 
         if self.use_langchain:
+            raise NotImplementedError("LangChain is not supported yet")
             # Branch 1: LangChain + FAISS
             print("[LangChain] Using HuggingFaceEmbeddings + FAISS")
-
             # Initialize embeddings
             self.embeddings = HuggingFaceEmbeddings(
                 model_name=self.config.embedding_model,
@@ -124,7 +152,7 @@ class RAG:
                 show_progress=True
             )
 
-            # Build FAISS index
+            # Build FAISS index (legacy - kept for compatibility)
             self.knowledge_index = FAISS.from_documents(
                 self.documents,
                 self.embeddings
@@ -132,7 +160,7 @@ class RAG:
 
             # Store document embeddings for batch retrieval
             doc_texts = [doc.page_content for doc in self.documents]
-            print(f"Embedding {len(doc_texts)} documents...")
+            print(f"Embedding {len(doc_texts)} documents for both indices...")
 
             batch_size = 1024
             all_embeddings = []
@@ -145,26 +173,34 @@ class RAG:
                 all_embeddings.extend(batch_embeddings)
 
             doc_embeddings_np = np.array(all_embeddings)
-            self.document_embeddings = torch.from_numpy(doc_embeddings_np).float().to(self.device)
+            embeddings_tensor = torch.from_numpy(doc_embeddings_np).float().to(self.device)
 
             if self.config.normalize_embeddings:
-                self.document_embeddings = F.normalize(self.document_embeddings, p=2, dim=1)
+                embeddings_tensor = F.normalize(embeddings_tensor, p=2, dim=1)
 
-            print(f"[LangChain] Build index: {time() - t0:.2f} seconds")
+            # Both indices start with same embeddings
+            self.submission_embeddings = embeddings_tensor.clone()
+            self.citation_embeddings = embeddings_tensor.clone()
+
+            print(f"[LangChain] Build indices: {time() - t0:.2f} seconds")
 
         else:
             # Branch 2: Pure SentenceTransformer
-            print("[SentenceTransformer] Using pure SentenceTransformer")
+            print("[SentenceTransformer] Encoding documents using SentenceTransformer")
 
             # Initialize SentenceTransformer if not already done
-            self.sentence_transformer_model = SentenceTransformer(
-                self.config.embedding_model,
-                device=self.device
-            )
+            if not hasattr(self, 'sentence_transformer_model') or self.sentence_transformer_model is None:
+                self.sentence_transformer_model = SentenceTransformer(
+                    self.config.embedding_model,
+                    device=self.device
+                )
 
             # Encode all documents at once
             doc_texts = [doc.page_content for doc in self.documents]
             print(f"Encoding {len(doc_texts)} documents...")
+            
+            # https://arxiv.org/pdf/1234.12345.pdf -> 0
+            self.id2document_indices = {doc.metadata['id']: i for i, doc in enumerate(self.documents)}
 
             self.document_embeddings = self.sentence_transformer_model.encode(
                 doc_texts,
@@ -174,38 +210,49 @@ class RAG:
                 batch_size=64,
                 device=self.device
             )  # (D, dim)
-            print(f"[SentenceTransformer] Encode documents: {time() - t0:.2f} seconds")
+            
 
-        print(f"Document embeddings shape: {self.document_embeddings.shape}")
-        print(f"Knowledge index built with {len(self.documents)} documents")
+            print(f"[SentenceTransformer] Encode documents: {time() - t0:.2f} seconds")
 
         return self.knowledge_index
 
     def batch_retrieve(
-            self,
-            queries: List[str],
-            use_reranker: bool = None
-    ) -> List[List[Document]]:
+        self,
+        queries: List[str],
+        retrieval_type: str = "submission"
+    ) -> Dict:
         """
         Batch retrieve documents for multiple queries using PyTorch tensor operations
         Optimized for large document sets with GPU acceleration
 
         Args:
             queries: List of query strings
-            use_reranker: Whether to use reranker (default from config)
+            retrieval_type: Which index to use - "submission" for paper submission, "citation" for citing papers
 
         Returns:
-            List of document lists, one per query
+            Dictionary with 'topk_indices' and 'similarity_scores'
         """
-        if self.document_embeddings is None:
-            raise ValueError("Knowledge index not built. Call build_knowledge_index() first.")
-
-        use_reranker = use_reranker if use_reranker is not None else self.config.use_reranker
-
-        print(f"\nBatch retrieving for {len(queries)} queries...")
-        print(f"Initial retrieval: {self.config.num_retrieved_docs} docs per query")
-        if use_reranker:
-            print(f"Reranking to: {self.config.num_docs_final} docs per query")
+        # Select the appropriate index
+        if retrieval_type == "submission":
+            indices = (self.document_status['status'] == "unsubmitted").index.values
+            assert len(indices) > 0, "No candidate papers found!"
+            
+            print(f"\n[SUBMISSION INDEX] Batch retrieving for {len(queries)} queries...")
+        elif retrieval_type == "citation":
+            indices = (self.document_status['status'] == "accepted").index.values
+            assert len(indices) > 0, "No accepted papers found!"
+            print(f"\n[CITATION INDEX] Batch retrieving for {len(queries)} queries...")
+            
+        else:
+            raise ValueError(f"Invalid retrieval_type: {retrieval_type}. Must be 'submission' or 'citation'")
+        
+        indices = np.sort(indices)
+        mapping = {i: original_idx for i, original_idx in enumerate(indices)}
+        indices = torch.tensor(indices, device=self.device)
+        
+        
+        
+        document_embeddings = self.document_embeddings[indices]
 
         t0 = time()
 
@@ -232,7 +279,7 @@ class RAG:
             )  # (Q, dim)
 
         print(f"Query embeddings shape: {query_embeddings.shape}")
-        print(f"Document embeddings shape: {self.document_embeddings.shape}")
+        print(f"Document embeddings shape: {document_embeddings.shape}")
 
         # Compute similarity matrix: (Q, embedding_dim) @ (embedding_dim, D) = (Q, D)
         print("Computing similarity matrix...")
@@ -240,8 +287,8 @@ class RAG:
 
         all_similarity_scores = []
 
-        for i in trange(0, len(self.document_embeddings), self.config.batch_size):
-            batch_embeddings = self.document_embeddings[i:i + self.config.batch_size]
+        for i in trange(0, len(document_embeddings), self.config.batch_size):
+            batch_embeddings = document_embeddings[i:i + self.config.batch_size]
             similarity_scores = torch.mm(query_embeddings, batch_embeddings.T)
             all_similarity_scores.append(similarity_scores)
 
@@ -254,195 +301,37 @@ class RAG:
         t2 = time()
         _, topk_indices = torch.topk(similarity_scores, k=self.config.num_retrieved_docs, dim=1)
         topk_indices = topk_indices.cpu().numpy()
+        
+        topk_indices = np.vectorize(mapping.get)(topk_indices)
+
         print(f"Top-k selection time: {time() - t2:.2f} seconds")
 
-        # Build results list from indices
-        topk_docs = [[self.documents[idx] for idx in query_indices] for query_indices in topk_indices]
-
-        # Optional reranking
-        if use_reranker:
-            print("Applying reranking...")
-            if self.use_langchain:
-                reranked_indices = self._batch_rerank_documents_torch(queries, topk_indices, query_embeddings)
-            else:
-                reranked_indices = self._batch_rerank_documents_sentencetransformer(queries, topk_indices)
-
-            print(f"Total batch retrieval time: {time() - t0:.2f} seconds")
-            return {
-                'topk_indices': reranked_indices,
-                'similarity_scores': similarity_scores,
-            }
-        else:
-            print(f"Total batch retrieval time: {time() - t0:.2f} seconds")
-            return {
-                'topk_indices': topk_indices,
-                'similarity_scores': similarity_scores,
-            }
+        print(f"Total batch retrieval time: {time() - t0:.2f} seconds")
+        return {
+            'topk_indices': topk_indices,
+            'similarity_scores': similarity_scores,
+        }
 
     async def batch_retrieve_async(
             self,
             queries: List[str],
-            use_reranker: bool = None
-    ) -> List[List[Document]]:
+            retrieval_type: str = "submission"
+    ) -> Dict:
         """
         Async batch retrieval using vectorized operations
 
         Note: The actual computation is still synchronous (vectorized),
         but wrapped in async for API compatibility
         """
-        if self.knowledge_index is None:
-            raise ValueError("Knowledge index not built. Call build_knowledge_index() first.")
-
-        use_reranker = use_reranker if use_reranker is not None else self.config.use_reranker
-
         print(f"\nAsync batch retrieving for {len(queries)} queries...")
 
         # Wrap synchronous batch operation in async
         # The vectorized operations are already efficient
         results = await asyncio.to_thread(
-            self.batch_retrieve, queries, use_reranker
+            self.batch_retrieve, queries, retrieval_type
         )
 
         return results
-
-    def _batch_rerank_documents_sentencetransformer(
-            self,
-            queries: List[str],
-            topk_indices: np.ndarray,
-    ) -> np.ndarray:
-        """
-        Batch rerank using SentenceTransformer - returns reranked indices
-        No for-loops: processes all queries at once using vectorized operations
-
-        Args:
-            queries: List of query strings
-            topk_indices: Initial top-k indices (Q, num_retrieved_docs)
-            topk_docs: List of document lists (one per query)
-
-        Returns:
-            Reranked indices (Q, num_docs_final)
-        """
-        print("[SentenceTransformer Branch] Reranking with vectorized operations...")
-        t0 = time()
-
-        raise NotImplementedError("Reranking has bugs now")
-
-        # Encode all queries at once: (Q, dim)
-        query_embeddings = self.sentence_transformer_model.encode(
-            queries,
-            convert_to_tensor=True,
-            normalize_embeddings=self.config.normalize_embeddings,
-            device=self.device
-        )
-
-        # Flatten all candidate documents across all queries
-        all_doc_texts = [doc.page_content for doc in self.documents]
-
-        # Encode all documents at once: (total_docs, dim)
-        all_doc_embeddings = self.sentence_transformer_model.encode(
-            all_doc_texts,
-            convert_to_tensor=True,
-            normalize_embeddings=self.config.normalize_embeddings,
-            device=self.device,
-            show_progress_bar=False,
-        )
-
-        # Build block diagonal structure for batch processing
-        # Each query only computes similarity with its candidate documents
-        reranked_indices = []
-        doc_offset = 0
-
-        num_docs_per_query = topk_indices.shape[1]
-
-        for query_idx, num_docs in enumerate(num_docs_per_query):
-            if num_docs == 0:
-                reranked_indices.append([])
-                continue
-
-            # Get embeddings for this query's documents
-            doc_embs = all_doc_embeddings[topk_indices[query_idx]]  # (num_docs, dim)
-            query_emb = query_embeddings[query_idx]  # (dim,)
-
-            # Compute similarities: (num_docs,) = (num_docs, dim) @ (dim,)
-            similarities = torch.mv(doc_embs, query_emb)
-
-            # Get top-k local indices
-            _, local_top_indices = torch.topk(similarities, k=min(self.config.num_docs_final, num_docs))
-            local_top_indices = local_top_indices.cpu().numpy()
-
-            # Map to global indices
-            global_indices = topk_indices[query_idx][local_top_indices]
-            reranked_indices.append(global_indices)
-
-            doc_offset += num_docs
-
-        print(f"SentenceTransformer reranking time: {time() - t0:.2f} seconds")
-        return np.array(reranked_indices)
-
-    def _batch_rerank_documents_torch(
-            self,
-            queries: List[str],
-            topk_indices: np.ndarray,
-            query_embeddings: torch.Tensor
-    ) -> np.ndarray:
-        """
-        PyTorch-optimized batch rerank - returns reranked indices
-        No for-loops: processes all queries at once using vectorized operations
-
-        Args:
-            queries: List of query strings
-            topk_indices: Initial top-k indices (Q, num_retrieved_docs)
-            topk_docs: List of document lists (one per query)
-            query_embeddings: Pre-computed query embeddings as PyTorch tensor
-
-        Returns:
-            Reranked indices (Q, num_docs_final)
-        """
-        print("Reranking with PyTorch tensors (vectorized)...")
-        t0 = time()
-
-        # Flatten all candidate documents across all queries
-        all_doc_texts = [doc.page_content for docs in topk_docs for doc in docs]
-
-        # Encode all documents at once: (total_docs, dim)
-        print(f"    Encoding {len(all_doc_texts)} total candidate documents...")
-        all_doc_embeddings_np = np.array(self.embeddings.embed_documents(all_doc_texts))
-        all_doc_embeddings = torch.from_numpy(all_doc_embeddings_np).float().to(self.device)
-
-        # Normalize if required
-        if self.config.normalize_embeddings:
-            all_doc_embeddings = F.normalize(all_doc_embeddings, p=2, dim=1)
-
-        # Build block diagonal structure for batch processing
-        reranked_indices = []
-        doc_offset = 0
-
-        num_docs_per_query = [len(docs) for docs in topk_docs]
-
-        for query_idx, num_docs in enumerate(num_docs_per_query):
-            if num_docs == 0:
-                reranked_indices.append([])
-                continue
-
-            # Get embeddings for this query's documents
-            doc_embs = all_doc_embeddings[doc_offset:doc_offset + num_docs]  # (num_docs, dim)
-            query_emb = query_embeddings[query_idx]  # (dim,)
-
-            # Compute similarities: (num_docs,) = (num_docs, dim) @ (dim,)
-            similarities = torch.mv(doc_embs, query_emb)
-
-            # Get top-k local indices
-            _, local_top_indices = torch.topk(similarities, k=min(self.config.num_docs_final, num_docs))
-            local_top_indices = local_top_indices.cpu().numpy()
-
-            # Map to global indices
-            global_indices = topk_indices[query_idx][local_top_indices]
-            reranked_indices.append(global_indices)
-
-            doc_offset += num_docs
-
-        print(f"PyTorch reranking time: {time() - t0:.2f} seconds")
-        return np.array(reranked_indices)
 
     def visualize_embeddings(
             self,
@@ -584,3 +473,97 @@ class RAG:
 
             if len(docs) > max_docs_display:
                 print(f"\n  ... and {len(docs) - max_docs_display} more documents")
+                
+    def mark_papers_as_submitted(self, accepted_paper_ids: List[str], rejected_paper_ids: List[str]):
+        """Mark papers as submitted"""
+        self.document_status.loc[self.document_status['id'].isin(accepted_paper_ids), 'status'] = 'accepted'
+        self.document_status.loc[self.document_status['id'].isin(rejected_paper_ids), 'status'] = 'rejected'
+        
+
+    def add_documents_to_corpus(self, new_documents: List[Document]):
+        """
+        Add new documents (e.g., accepted papers from simulation) to the corpus.
+        These papers are added ONLY to the citation index (not submission index)
+        since they represent already-submitted papers.
+
+        Args:
+            new_documents: List of LangChain Document objects to add
+
+        Note:
+            This incrementally updates the knowledge base without rebuilding from scratch.
+        """
+        if not new_documents:
+            print("No new documents to add.")
+            return
+
+        print(f"Adding {len(new_documents)} new documents to citation index (already-submitted papers)...")
+        t0 = time()
+
+        # Add to document lists
+        docs_to_add = []
+        for doc in new_documents:
+            doc_id = doc.metadata.get('id', f"sim_{len(self.documents)}")
+            if doc_id not in self.id2docs:
+                self.documents.append(doc)
+                self.id2docs[doc_id] = doc
+                docs_to_add.append(doc)
+
+                # Add to citation index only
+                self.citation_documents.append(doc)
+                self.citation_doc_ids.add(doc_id)
+
+        if not docs_to_add:
+            print("All documents already in corpus.")
+            return
+
+        # Encode new documents
+        new_doc_texts = [doc.page_content for doc in docs_to_add]
+
+        if self.use_langchain:
+            # LangChain branch
+            print("[LangChain] Encoding new documents...")
+            new_embeddings_np = np.array(self.embeddings.embed_documents(new_doc_texts))
+            new_embeddings = torch.from_numpy(new_embeddings_np).float().to(self.device)
+
+            if self.config.normalize_embeddings:
+                new_embeddings = F.normalize(new_embeddings, p=2, dim=1)
+
+            # Update citation index only
+            self.citation_embeddings = torch.cat([self.citation_embeddings, new_embeddings], dim=0)
+
+            # Update FAISS index (legacy)
+            print("[LangChain] Updating FAISS index...")
+            self.knowledge_index.add_documents(docs_to_add)
+
+        else:
+            # SentenceTransformer branch
+            print("[SentenceTransformer] Encoding new documents...")
+            new_embeddings = self.sentence_transformer_model.encode(
+                new_doc_texts,
+                convert_to_tensor=True,
+                normalize_embeddings=self.config.normalize_embeddings,
+                show_progress_bar=True,
+                batch_size=64,
+                device=self.device
+            )
+
+            # Update citation index only
+            self.citation_embeddings = torch.cat([self.citation_embeddings, new_embeddings], dim=0)
+
+        print(f"Added {len(docs_to_add)} documents in {time() - t0:.2f} seconds")
+        print(f"Total documents in corpus: {len(self.documents)}")
+        print(f"Submission index: {len(self.submission_documents)} documents")
+        print(f"Citation index: {len(self.citation_documents)} documents")
+
+    def get_corpus_statistics(self) -> Dict:
+        """Get statistics about the corpus"""
+        simulation_papers = sum(1 for doc in self.documents
+                               if doc.metadata.get('source') == 'simulation')
+        external_papers = len(self.documents) - simulation_papers
+
+        return {
+            'total_documents': len(self.documents),
+            'external_papers': external_papers,
+            'simulation_papers': simulation_papers,
+            'original_doc_count': self.original_doc_count
+        }

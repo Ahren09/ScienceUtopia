@@ -24,13 +24,17 @@ class MultiAgentEcosystem:
     Multi-agent ecosystem that manages scientific agents without inheriting from AgentManager
     to avoid complex dependency issues during Phase 1 testing
     """
-    def __init__(self, agent_configs: Dict, initial_paper_corpus: List):
+    def __init__(self, agent_configs: Dict):
         # Initialize without inheriting from AgentManager for Phase 1 simplicity
         self.config = agent_configs
-        self.paper_archive = initial_paper_corpus
         self.citation_graph = nx.DiGraph()  # NetworkX graph for citations
         self.simulation_metrics = self._create_metrics_tracker()
-        self.agent_population = []  # Store all simulation agents
+        self.agent_population = {}  # Store all simulation agents
+        
+    def remove_agent(self, agent_id: str):
+        """Remove agent from ecosystem population"""
+        assert self.agent_population[agent_id].is_active, f"Agent {agent_id} is already not active"
+        self.agent_population[agent_id].is_active = False
         
     def _create_metrics_tracker(self):
         """Initialize metrics tracking system"""
@@ -43,19 +47,207 @@ class MultiAgentEcosystem:
         
     def add_agent(self, agent):
         """Add agent to ecosystem population"""
-        self.agent_population.append(agent)
+        self.agent_population[agent.id] = agent
+        
+    def get_agent_by_id(self, agent_id: str):
+        """Get agent by ID"""
+        return self.agent_population.get(agent_id)
         
     def get_available_reviewers(self, exclude_agent_ids: List = None):
         """Get agents that can serve as reviewers"""
         exclude_agent_ids = exclude_agent_ids or []
-        return [agent for agent in self.agent_population 
+        return [agent for agent_id, agent in self.agent_population.items() 
                 if hasattr(agent, 'can_review') and agent.can_review 
                 and agent.id not in exclude_agent_ids]
                 
     def get_available_authors(self):
         """Get agents that can author papers"""
-        return [agent for agent in self.agent_population 
+        return [agent for agent_id, agent in self.agent_population.items()
                 if hasattr(agent, 'can_author') and agent.can_author]
+
+    def to_dict(self) -> Dict:
+        """Serialize ecosystem to dictionary (without LLM objects)
+
+        Returns:
+            Dictionary with serialized state
+        """
+        from utopia.agents.researcher_agents import UniversityResearcher, IndustryResearcher
+        from utopia.agents.funding_agents import FundingAgency
+
+        agents_data = []
+        for agent_id, agent in self.agent_population.items():
+            agent_dict = {
+                'id': agent.id,
+                'resources': agent.resources,
+                'reputation': agent.reputation,
+                'memory_bank': agent.memory_bank,
+                'review_experiences': agent.review_experiences,
+                'is_active': agent.is_active,
+                'can_author': agent.can_author,
+                'can_review': agent.can_review,
+                
+            }
+
+            if isinstance(agent, UniversityResearcher):
+                agent_dict['type'] = 'UniversityResearcher'
+                agent_dict['university_name'] = agent.university_name
+                agent_dict['expertise'] = [exp.topic for exp in agent.expertise]
+                agent_dict['funding_success_history'] = agent.funding_success_history
+                agent_dict['conflict_of_interest'] = list(agent.conflict_of_interest)
+                agent_dict['generate_research_proposal'] = agent.generate_research_proposal
+
+            elif isinstance(agent, IndustryResearcher):
+                agent_dict['type'] = 'IndustryResearcher'
+                agent_dict['company_name'] = agent.company_name
+                agent_dict['expertise'] = [exp.topic for exp in agent.expertise]
+                agent_dict['funding_mode'] = agent.funding_mode
+                agent_dict['budget'] = agent.budget
+                agent_dict['conflict_of_interest'] = list(agent.conflict_of_interest)
+                agent_dict['funding_success_history'] = agent.funding_success_history
+
+            elif isinstance(agent, FundingAgency):
+                agent_dict['type'] = 'FundingAgency'
+                agent_dict['agency_name'] = agent.id
+                agent_dict['default_funding_rate'] = getattr(agent, 'default_funding_rate', None)
+                # Serialize funding programs
+                programs_data = {}
+                for prog_id, program in agent.funding_programs.items():
+                    programs_data[prog_id] = {
+                        'program_id': program.program_id,
+                        'name': program.name,
+                        'research_directions': [rd.to_dict() if hasattr(rd, 'to_dict') else rd for rd in program.research_directions],
+                        'funding_mode': program.funding_mode,
+                        'budget': getattr(program, 'budget', None),
+                        'budget_per_winner': getattr(program, 'budget_per_winner', None),
+                        'funding_rate': getattr(program, 'funding_rate', None)
+                    }
+                agent_dict['funding_programs'] = programs_data
+            else:
+                # Unknown agent type - skip or raise error
+                continue
+
+            agents_data.append(agent_dict)
+
+        return {
+            'config': self.config,
+            'agents': agents_data,
+            'simulation_metrics': self.simulation_metrics
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict, llm: LLM) -> 'MultiAgentEcosystem':
+        """Reconstruct ecosystem from dictionary
+
+        Args:
+            data: Dictionary with serialized state
+            llm: LLM instance to use for all agents
+
+        Returns:
+            Reconstructed MultiAgentEcosystem instance
+        """
+        from utopia.agents.researcher_agents import UniversityResearcher, IndustryResearcher
+        from utopia.agents.funding_agents import FundingAgency, FundingProgram
+        from utopia.agents.research_direction import ResearchDirection
+
+        # Create new ecosystem
+        ecosystem = cls(
+            agent_configs=data.get('config', {}),
+            initial_paper_corpus=[]
+        )
+
+        ecosystem.simulation_metrics = data.get('simulation_metrics', ecosystem._create_metrics_tracker())
+        # Reconstruct agents
+        all_agent_data = data.get('agents', [])
+        for agent_data in all_agent_data:
+            agent_type = agent_data['type']
+
+            if agent_type == 'UniversityResearcher':
+                # Reconstruct expertise
+                expertise = []
+                for exp_data in agent_data.get('expertise', []):
+                    if isinstance(exp_data, dict):
+                        expertise.append(ResearchDirection.from_dict(exp_data))
+                    else:
+                        expertise.append(exp_data)
+
+                agent = UniversityResearcher(
+                    researcher_name=agent_data['id'],
+                    university_name=agent_data['university_name'],
+                    funding_level=agent_data['resources'],
+                    expertise=expertise,
+                    llm=llm,
+                    generate_research_proposal=agent_data.get('generate_research_proposal', True)
+                )
+                agent.reputation = agent_data['reputation']
+                agent.memory_bank = agent_data.get('memory_bank', [])
+                agent.review_experiences = agent_data.get('review_experiences', [])
+                agent.is_active = agent_data.get('is_active', True)
+                agent.funding_success_history = agent_data.get('funding_success_history', {})
+                agent.conflict_of_interest = set(agent_data.get('conflict_of_interest', []))
+
+            elif agent_type == 'IndustryResearcher':
+                # Reconstruct expertise
+                expertise = []
+                for exp_data in agent_data.get('expertise', []):
+                    if isinstance(exp_data, dict):
+                        expertise.append(ResearchDirection.from_dict(exp_data))
+                    else:
+                        expertise.append(exp_data)
+
+                agent = IndustryResearcher(
+                    researcher_name=agent_data['id'],
+                    company_name=agent_data['company_name'],
+                    funding_level=agent_data['resources'],
+                    expertise=expertise,
+                    llm=llm,
+                    funding_mode=agent_data.get('funding_mode', 'performance')
+                )
+                agent.reputation = agent_data['reputation']
+                agent.memory_bank = agent_data.get('memory_bank', [])
+                agent.review_experiences = agent_data.get('review_experiences', [])
+                agent.is_active = agent_data.get('is_active', True)
+                agent.budget = agent_data.get('budget', agent.budget)
+                agent.research_priorities = set(agent_data.get('research_priorities', []))
+                agent.conflict_of_interest = set(agent_data.get('conflict_of_interest', []))
+                agent.funding_success_history = agent_data.get('funding_success_history', {})
+
+            elif agent_type == 'FundingAgency':
+                agent = FundingAgency(
+                    agency_name=agent_data['agency_name'],
+                    funding_level=agent_data['resources'],
+                    llm=llm,
+                    default_funding_rate=agent_data.get('default_funding_rate')
+                )
+                agent.reputation = agent_data['reputation']
+                agent.memory_bank = agent_data.get('memory_bank', [])
+                agent.review_experiences = agent_data.get('review_experiences', [])
+                agent.is_active = agent_data.get('is_active', True)
+
+                # Reconstruct funding programs
+                for prog_id, prog_data in agent_data.get('funding_programs', {}).items():
+                    research_directions = []
+                    for rd_data in prog_data.get('research_directions', []):
+                        if isinstance(rd_data, dict):
+                            research_directions.append(ResearchDirection.from_dict(rd_data))
+                        else:
+                            research_directions.append(rd_data)
+
+                    program = FundingProgram(
+                        program_id=prog_data['program_id'],
+                        name=prog_data['name'],
+                        research_directions=research_directions,
+                        funding_mode=prog_data['funding_mode'],
+                        budget=prog_data.get('budget'),
+                        budget_per_winner=prog_data.get('budget_per_winner'),
+                        funding_rate=prog_data.get('funding_rate')
+                    )
+                    agent.funding_programs[prog_id] = program
+            else:
+                continue
+
+            ecosystem.add_agent(agent)
+
+        return ecosystem
 
 
 class SimulationAgent:
@@ -69,6 +261,7 @@ class SimulationAgent:
         self.memory_bank = []  # Store experiences and thoughts from interactions
         self.review_experiences = []  # Track experiences as both author and reviewer
         self.llm = llm
+        self.is_active = True
         
     def generate_research_idea(self, citation_context: List, research_focus: str = None) -> Dict:
         """
@@ -145,6 +338,11 @@ class SimulationAgent:
         self._record_authoring_experience(idea, paper_output)
         
         return paper_output
+        
+    def update_resources(self, delta: float):
+        """Update researcher resources"""
+        assert isinstance(delta, (int, float)), "changes in funding level must be a valid number"
+        self.resources += delta
         
     def review_paper(self, paper: Dict) -> Dict:
         """Generate review for a paper using LLM
@@ -381,15 +579,39 @@ Provide an  comprehensive review with:
         recent = [e for e in self.review_experiences if time.time() - e['timestamp'] < 86400*7]
         return any(e.get('emotional_response') == 'negative' for e in recent)
     
-    def get_paper_submission_prompt(self, candidate_papers: List[Document], conferences: List[Conference], max_papers: int = 10) -> str:
-        """Get research idea prompt for this agent"""
-        
+    def get_paper_submission_prompt(self, candidate_papers: List[Document], conferences: List[Conference], max_papers: int = 10, previous_papers: List[str] = None) -> str:
+        """
+        Get research idea prompt for this agent
+
+        Args:
+            candidate_papers: Candidate papers from RAG retrieval
+            conferences: List of conferences to submit to
+            max_papers: Maximum number of candidate papers to show
+            previous_papers: Optional list of preview strings for previously accepted papers
+        """
+
         expertise = [research_direction.topic for research_direction in self.expertise]
         prompt = f"""
-You are a researcher specializing in {', '.join(expertise)}. 
-You plan to do a project and submit a paper to a conference. 
+You are a researcher specializing in {', '.join(expertise)}.
+You plan to do a project and submit a paper to a conference.
 From the following candidate papers, please give me a paper ID that you want to submit. Then, give a conference name that you want to submit to.
+"""
 
+        # Add previously accepted papers if available (Year 2+)
+        if previous_papers and len(previous_papers) > 0:
+            raise NotImplementedError("Previous papers are not supported yet")
+            prompt += f"""
+## Previously Accepted Papers (for reference and citation)
+The following papers were accepted in previous years and can be cited in your work:
+
+"""
+            for i, paper_preview in enumerate(previous_papers[:5], 1):  # Show top 5
+                prompt += f"{i}. {paper_preview}\n"
+
+            if len(previous_papers) > 5:
+                prompt += f"\n... and {len(previous_papers) - 5} more papers available.\n"
+
+        prompt += """
 ## Candidate Papers
 """
         for i, paper in enumerate(candidate_papers[:max_papers]):
@@ -399,15 +621,18 @@ arXiv ID: {paper.metadata['id']}
 Title: {paper.metadata['title']}
 Abstract: {paper.page_content}
 
-## Candidate Conferences
+"""
+
+        prompt += """## Candidate Conferences
 Below are the candidate conferences you can submit to. Please choose one of them that suits the paper. Submitting to a conference with mismatch topics has a high chance of getting rejected, although not always.
 """
+        candidate_conference_ids = set([conference.conference_id for conference in conferences])
         for conference in conferences:
-            prompt += f"""- \"{conference.conference_id}\": topics: {', '.join(conference.topics)}
+            prompt += f"""- \"{conference.conference_id}\": primary topics: {', '.join(conference.topics[:3])} | less preferred topics: {', '.join(conference.topics[3:])}
 """
         prompt += f"""
 ## Your Task
-Please respond with a paper ID you want to submit.
+Please respond with a paper ID you want to submit (the full URL) and its conference abbreviated name (e.g. "NeurIPS" or "AAAI").
 
 ## Sample Response
 ```json

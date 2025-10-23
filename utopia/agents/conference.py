@@ -30,7 +30,7 @@ class Conference:
         name: Conference name
         topics: All arXiv categories accepted (sorted by preference, top 3 are most preferred)
         most_preferred_topics: Top 3 most preferred topics (auto-extracted from first 3 in topics)
-        acceptance_rate: Target acceptance rate (0-1)
+        acceptance_rate: Target acceptance rate (0-1), uses default from config if None
         review_criteria: Criteria weights for review scoring
         conference_id: Unique identifier
         year: Current conference year
@@ -41,7 +41,7 @@ class Conference:
     name: str
     topics: List[str]  # All research topics (first 3 are most preferred, sorted by preference)
     category: str = None  # General research category (e.g., "Artificial Intelligence", "Computer Networks")
-    acceptance_rate: float = 0.3  # Target acceptance rate (0-1)
+    acceptance_rate: float = None  # Target acceptance rate (0-1), None = use default from config
     year: int = 0
     status: ConferenceStatus = ConferenceStatus.ACCEPTING_SUBMISSIONS
 
@@ -59,8 +59,14 @@ class Conference:
         return self.topics[:3] if len(self.topics) >= 3 else self.topics
 
     def __post_init__(self):
+        from utopia.config import SIMULATION_CONFIG
+
         if self.conference_id is None:
             self.conference_id = f"conf_{self.name.lower().replace(' ', '_')}_{int(time.time() * 1000) % 10000}"
+
+        # Use default acceptance rate if not specified
+        if self.acceptance_rate is None or SIMULATION_CONFIG['conference']['use_default_acceptance_rate']:
+            self.acceptance_rate = SIMULATION_CONFIG['conference']['acceptance_rate']
 
     def is_topic_match(self, paper_topics: List[str]) -> bool:
         """Check if paper topics match conference topics
@@ -93,10 +99,11 @@ class Conference:
             return False
 
         # Add conference metadata to paper
-        paper['conference_id'] = self.conference_id
-        paper['conference_name'] = self.name
+        if 'conference' not in paper:
+            paper['conference'] = self.conference_id
+        else:
+            assert paper['conference'] == self.conference_id
         paper['submission_time'] = time.time()
-
         self.submitted_papers.append(paper)
         return True
 
@@ -153,7 +160,7 @@ class Conference:
         paper_scores.sort(key=lambda x: x['score'], reverse=True)
 
         # Accept top papers according to acceptance rate
-        num_to_accept = min(1, round(len(paper_scores) * self.acceptance_rate))
+        num_to_accept = max(1, round(len(paper_scores) * self.acceptance_rate))
 
         for i, item in enumerate(paper_scores):
             paper = item['paper']
@@ -161,10 +168,10 @@ class Conference:
             paper['decision_time'] = time.time()
 
             if i < num_to_accept:
-                paper['decision'] = 'accepted'
+                paper['decision'] = 'accept'
                 self.accepted_papers.append(paper)
             else:
-                paper['decision'] = 'rejected'
+                paper['decision'] = 'reject'
                 self.rejected_papers.append(paper)
 
         self.status = ConferenceStatus.DECISIONS_MADE
@@ -172,8 +179,8 @@ class Conference:
         print(f"Conference {self.conference_id}: Total: {len(self.submitted_papers)}. Accepted: {len(self.accepted_papers)}. Reject: {len(self.rejected_papers)}. ")
 
         return {
-            'accepted': self.accepted_papers,
-            'rejected': self.rejected_papers
+            'accept': self.accepted_papers,
+            'reject': self.rejected_papers
         }
 
     def _calculate_paper_score(self, reviews: List[Dict]) -> float:
@@ -233,6 +240,42 @@ class Conference:
             'actual_acceptance_rate': len(self.accepted_papers) / len(self.submitted_papers) if self.submitted_papers else 0.0,
             'avg_reviews_per_paper': sum(len(reviews) for reviews in self.reviews.values()) / len(self.reviews) if self.reviews else 0.0
         }
+
+    def to_dict(self) -> Dict:
+        """Serialize to dictionary"""
+        return {
+            'conference_id': self.conference_id,
+            'name': self.name,
+            'topics': self.topics,
+            'category': self.category,
+            'acceptance_rate': self.acceptance_rate,
+            'year': self.year,
+            'status': self.status.value,  # Convert enum to string
+            'submitted_papers': self.submitted_papers,
+            'accepted_papers': self.accepted_papers,
+            'rejected_papers': self.rejected_papers,
+            'reviews': self.reviews
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'Conference':
+        """Deserialize from dictionary"""
+        conf = cls(
+            conference_id=data['conference_id'],
+            name=data['name'],
+            topics=data['topics'],
+            category=data.get('category'),
+            acceptance_rate=data.get('acceptance_rate'),
+            year=data.get('year', 0)
+        )
+        # Restore status
+        conf.status = ConferenceStatus(data.get('status', ConferenceStatus.ACCEPTING_SUBMISSIONS.value))
+        # Restore papers and reviews
+        conf.submitted_papers = data.get('submitted_papers', [])
+        conf.accepted_papers = data.get('accepted_papers', [])
+        conf.rejected_papers = data.get('rejected_papers', [])
+        conf.reviews = data.get('reviews', {})
+        return conf
 
 
 class ConferenceSystem:
@@ -343,8 +386,19 @@ class ConferenceSystem:
         """
         return self.conference_map.get(conference_id)
 
+    def to_dict(self) -> Dict:
+        """Serialize to dictionary"""
+        return {
+            'conferences': [conf.to_dict() for conf in self.conferences]
+        }
 
-# Predefined conference templates - CCF Tier-A conferences
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'ConferenceSystem':
+        """Deserialize from dictionary"""
+        conferences = [Conference.from_dict(conf_data) for conf_data in data.get('conferences', [])]
+        return cls(conferences=conferences)
+
+
 CONFERENCES = {
     # Computer Architecture / Parallel & Distributed Computing / Storage Systems
     'ASPLOS': Conference(
@@ -764,7 +818,7 @@ for conference in CONFERENCES.values():
 # This maps the topics in ResearchDirection to the conference categories
 TOPIC_TO_CATEGORY_MAPPING = {
     # Artificial Intelligence category
-    'knowledge_representation': 'Artificial Intelligence',
+    'artificial_intelligence': 'Artificial Intelligence',
     'planning_and_scheduling': 'Artificial Intelligence',
     'neural_symbolic_ai': 'Artificial Intelligence',
     'natural_language_processing': 'Artificial Intelligence',
@@ -871,7 +925,12 @@ def select_conferences_for_simulation(
     selected_conferences = []
     for category, count in category_counts.items():
         num_confs = max(1, round((count / num_agents) * num_conferences))
-        print(f"Category {category}: {count} agents -> {num_confs} conference(s)")
+        if count < 3:
+            
+            print(f"  ❌ Category {category}: {count} agents -> NO conference due to low number of agents")
+            continue
+        
+        print(f"  ✅ Category {category}: {count} agents -> {num_confs} conference(s)")
         selected_conferences.extend(CONFERENCES_BY_CATEGORY[category][:num_confs])
 
     return selected_conferences[:num_conferences]
