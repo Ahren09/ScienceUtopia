@@ -16,7 +16,10 @@ import os
 import random
 from typing import List, Dict, Set, Union
 from tqdm import tqdm
-from collections import Counter
+from collections import Counter, defaultdict
+import numpy as np
+import traceback
+import time
 
 from utopia.agents.base_agent import MultiAgentEcosystem
 from utopia.agents.conference import (
@@ -49,6 +52,8 @@ from utopia.utils.citation_extractor import extract_citations_from_content
 
 from utopia.utils.generail_utils import project_setup
 from utopia.config import SIMULATION_CONFIG
+from utopia.metrics.tracker import calculate_gini_coefficient, calculate_citation_metrics, calculate_score_metrics
+from utopia.analysis.analyze_all_results import SimulationAnalyzer
 
 # Setup logging
 logging.basicConfig(
@@ -230,6 +235,11 @@ class Simulation:
         all_agents = [agent for agent in self.ecosystem.agent_population if hasattr(agent, 'expertise_directions')]
         initialize_agent_expertise(all_agents, num_expertise=3)
         logger.info(f"Initialized expertise for {len(all_agents)} agents")
+        
+    def calculate_average_funding_level(self):
+        """Calculate the average funding level of all agents"""
+        funding_levels = [agent.resources for agent_id, agent in self.ecosystem.agent_population.items() if getattr(agent, "resources", None) is not None]
+        return np.mean(funding_levels)
 
     def run_one_round(self, year: int) -> Dict:
         """Run simulation for one year
@@ -251,13 +261,37 @@ class Simulation:
             'year': year,
             'phases': {}
         }
-        
+
+        # Phase 0: Resubmissions (year 2+)
+        resubmissions_list = []
+        if year > 1:
+            logger.info(f"Year {year} Phase 0: Processing resubmissions from year {year-1}...")
+            for author_id, papers in self.paper_archive.papers_by_author.items():
+                agent = self.ecosystem.get_agent_by_id(author_id)
+                if not agent:
+                    continue
+
+                rejected_papers = {paper.id: paper.to_dict() for paper in papers if paper.decision == 'reject'}
+                if not rejected_papers:
+                    continue
+
+                resubmissions_of_author = agent.decide_resubmission(rejected_papers, self.conference_system.conferences)
+                
+                for metadata in resubmissions_of_author:
+                    
+                    paper_dict = rejected_papers[metadata['arxiv_id']].copy()
+                    paper_dict['conference'] = metadata['conference']
+                    paper_dict['year'] = year
+                    paper_dict['type'] = 'resubmission'
+                    del paper_dict['decision'], paper_dict['review_history']
+                    
+                    resubmissions_list.append(paper_dict)
         # Get academic funding agencies (For now, only NSF and DARPA)
         funding_agencies = [
             agent for agent_id, agent in self.ecosystem.agent_population.items()
             if isinstance(agent, FundingAgency)
         ]
-
+        average_funding_level = self.calculate_average_funding_level()
         # Reset funding programs for new year
         all_funding_programs_dict = {}
         for funding_agent in funding_agencies:
@@ -272,8 +306,21 @@ class Simulation:
 
         if year == 1:
             directions = assign_directions_batch(active_authors)
+            
         else:
-            directions = assign_directions_individual(active_authors)
+            # Get past papers from paper archive for LLM-based direction selection
+            
+            directions = {}
+            for agent in tqdm(active_authors, desc="Research Directions"):
+
+                # Use LLM-based individual assignment with past research context
+                direction = assign_directions_individual(
+                    agent,
+                    year=year,
+                    paper_archive=self.paper_archive,
+                    average_funding_level=average_funding_level
+                )
+                directions[agent.id] = direction
 
         year_results['phases']['research_assignment'] = {
             'mode': research_direction_selection_mode,
@@ -293,18 +340,20 @@ class Simulation:
         if year == 1:
             self.rag.load_documents()
             self.rag.build_knowledge_index()
-            
+
         else:
-            submitted_docs = self.paper_archive.get_papers_before_year(year=year)
+            
+            # Get submitted papers from paper archive
+            accepted_papers, rejected_papers = self.paper_archive.get_papers_before_year(year=year)
             # NOT year 1
             if self.rag.documents == []:
-                # Resuming from checkpoint
+                # Resuming from checkpoint - preserve document_status
+                saved_document_status = self.rag.document_status.copy()
                 self.rag.load_documents()
-            
-            else:
-                # Year 2+: Add previously accepted papers to RAG corpus
-                logger.info(f"Adding {len(self.paper_archive.papers_by_id)} previously accepted papers to RAG corpus...")
-                self.rag.add_documents_to_corpus(submitted_docs)
+                self.rag.build_knowledge_index()
+                # Restore document_status from checkpoint
+                self.rag.document_status = saved_document_status
+                logger.info(f"Resumed from checkpoint with {len(saved_document_status)} document statuses preserved")
 
         # Batch retrieve relevant documents for all research ideas
         # Use SUBMISSION index to get papers available for submission
@@ -319,91 +368,171 @@ class Simulation:
         assert topk_indices.shape[0] == len(active_authors)
         
         submitted_papers = {}
-        submitted_papers_list = []
+        submissions_list = []
+        potential_cited_papers_list = []
         
-        # Get previous papers preview for Year 2+
-        previous_papers_preview = None
-        if year >= 2:
-            previous_papers_preview = self.paper_archive.get_papers_preview(year=year, max_papers=20)
+        message_history_dict = {}
 
+        submitted_paper_indices_current_year = set()
         for agent_idx, agent in enumerate(tqdm(active_authors, desc="Submitting papers")):
+            
             candidate_paper_indices = topk_indices[agent_idx]
             # Use submission_documents since we retrieved from submission index
-            candidate_papers = [self.rag.documents[idx] for idx in candidate_paper_indices]
+            candidate_papers = [self.rag.documents[idx] for idx in candidate_paper_indices if self.rag.document_status.loc[idx, 'status'] == 'unsubmitted']
             prompt, response_format = agent.get_paper_submission_prompt(
                 candidate_papers=candidate_papers,
+                year=year,
                 conferences=self.conference_system.conferences,
-                previous_papers=previous_papers_preview
+                paper_archive=self.paper_archive
             )
-            submission_metadata = json.loads(self.llm.generate(prompt=prompt, response_format=response_format))
-            arxiv_id = submission_metadata['arxiv_id']
-            assert arxiv_id in [p.metadata['id'] for p in candidate_papers]
-            assert submission_metadata['conference'] in self.conference_system.conference_map
+            
+            
+            for _ in range(3):
+                
+                try:
+                    submission_metadata, message_history = self.llm.generate(prompt=prompt, response_format=response_format)
+                    arxiv_id = submission_metadata['arxiv_id']
+                    assert arxiv_id in [p.metadata['id'] for p in candidate_papers]
+                    assert submission_metadata['conference'] in self.conference_system.conference_map
+                    
+                except Exception as e:
+                    logger.warning(f"Error submitting paper: {e}")
+                    traceback.print_exc()
+            
+
+            
             paper_doc = self.rag.id2docs[arxiv_id]
+            
             paper_dict = {
                 'id': arxiv_id,
                 'author_id': agent.id,
                 'title': paper_doc.metadata['title'],
                 'content': paper_doc.page_content,
                 'topics': paper_doc.metadata.get('categories', '').split(),
-                'conference': submission_metadata['conference']
+                'conference': submission_metadata['conference'],
+                'type': 'submission'
             }
-            submitted_papers_list.append(paper_dict)
+            
+            message_history_dict[agent.id] = message_history
+            
+            submissions_list.append(paper_dict)
+            
+            self.rag.document_status.loc[self.rag.document_status['id'] == arxiv_id, 'status'] = 'submitted'
+            
+        del retrieval_results
+            
+        if year >= 2:
+            
+            retrieval_prompts = []
+            
+            for submitted_paper in resubmissions_list + submissions_list:
+                retrieval_prompts.append(f"{submitted_paper['title']} \n{submitted_paper['content']}")
+                
+            retrieval_results = self.rag.batch_retrieve(
+                retrieval_prompts,
+                retrieval_type="citation"
+            )
+            
+            topk_indices_citation = retrieval_results['topk_indices']
+            
+            accepted_papers_arxiv_ids = set(self.rag.document_status[self.rag.document_status['status'] == "accepted"].id.values.tolist())
+            
+            for i in range(len(submissions_list)):
+                submitted_paper = submissions_list[i]
+                candidate_citation_indices = topk_indices_citation[i]
+                
+                candidate_papers = [self.rag.documents[idx] for idx in candidate_citation_indices[:30]]
+                
+                
+                
+                
+                candidate_papers = [{'id': paper.metadata['id'], 'title': paper.metadata['title'], 'content': paper.page_content} for paper in candidate_papers]
+                
+                assert set([candidate_paper['id'] for candidate_paper in candidate_papers]) <= accepted_papers_arxiv_ids, f"Submitted paper {submitted_paper['id']} is trying to cite non-accepted papers"
+                
+                prompt = agent.get_potential_cited_papers_prompt(
+                    paper=submitted_paper,
+                    candidate_papers=candidate_papers,
+                    max_papers=10
+                )
+                llm_response, message_history = self.llm.generate(prompt=prompt, message_history=message_history_dict[agent.id])
+                
+                assert llm_response.get('citations') is not None
+                
+                submissions_list[i]['citations'] = [candidate_papers[int(idx)]['id'] for idx in llm_response['citations']]
+        
 
+        del message_history_dict
+        submitted_papers_dict = {paper['id']: paper for paper in submissions_list + resubmissions_list}
 
-        submitted_papers_dict = {paper['id']: paper for paper in submitted_papers_list}
-
-        for paper_dict in submitted_papers_list:
+        for paper_dict in submissions_list + resubmissions_list:
 
             conf: Conference = self.conference_system.conference_map[paper_dict['conference']]
+            if paper_dict['author_id'] not in submitted_papers:
+                submitted_papers[paper_dict['author_id']] = []
+            
             if conf.submit_paper(paper_dict):
-                submitted_papers[paper_dict['author_id']] = paper_dict
+                submitted_papers[paper_dict['author_id']].append(paper_dict)
                 self.submitted_paper_ids.add(paper_dict['id'])
+            
             else:
                 raise ValueError(f"Paper {arxiv_id} submission to conference {paper_dict['conference']} failed")
 
-        # Mark papers as submitted - removes them from submission index but keeps in citation index
-        submitted_paper_ids_list = list(self.submitted_paper_ids)
-
         year_results['phases']['paper_submission'] = {
-            'num_papers_submitted': len(submitted_papers),
+            'num_papers_submitted': sum(len(papers) for author_id, papers in submitted_papers.items()),
             'papers': submitted_papers
         }
 
         # Phase 3: Peer review
-
-
-
         logger.info(f"Year {year} Phase 3: Conducting peer reviews...")
         self.conference_system.start_all_review_processes()
-        cache_path = os.path.join(self.output_dir, f"year_{year}_conference_system.json")
-        if self.debug and os.path.exists(cache_path):
-            with open(cache_path, "r") as f:
-                conference_data = json.load(f)
-                self.conference_system = ConferenceSystem.from_dict(conference_data)
 
-        else:
-            for conference in tqdm(self.conference_system.conferences, desc="Peer reviews"):
-                for paper in conference.submitted_papers:
-                    # Assign reviewers (excluding paper author)
-                    author = self.ecosystem.get_agent_by_id(paper['author_id'])
-                    reviewers = self.ecosystem.get_available_reviewers(
-                        exclude_agent_ids=[paper['author_id']] + list(author.conflict_of_interest)
-                    )
+        average_scores = {}
+        reviews_by_conference = {}  # {conf_id: {paper_id: [reviews]}}
+        reviews_by_reviewer = defaultdict(list)  # {reviewer_id: [scores]}
 
-                    # Select 3 random reviewers
-                    selected_reviewers = random.sample(reviewers, min(3, len(reviewers)))
+        for conference in tqdm(self.conference_system.conferences, desc="Peer reviews"):
+            average_scores[conference.conference_id] = {}
+            reviews_by_conference[conference.conference_id] = {}
 
-                    for reviewer in selected_reviewers:
-                        review = reviewer.review_paper(paper)
-                        conference.add_review(paper['id'], review)
+            for paper in conference.submitted_papers:
+                # Assign reviewers (excluding paper author)
+                author = self.ecosystem.get_agent_by_id(paper['author_id'])
+                reviewers = self.ecosystem.get_available_reviewers(
+                    exclude_agent_ids=[paper['author_id']] + list(author.conflict_of_interest)
+                )
 
-            with open(cache_path, "w") as f:
-                json.dump(self.conference_system.to_dict(), f, indent=2)
+                # Select 3 random reviewers
+                selected_reviewers = random.sample(reviewers, min(3, len(reviewers)))
 
-        del cache_path
+                for reviewer in selected_reviewers:
+                    num_retries = 0
+                    review = None
+                    while True:
+                        try:
+                            review = reviewer.review_paper(paper)
+                            conference.add_review(paper['id'], review)
+                            reviews_by_reviewer[reviewer.id].append(review['overall_score'])
+                            break
+                        except Exception as e:
+                            logger.warning(f"Error reviewing paper: {e}")
+                            traceback.print_exc()
+                            num_retries += 1
+                            if num_retries > 3:
+                                break
+                            time.sleep(1)
+
+                paper_reviews = conference.reviews[paper['id']]
+                reviews_by_conference[conference.conference_id][paper['id']] = paper_reviews
+                average_scores[conference.conference_id][paper['id']] = sum(r['overall_score'] for r in paper_reviews) / len(paper_reviews)
+                
+        # Calculate score metrics
+        score_metrics = calculate_score_metrics(reviews_by_conference, dict(reviews_by_reviewer))
+
         year_results['phases']['peer_review'] = {
-            'reviews_conducted': sum(len(c.reviews) for c in self.conference_system.conferences)
+            'reviews_conducted': sum(len(c.reviews) for c in self.conference_system.conferences),
+            'score_metrics': score_metrics,
+            'average_scores': average_scores
         }
 
         # Process received reviews for authors
@@ -415,7 +544,8 @@ class Simulation:
                     # Find the author agent
                     author = self.ecosystem.get_agent_by_id(paper['author_id'])
                     
-                    author.process_received_reviews(paper_reviews, paper_id=paper['id'])
+                    
+                    author.process_received_reviews(paper_reviews, paper_id=paper['id'], year=year, average_scores_of_venue=average_scores[conference.conference_id])
 
         
 
@@ -454,46 +584,9 @@ class Simulation:
                         accepted_paper_ids.append(paper['id'])
                     else:
                         rejected_paper_ids.append(paper['id'])
-
-                    # Archive accepted paper for future reference
                     self.paper_archive.add_paper(paper, year, decision)
                     
         self.rag.mark_papers_as_submitted(accepted_paper_ids, rejected_paper_ids)
-        # Extract citations from accepted papers (Year 2+)
-        if year >= 2:
-            raise NotImplementedError("Citations extraction not implemented yet")
-            logger.info(f"Extracting citations from {total_accepted} accepted papers...")
-            available_papers = [
-                {
-                    'id': p.id,
-                    'title': p.title,
-                    'abstract': p.abstract
-                }
-                for p in self.paper_archive.get_papers_before_year(year)
-            ]
-
-            for conf_decisions in decisions.values():
-                for paper in conf_decisions['accepted']:
-                    # Extract citations using LLM
-                    citations = extract_citations_from_content(
-                        paper_id=paper['id'],
-                        paper_content=paper['content'],
-                        available_papers=available_papers,
-                        llm=self.llm,
-                        model=self.llm.model_name
-                    )
-
-                    # Update citation tracking
-                    if paper['id'] not in self.citations:
-                        self.citations[paper['id']] = set()
-                    self.citations[paper['id']].update(citations)
-
-                    # Increment citation counts in archive
-                    for citation in citations:
-                        self.paper_archive.increment_citation_count(citation.cited_paper_id)
-
-            logger.info(f"  Extracted {sum(len(cites) for cites in self.citations.values())} total citations")
-
         # Save paper archive to disk
 
         year_results['phases']['decisions'] = {
@@ -575,18 +668,31 @@ class Simulation:
                     agent.funding_success_history[program_id] = []
                 agent.funding_success_history[program_id].append({
                     'year': year,
+                    'amount': program.budget_per_winner
                 })
                 
         for agent_id, agent in self.ecosystem.agent_population.items():
-            if agent.resources <= 10 and hasattr(agent, 'can_author') and agent.can_author:
+            if getattr(agent, 'resources', None) and agent.resources <= 10 and hasattr(agent, 'can_author') and agent.can_author:
                 print(f"Removing agent {agent.id} due to insufficient funding")
                 self.ecosystem.remove_agent(agent.id)
 
+        # Calculate agent behavior and ecosystem health metrics
+        funding_levels = [agent.resources for agent_id, agent in self.ecosystem.agent_population.items() if getattr(agent, 'resources', None) is not None]
+        year_results['ecosystem_metrics'] = {
+            'resource_distribution': {
+                'mean': float(np.mean(funding_levels)) if funding_levels else 0.0,
+                'std': float(np.std(funding_levels)) if funding_levels else 0.0,
+                'gini': calculate_gini_coefficient(funding_levels)
+            },
+            'active_agents': len([a for a in self.ecosystem.agent_population.values() if hasattr(a, 'can_author') and a.can_author]),
+            'funding_success_by_type': {
+                'university': len([w for p_id, winners in all_funding_winners_dict.items() for w in winners]),
+                'total_applications': len(university_applications)
+            }
+        }
+
         # Get conference statistics
         year_results['conference_statistics'] = self.conference_system.get_all_statistics()
-
-        # Save year results
-        self._save_year_results(year, year_results)
 
         # Save checkpoint after each year in debug mode
         if self.debug:
@@ -722,100 +828,63 @@ class Simulation:
             logger.warning(f"Checkpoint not found: {checkpoint_path}")
             return False
 
-        try:
-            with open(checkpoint_path, 'r') as f:
-                checkpoint_data = json.load(f)
+        with open(checkpoint_path, 'r') as f:
+            checkpoint_data = json.load(f)
 
-            self.current_year = checkpoint_data['year']
+        self.current_year = checkpoint_data['year']
 
-            # Reconstruct ecosystem with LLM from serialized data
-            self.ecosystem = MultiAgentEcosystem.from_dict(
-                checkpoint_data['ecosystem_data'],
-                llm=self.llm
-            )
-            
-
-            # Reconstruct conference system
-            self.conference_system = ConferenceSystem.from_dict(checkpoint_data['conference_system'])
-
-            # Reconstruct citations from JSON format
-            self.citations = checkpoint_data['citations']
-
-            self.all_papers_history = checkpoint_data['all_papers_history']
-
-            # Reconstruct paper archive
-            self.paper_archive = PaperArchive.from_dict(checkpoint_data['paper_archive'])
-
-            self.yearly_results = checkpoint_data['yearly_results']
-
-            # Reconstruct industry funding system
-            self.industry_funding_system = IndustryFundingSystem.from_dict(checkpoint_data['industry_funding_system'])
-
-            # Convert submitted_paper_ids from list back to set
-            self.submitted_paper_ids = set(checkpoint_data['submitted_paper_ids'])
-
-            # RAG will be reconstructed in run() method
-            logger.info(f"Checkpoint loaded successfully from year {checkpoint_data['year']}")
-            logger.info(f"  Loaded {len(self.ecosystem.agent_population)} agents")
-            logger.info(f"  Loaded {len(self.submitted_paper_ids)} submitted paper IDs")
-            return True
+        # Reconstruct ecosystem with LLM from serialized data
+        self.ecosystem = MultiAgentEcosystem.from_dict(
+            checkpoint_data['ecosystem_data'],
+            llm=self.llm
+        )
         
-        
-        except Exception as e:
-            logger.error(f"Failed to load checkpoint: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
 
-    def _save_year_results(self, year: int, results: Dict):
-        """Save results for a specific year
+        # Reconstruct conference system
+        self.conference_system = ConferenceSystem.from_dict(checkpoint_data['conference_system'])
 
-        Args:
-            year: Year number
-            results: Results dictionary
-        """
-        output_file = os.path.join(self.output_dir, f"year_{year}_results.json")
-        with open(output_file, 'w') as f:
-            json.dump(results, f, indent=2, default=str)
+        # Reset conferences for the next year (checkpoint was saved before reset)
+        self.conference_system.reset_all_for_next_year(year + 1)
+
+        # Reconstruct citations from JSON format
+        self.citations = checkpoint_data['citations']
+
+        self.all_papers_history = checkpoint_data['all_papers_history']
+
+        # Reconstruct paper archive
+        self.paper_archive = PaperArchive.from_dict(checkpoint_data['paper_archive'])
+
+        self.yearly_results = checkpoint_data['yearly_results']
+
+        # Reconstruct industry funding system
+        self.industry_funding_system = IndustryFundingSystem.from_dict(checkpoint_data['industry_funding_system'])
+
+        # Convert submitted_paper_ids from list back to set
+        self.submitted_paper_ids = set(checkpoint_data['submitted_paper_ids'])
+
+        # Reconstruct RAG with document_status from checkpoint
+        if 'rag' in checkpoint_data:
+            rag_config = RAGConfig(use_langchain=self.use_langchain)
+            sentence_transformer_model = None
+            if not self.use_langchain:
+                from sentence_transformers import SentenceTransformer
+                sentence_transformer_model = SentenceTransformer(rag_config.embedding_model, device=rag_config.device)
+            self.rag = RAG.from_dict(checkpoint_data['rag'], config=rag_config, model=sentence_transformer_model, debug=self.debug)
+            logger.info(f"  Loaded RAG with {len(self.rag.document_status)} document statuses")
+
+        logger.info(f"Checkpoint loaded successfully from year {checkpoint_data['year']}")
+        logger.info(f"  Loaded {len(self.ecosystem.agent_population)} agents")
+        logger.info(f"  Loaded {len(self.submitted_paper_ids)} submitted paper IDs")
+        return True
 
     def _generate_final_report(self):
-        """Generate final simulation report"""
+        """Generate final simulation report using analyzer module"""
         report_file = os.path.join(self.output_dir, "simulation_report.json")
 
-        # Get paper archive statistics
-        archive_stats = self.paper_archive.get_statistics()
-
-        # Calculate citation statistics
-        total_citations = sum(len(cites) for cites in self.citations.values())
-        papers_with_citations = sum(1 for cites in self.citations.values() if len(cites) > 0)
-
-        report = {
-            'configuration': {
-                'num_years': self.num_years,
-                'num_agents': len(self.ecosystem.agent_population)
-            },
-            'yearly_results': self.yearly_results,
-            'summary': {
-                'total_papers_submitted': sum(
-                    r['phases']['paper_submission']['num_papers_submitted']
-                    for r in self.yearly_results
-                ),
-                'total_papers_accepted': sum(
-                    r['phases']['decisions']['total_accepted']
-                    for r in self.yearly_results
-                ),
-                'total_citations': total_citations,
-                'papers_with_citations': papers_with_citations,
-                'archive_statistics': archive_stats
-            }
-        }
-
-        with open(report_file, 'w') as f:
-            json.dump(report, f, indent=2, default=str)
-
-        logger.info(f"Final report saved to {report_file}")
-        logger.info(f"Paper archive saved with {archive_stats['total_papers']} papers")
-        logger.info(f"Total citations tracked: {total_citations}")
+        # Use SimulationAnalyzer to generate comprehensive report
+        analyzer = SimulationAnalyzer(self.output_dir)
+        analyzer.load_from_simulation(self)
+        analyzer.generate_report(output_file=report_file)
 
 
 def main():
@@ -824,9 +893,9 @@ def main():
         description="Run Academic Society Ecosystem Simulation"
     )
     parser.add_argument(
-        '--years',
+        '--num_years',
         type=int,
-        default=5,
+        default=4,
         help='Number of years to simulate (default: 5)'
     )
     parser.add_argument(
@@ -882,7 +951,7 @@ def main():
     # Create and run simulation
     simulation = Simulation(
         llm=llm,
-        num_years=args.years,
+        num_years=args.num_years,
         output_dir=args.output_dir,
         debug=args.debug,
         industry_funding_mode=args.industry_funding_mode,

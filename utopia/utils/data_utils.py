@@ -5,6 +5,7 @@ import os
 from typing import Tuple, Union, Dict, Any, List, Optional
 import base64
 import re
+import numpy as np
 
 from datasets import load_dataset, DatasetDict
 from PIL import Image
@@ -27,3 +28,8 @@ def write_json(data: dict, f):
 def load_data(debug: bool = False):
     from langchain_core.documents import Document
     
+    
+def top_percentile(value, data):
+    data = np.array(data)
+    percentile = np.sum(data >= value) / len(data) * 100
+    return percentile

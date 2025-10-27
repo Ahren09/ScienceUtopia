@@ -43,19 +43,21 @@ class UniversityResearcher(SimulationAgent):
         """
         super().__init__(
             reputation=5,
-            funding_level=funding_level,
             agent_id=researcher_name,
             llm=llm
         )
         self.university_name = university_name
         self.can_author = True  # University researchers can write papers
         self.can_review = True  # University researchers can review papers
-        
+        self.resources = funding_level
         # Do we use LLM to generate research proposal?
         self.generate_research_proposal = generate_research_proposal
 
-        # Store inherent expertise (3 research directions)
+        assert isinstance(expertise, List) and all(isinstance(rd, ResearchDirection) for rd in expertise), "expertise must be a list of ResearchDirection objects"
+        assert len(expertise) > 0, "expertise must be a non-empty list"
+        # Inherent expertise (3 research directions)
         self.expertise = expertise
+        
         self.funding_success_history = {} # program_id -> successes
         self.conflict_of_interest = set() # set of authors they have collaborated with or belong to the same institution   
         
@@ -225,9 +227,8 @@ Status: {paper['decision']}
 }
 ```
 """
-            result = self.llm.generate(prompt=prompt)
-            proposal = json.loads(result)
-            
+            proposal, message_history = self.llm.generate(prompt=prompt)
+
             # Check if the referred papers are from the current author
             all_paper_ids_of_current_author = set(paper['id'] for paper in past_accepted_papers + past_rejected_papers)
             all_paper_ids_in_proposals = set()
@@ -273,10 +274,12 @@ class IndustryResearcher(SimulationAgent):
 
         super().__init__(
             reputation=6,
-            funding_level=funding_level,
             agent_id=researcher_name,
             llm=llm
         )
+        self.resources = funding_level
+        assert isinstance(expertise, List) and all(isinstance(rd, ResearchDirection) for rd in expertise), "expertise must be a list of ResearchDirection objects"
+        assert len(expertise) > 0, "expertise must be a non-empty list"
         self.expertise = expertise
         self.company_name = company_name
         self.can_author = True
@@ -369,7 +372,7 @@ Generate a 100-word proposal emphasizing:
 
 Return JSON with "research_proposal" field only."""
 
-        result = self.llm.generate(prompt=prompt)
+        result, message_history = self.llm.generate(prompt=prompt)
         proposal = result.get('research_proposal', 'Industry research proposal.')
 
         return {
@@ -391,7 +394,7 @@ propose a research direction for next year. Current priorities: {self.research_p
 Return JSON with format:
 {{"topic": "topic_name", "method": "method_name", "application": "application_area"}}"""
 
-        result = self.llm.generate(prompt=prompt) if self.llm else {}
+        result, message_history = self.llm.generate(prompt=prompt) if self.llm else {}
         new_dir = ResearchDirection(
             topic=result.get('topic', 'AI'),
             method=result.get('method', 'deep learning'),

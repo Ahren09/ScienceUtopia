@@ -19,6 +19,7 @@ SIMULATION_CONFIG = {
     'conference': {
         'acceptance_rate': 0.3,  # 25% acceptance rate if not specified
         'use_default_acceptance_rate': True,
+        'resubmission_cost': 5,
     },
 
     # Funding agency settings

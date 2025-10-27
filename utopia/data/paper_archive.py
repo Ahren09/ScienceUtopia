@@ -7,7 +7,7 @@ references.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Tuple
 from langchain_core.documents import Document
 import json
 from pathlib import Path
@@ -24,22 +24,24 @@ class ArchivedPaper:
     conference: str
     decision: str
     topics: List[str] = field(default_factory=list)
-    final_score: float = 0.0
     citation_count: int = 0  # Number of times this paper has been cited
     
+    review_history: List[Dict] = field(default_factory=list)  # [{"conference": str, "year": int, "score": float}]
+    
     def to_dict(self) -> Dict:
-        """Convert to dictionary for JSON serialization"""
+        """Convert to dictionary (for both serialization and resubmission)"""
         return {
             'id': self.id,
             'title': self.title,
+            'content': self.abstract,  # Use 'content' for compatibility with paper submission
             'abstract': self.abstract,
             'author_id': self.author_id,
             'year': self.year,
             'conference': self.conference,
             'topics': self.topics,
             'decision': self.decision,
-            'final_score': self.final_score,
-            'citation_count': self.citation_count
+            'citation_count': self.citation_count,
+            'review_history': self.review_history
         }
 
     @classmethod
@@ -48,13 +50,14 @@ class ArchivedPaper:
         return cls(
             id=data['id'],
             title=data['title'],
-            abstract=data['abstract'],
+            abstract=data.get('abstract', data.get('content', '')),
             author_id=data['author_id'],
             year=data['year'],
             conference=data['conference'],
             topics=data.get('topics', []),
-            final_score=data.get('final_score', 0.0),
-            citation_count=data.get('citation_count', 0)
+            decision=data['decision'],
+            citation_count=data.get('citation_count', 0),
+            review_history=data.get('review_history', [])
         )
 
     def to_langchain_document(self) -> Document:
@@ -68,9 +71,8 @@ class ArchivedPaper:
                 'year': self.year,
                 'conference': self.conference,
                 'topics': ', '.join(self.topics),
-                'final_score': self.final_score,
                 'citation_count': self.citation_count,
-                'source': 'simulation'  # Distinguish from external papers
+                'source': 'simulation'
             }
         )
 
@@ -95,37 +97,67 @@ class PaperArchive:
 
     def add_paper(self, paper_dict: Dict, year: int, decision: str) -> ArchivedPaper:
         """
-        Add an accepted paper to the archive
+        Add a paper to the archive (handles resubmissions)
 
         Args:
             paper_dict: Paper dictionary with keys: id, title, content, author_id,
-                       conference, topics, final_score
-            year: Simulation year the paper was accepted
+                       conference, topics
+            year: Simulation year
+            decision: 'accept' or 'reject'
 
         Returns:
             ArchivedPaper object
         """
-        archived_paper = ArchivedPaper(
-            id=paper_dict['id'],
-            title=paper_dict['title'],
-            abstract=paper_dict.get('content', ''),
-            author_id=paper_dict['author_id'],
-            year=year,
-            conference=paper_dict['conference'],
-            topics=paper_dict.get('topics', []),
-            final_score=paper_dict.get('final_score', 0.0),
-            decision=decision,
-            citation_count=0
-        )
+        # Check if paper already exists (resubmission case)
+        if paper_dict['id'] in self.papers_by_id:
+            archived_paper = self.papers_by_id[paper_dict['id']]
+            # Append to review history
+            archived_paper.review_history.append({
+                'conference': paper_dict['conference'],
+                'year': year,
+                'score': paper_dict['final_score'],
+                'reviews': paper_dict['reviews'],
+                'decision': decision,
+            })
+            
 
-        # Store in all indices
-        self.papers_by_id[archived_paper.id] = archived_paper
+        else:
+            # New paper
+            archived_paper = ArchivedPaper(
+                id=paper_dict['id'],
+                title=paper_dict['title'],
+                abstract=paper_dict.get('content', ''),
+                author_id=paper_dict['author_id'],
+                year=year,
+                conference=paper_dict['conference'],
+                topics=paper_dict.get('topics', []),
+                decision=decision,
+                citation_count=0,
+                review_history=[{
+                    'conference': paper_dict['conference'], 
+                    'year': year, 
+                    'score': paper_dict['final_score'], 
+                    'reviews': paper_dict['reviews'],
+                    'decision': decision
+                }]
+            )
+            self.papers_by_id[archived_paper.id] = archived_paper
+
+        # Update papers_by_author index
+        if archived_paper.author_id not in self.papers_by_author:
+            self.papers_by_author[archived_paper.author_id] = []
         
+        if archived_paper not in self.papers_by_author[archived_paper.author_id]:
+            self.papers_by_author[archived_paper.author_id].append(archived_paper)
+
+
+        # Update accept / reject paper index
         if decision == 'accept':
 
             if year not in self.accepted_papers_by_year:
                 self.accepted_papers_by_year[year] = []
             self.accepted_papers_by_year[year].append(archived_paper)
+            
         elif decision == 'reject':
             if year not in self.rejected_papers_by_year:
                 self.rejected_papers_by_year[year] = []
@@ -136,7 +168,7 @@ class PaperArchive:
 
         return archived_paper
 
-    def get_papers_before_year(self, year: int) -> List[ArchivedPaper]:
+    def get_papers_before_year(self, year: int) -> Tuple[List[ArchivedPaper], List[ArchivedPaper]]:
         """Get all papers accepted before a given year"""
         accepted_papers, rejected_papers = [], []
         for y in range(1, year):
@@ -174,58 +206,6 @@ class PaperArchive:
 
         return [paper.to_langchain_document() for paper in papers]
 
-    def get_papers_preview(self, year: int, max_papers: int = 50) -> List[str]:
-        """
-        Get preview strings of papers for display to agents
-
-        Args:
-            year: Only show papers before this year
-            max_papers: Maximum number of papers to return
-
-        Returns:
-            List of preview strings
-        """
-        papers = self.get_papers_before_year(year)
-        # Sort by year (descending) and score (descending)
-        papers = sorted(papers, key=lambda p: (-p.year, -p.final_score))
-        papers = papers[:max_papers]
-        return [paper.get_preview() for paper in papers]
-
-
-    def load(self):
-        """Load archive from disk"""
-        if not self.archive_file.exists():
-            return
-
-        with open(self.archive_file, 'r') as f:
-            data = json.load(f)
-
-        # Clear existing data
-        self.papers_by_id.clear()
-        self.accepted_papers_by_year.clear()
-        self.rejected_papers_by_year.clear()
-        self.papers_by_author.clear()
-
-        # Reload papers
-        for paper_dict in data['papers']:
-            paper = ArchivedPaper.from_dict(paper_dict)
-            self.papers_by_id[paper.id] = paper
-            
-            if paper.decision == 'accepted':
-
-                if paper.year not in self.accepted_papers_by_year:
-                    self.accepted_papers_by_year[paper.year] = []
-                self.accepted_papers_by_year[paper.year].append(paper)
-                
-            elif paper.decision == 'rejected':
-                if paper.year not in self.rejected_papers_by_year:
-                    self.rejected_papers_by_year[paper.year] = []
-                self.rejected_papers_by_year[paper.year].append(paper)
-
-            if paper.author_id not in self.papers_by_author:
-                self.papers_by_author[paper.author_id] = []
-            self.papers_by_author[paper.author_id].append(paper)
-
     def get_statistics(self) -> Dict:
         """Get archive statistics"""
         total_papers = len(self.papers_by_id)
@@ -258,12 +238,12 @@ class PaperArchive:
             paper = ArchivedPaper.from_dict(paper_dict)
             archive.papers_by_id[paper.id] = paper
             
-            if paper.decision == 'accepted':
+            if paper.decision == 'accept':
                 if paper.year not in archive.accepted_papers_by_year:
                     archive.accepted_papers_by_year[paper.year] = []
                 archive.accepted_papers_by_year[paper.year].append(paper)
                 
-            elif paper.decision == 'rejected':
+            elif paper.decision == 'reject':
                 if paper.year not in archive.rejected_papers_by_year:
                     archive.rejected_papers_by_year[paper.year] = []
                 archive.rejected_papers_by_year[paper.year].append(paper)

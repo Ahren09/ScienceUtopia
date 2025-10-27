@@ -79,7 +79,7 @@ def extract_citations_from_content(
 
     # Get LLM response
     try:
-        response = llm.generate(
+        response, message_history = llm.generate(
             prompt=prompt,
             system_prompt="You are a helpful citation extraction assistant.",
             temperature=0.3  # Lower temperature for more deterministic extraction

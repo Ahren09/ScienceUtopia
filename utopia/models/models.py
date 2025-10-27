@@ -7,7 +7,10 @@ import sys
 from PIL import Image
 from io import BytesIO
 from openai import AzureOpenAI, OpenAI, BadRequestError
-from typing import List, Optional, Union
+from typing import List, Optional, Union, Dict, Tuple
+import json
+import traceback
+
 
 class LLM:
     def __init__(self, model_name):
@@ -36,7 +39,7 @@ class GPT(LLM):
         else:
             raise ValueError("No API key found")
 
-    def generate(self, prompt: Optional[str] = None, image: Optional[List[Union[str, Image.Image]]] = None, temperature: float = 0.7, system_prompt: Optional[str] = "", response_format = None):
+    def generate(self, prompt: Optional[str] = None, image: Optional[List[Union[str, Image.Image]]] = None, temperature: float = 0.7, system_prompt: Optional[str] = "This is a simulation of an academic ecosystem, where researchers choose research directions and submit papers, reviewers conduct peer reviews of papers, and funding agencies allocate fundings.", response_format = None, message_history: Optional[List[Dict]] = []) -> Tuple[Dict, List[Dict]]:
         # System instructions for the GPT model
 
         try:
@@ -71,10 +74,22 @@ class GPT(LLM):
                             "image_url": {"url": f"data:image/jpeg;base64,{encoded_image}"}
                         })
 
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": content}
-            ]
+            
+            messages = []
+            if message_history != []:
+                new_message = [{
+                    "role": "user",
+                    "content": content
+                }]
+                messages = message_history + new_message
+                
+            else:
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": content}
+                ]
+                
+            assert len(messages) > 0, "Message history is empty"
 
             response = self.client.chat.completions.create(
                 model=self.model_name,
@@ -84,13 +99,25 @@ class GPT(LLM):
             )
 
             response_content = response.choices[0].message.content
+            
             if response_content is None:
                 raise ValueError("Empty response from model")
+            
+            response_json = json.loads(response_content.strip())
+            messages.append({
+                "role": "assistant",
+                "content": [{
+                    "type": "text", 
+                    "text": response_content
+                }]
+            })
 
-            return response_content.strip()
+
+            return response_json, messages
 
         except BadRequestError as e:
-            print(f"Error generating content with GPT-4o: {e}")
+            print(f"Error generating content with GPT-4o")
+            traceback.print_exc()
             return None
 
 

@@ -149,11 +149,14 @@ class Conference:
             else:
                 # Calculate weighted average score
                 avg_score = self._calculate_paper_score(paper_reviews)
+                
+                
+            paper["reviews"] = paper_reviews
 
             paper_scores.append({
                 'paper': paper,
                 'score': avg_score,
-                'num_reviews': len(paper_reviews)
+                'num_reviews': len(paper_reviews),
             })
 
         # Sort papers by score

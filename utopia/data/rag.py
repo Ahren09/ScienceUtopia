@@ -219,7 +219,8 @@ class RAG:
     def batch_retrieve(
         self,
         queries: List[str],
-        retrieval_type: str = "submission"
+        retrieval_type: str = "submission",
+        cite_only_accepted_papers: bool = True
     ) -> Dict:
         """
         Batch retrieve documents for multiple queries using PyTorch tensor operations
@@ -234,13 +235,16 @@ class RAG:
         """
         # Select the appropriate index
         if retrieval_type == "submission":
-            indices = (self.document_status['status'] == "unsubmitted").index.values
+            indices = (self.document_status[self.document_status['status'] == "unsubmitted"]).index.values
             assert len(indices) > 0, "No candidate papers found!"
             
-            print(f"\n[SUBMISSION INDEX] Batch retrieving for {len(queries)} queries...")
+            print(f"[SUBMISSION INDEX] Retrieving papers for {len(queries)} queries from {len(indices)} papers ...")
         elif retrieval_type == "citation":
-            indices = (self.document_status['status'] == "accepted").index.values
-            assert len(indices) > 0, "No accepted papers found!"
+            if cite_only_accepted_papers:
+                indices = (self.document_status[self.document_status['status'] == "accepted"]).index.values
+            else:
+                indices = (self.document_status[(self.document_status['status'] == "accepted") | (self.document_status['status'] == "rejected")]).index.values
+            assert len(indices) > 0, "No candidate papers found!"
             print(f"\n[CITATION INDEX] Batch retrieving for {len(queries)} queries...")
             
         else:
@@ -293,13 +297,13 @@ class RAG:
             all_similarity_scores.append(similarity_scores)
 
         similarity_scores = torch.cat(all_similarity_scores, dim=1)  # (Q, D)
-        assert similarity_scores.shape == (len(queries), len(self.documents))
+        assert similarity_scores.shape == (len(queries), document_embeddings.shape[0])
         del all_similarity_scores
         print(f"Similarity computation time: {time() - t1:.2f} seconds")
         # Get top-k indices for each query (vectorized)
         print("Finding top-k documents...")
         t2 = time()
-        _, topk_indices = torch.topk(similarity_scores, k=self.config.num_retrieved_docs, dim=1)
+        _, topk_indices = torch.topk(similarity_scores, k=min(self.config.num_retrieved_docs, len(indices)), dim=1)
         topk_indices = topk_indices.cpu().numpy()
         
         topk_indices = np.vectorize(mapping.get)(topk_indices)
@@ -479,6 +483,19 @@ class RAG:
         self.document_status.loc[self.document_status['id'].isin(accepted_paper_ids), 'status'] = 'accepted'
         self.document_status.loc[self.document_status['id'].isin(rejected_paper_ids), 'status'] = 'rejected'
         
+
+    def to_dict(self) -> Dict:
+        """Serialize RAG state (document status only, embeddings rebuilt on load)"""
+        return {
+            'document_status': self.document_status.to_dict('records')
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict, config: RAGConfig, model=None, debug: bool = False) -> 'RAG':
+        """Reconstruct RAG from saved state"""
+        rag = cls(config=config, model=model, debug=debug)
+        rag.document_status = pd.DataFrame(data['document_status'])
+        return rag
 
     def add_documents_to_corpus(self, new_documents: List[Document]):
         """

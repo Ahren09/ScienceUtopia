@@ -117,7 +117,6 @@ class FundingAgency(SimulationAgent):
     def __init__(self, agency_name: str, funding_level: int = 100, llm: LLM = None, default_funding_rate: float = None):
         super().__init__(
             reputation=8,
-            funding_level=funding_level,
             agent_id=agency_name,
             llm=llm
         )
@@ -378,8 +377,8 @@ Evaluate all applications and select the top {num_winners} winners, from the mos
 """
             winners = None
             try:
-                llm_response = self.llm.generate(prompt=prompt)
-                result = json.loads(llm_response)
+                result, message_history = self.llm.generate(prompt=prompt)
+                
                 winners = result.get('winners', [])
                 assert len(winners) == num_winners
                 # Ensure we don't exceed the number of applications

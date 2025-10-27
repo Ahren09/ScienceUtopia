@@ -12,11 +12,14 @@ import subprocess
 import hashlib
 import networkx as nx
 from typing import List, Dict
-from const import RESEARCH_COST, PAPER_SUBMISSION_COST
+from const import RESEARCH_COST, PAPER_SUBMISSION_COST, REVIEW_CRITERIA
 from langchain_core.documents import Document
 from utopia.models.models import LLM, GPT
 
+from utopia.config import SIMULATION_CONFIG
+
 from utopia.agents.conference import Conference
+from utopia.utils.data_utils import top_percentile
 
 
 class MultiAgentEcosystem:
@@ -78,7 +81,7 @@ class MultiAgentEcosystem:
         for agent_id, agent in self.agent_population.items():
             agent_dict = {
                 'id': agent.id,
-                'resources': agent.resources,
+                'resources': getattr(agent, 'resources', None),
                 'reputation': agent.reputation,
                 'memory_bank': agent.memory_bank,
                 'review_experiences': agent.review_experiences,
@@ -152,23 +155,25 @@ class MultiAgentEcosystem:
         # Create new ecosystem
         ecosystem = cls(
             agent_configs=data.get('config', {}),
-            initial_paper_corpus=[]
         )
 
         ecosystem.simulation_metrics = data.get('simulation_metrics', ecosystem._create_metrics_tracker())
         # Reconstruct agents
         all_agent_data = data.get('agents', [])
+        
+        from utopia.agents.research_direction import DIRECTIONS_DICT
         for agent_data in all_agent_data:
             agent_type = agent_data['type']
 
             if agent_type == 'UniversityResearcher':
                 # Reconstruct expertise
                 expertise = []
-                for exp_data in agent_data.get('expertise', []):
-                    if isinstance(exp_data, dict):
-                        expertise.append(ResearchDirection.from_dict(exp_data))
+                for direction in agent_data.get('expertise', []):
+                    if isinstance(direction, dict):
+                        expertise.append(ResearchDirection.from_dict(direction))
                     else:
-                        expertise.append(exp_data)
+                        assert direction in DIRECTIONS_DICT, f"Direction {direction} not found in DIRECTIONS_DICT"
+                        expertise.append(DIRECTIONS_DICT[direction])
 
                 agent = UniversityResearcher(
                     researcher_name=agent_data['id'],
@@ -192,7 +197,8 @@ class MultiAgentEcosystem:
                     if isinstance(exp_data, dict):
                         expertise.append(ResearchDirection.from_dict(exp_data))
                     else:
-                        expertise.append(exp_data)
+                        assert direction in DIRECTIONS_DICT, f"Direction {direction} not found in DIRECTIONS_DICT"
+                        expertise.append(DIRECTIONS_DICT[direction])
 
                 agent = IndustryResearcher(
                     researcher_name=agent_data['id'],
@@ -253,10 +259,9 @@ class MultiAgentEcosystem:
 class SimulationAgent:
     """Base class for simulation agents"""
 
-    def __init__(self, reputation: int, funding_level: int,
+    def __init__(self, reputation: int,
                  agent_id: str = None, llm: LLM = None):
         self.id = agent_id or f"agent_{int(time.time() * 1000)}"
-        self.resources = funding_level  # Integer from 0-100 scale
         self.reputation = reputation    # 1-10 scale
         self.memory_bank = []  # Store experiences and thoughts from interactions
         self.review_experiences = []  # Track experiences as both author and reviewer
@@ -290,55 +295,7 @@ class SimulationAgent:
         self.resources = max(0, self.resources - RESEARCH_COST)
         
         return agent_filtered_ideas
-        
-    def write_paper(self, idea: Dict, references: List) -> Dict:
-        """
-        WRAPPER around existing launch_scientist_bfts.py pipeline
-        Does NOT modify the original pipeline
-        """
-        # Check if agent has sufficient resources
-        if self.resources < PAPER_SUBMISSION_COST:
-            raise ValueError(f"Agent {self.id} has insufficient resources ({self.resources}) for paper submission")
-        
-        # Import existing pipeline WITHOUT modification
-        import os
-        
-        # WRAPPER: Use existing pipeline through subprocess to avoid modification
-        # Create temporary config for this agent
-        agent_output_dir = self._get_agent_output_dir()
-        
-        # Call existing AI-Scientist pipeline as-is without modification
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as temp_ideas:
-            json.dump(idea, temp_ideas)
-            temp_ideas_path = temp_ideas.name
-        
-        try:
-            # Execute existing pipeline without modifying it
-            result = subprocess.run([
-                'python', 'launch_scientist_bfts.py',
-                '--load_ideas', temp_ideas_path,
-                '--model_writeup', self._get_writeup_model(),
-                '--model_review', self._get_review_model(),
-                '--output_dir', agent_output_dir
-            ], capture_output=True, text=True, cwd='/nethome/yjin328/Workspace/PeerReview/AI-Scientist-v2')
-            
-            # POST-PROCESS: Parse output and add agent-specific enhancements
-            paper_output = self._parse_pipeline_output(result, agent_output_dir)
-            paper_output = self._add_traceable_citations(paper_output, references)
-            
-        finally:
-            # Clean up temporary files
-            if os.path.exists(temp_ideas_path):
-                os.unlink(temp_ideas_path)
-        
-        # Deduct cost for paper writing and submission
-        self.resources = max(0, self.resources - PAPER_SUBMISSION_COST)
-        
-        # Record paper writing experience
-        self._record_authoring_experience(idea, paper_output)
-        
-        return paper_output
-        
+     
     def update_resources(self, delta: float):
         """Update researcher resources"""
         assert isinstance(delta, (int, float)), "changes in funding level must be a valid number"
@@ -359,7 +316,7 @@ class SimulationAgent:
         # TODO: Generate topics for the papers
         
         if memory_context:
-            memory_context = f"""## Memory Context
+            memory_context = f"""## Your Recent Experiences 
 {memory_context}
 """
             
@@ -382,61 +339,65 @@ Paper Topics: {', '.join(paper.get('topics', []))}
 {memory_context}
 
 ## Review Instructions
-Provide an  comprehensive review with:
+Provide a comprehensive review with:
 1. Overall Score (1-5 scale):
-   - 5: Award-worthy (top 2.5%)
-   - 4: Strong accept
-   - 3: Borderline accept
-   - 2: Needs major revisions
-   - 1: Reject
+{REVIEW_CRITERIA}
    
 2. A succinct, 1-sentence justification for the score.
+"""
 
+        prompt += """
 ## Sample Response
 ```json
-{{
+{
     "justification": "The paper has critical flaws and needs major revisions."
     "overall_score": 2,
-}}
+}
 ```
 """
 
-        review_json = self.llm.generate(prompt=prompt)
-        review = json.loads(review_json)
-
-        # Apply agent-specific biases
-        final_review = self._apply_agent_review_biases(review)
-        final_review['reviewer_id'] = self.id
-
-        return final_review
+        review_json, message_history = self.llm.generate(prompt=prompt)
         
-    def process_received_reviews(self, reviews: List[Dict], paper_id: str = None):
+        review_json['reviewer_id'] = self.id
+
+        return review_json
+        
+    def process_received_reviews(self, reviews: List[Dict], paper_id: str, year: int, average_scores_of_venue: dict):
         """Process reviews received for submitted paper and update memory
 
         Args:
             reviews: List of review dictionaries
             paper_id: ID of the paper that was reviewed
+            average_scores_of_venue: Average score of all papers in the conference
         """
         if not reviews:
             return
 
         # Calculate average score
         avg_score = sum(r.get('overall_score', 0) for r in reviews) / len(reviews)
+        
+        percentile = top_percentile(avg_score, list(average_scores_of_venue.values()))
+        
+        status_string = f"(Top {percentile:.1f}% of all papers" #, average score: {avg_score:.1f} on a scale of 1-5)"
 
         # Determine emotional response based on average score
-        if avg_score >= 4.0:
+        if percentile <= 0.1: # percentile >= 4.0:
             
-            thought = f"My paper received excellent reviews (avg: {avg_score:.2f})! This validates my research direction and boosts my confidence."
+            thought = f"My paper received excellent reviews {status_string}! This validates my research direction and boosts my confidence."
             memory_type = 'excellent_reviews_received'
-        elif avg_score >= 3.0:
-            thought = f"My paper received moderately good reviews (avg: {avg_score:.2f}). There's room for improvement, but overall positive."
+        elif percentile <= 0.3: # percentile >= 3.0:
+            thought = f"My paper received moderately good reviews {status_string}. There's room for improvement, but overall positive."
             memory_type = 'good_reviews_received'
-        elif avg_score >= 2.0:
-            thought = f"My paper received average reviews (avg: {avg_score:.2f}). I need to work harder to improve my research quality."
+        elif percentile <= 0.5: # percentile >= 2.0:
+            thought = f"My paper received average reviews {status_string}. I need to work harder to improve my research quality."
             memory_type = 'average_reviews_received'
-        else:
-            thought = f"My paper received very poor reviews (avg: {avg_score:.2f}). This is disappointing and frustrating."
+        elif percentile <= 0.7:
+            thought = f"My paper received poor reviews {status_string}. This is disappointing."
             memory_type = 'poor_reviews_received'
+            
+        else:
+            thought = f"My paper received VERY harsh reviews {status_string}. This is too UNFAIR, harsh, and frustrating."
+            memory_type = 'harsh_reviews_received'
 
         # Record overall experience
         self.memory_bank.append({
@@ -446,7 +407,75 @@ Provide an  comprehensive review with:
             'avg_score': avg_score,
             'num_reviews': len(reviews),
             'paper_id': paper_id,
+            'year': year,
         })
+
+    def decide_resubmission(self, rejected_papers: Dict[str, Dict], conferences: List[Conference], resubmission_cost: int = SIMULATION_CONFIG['conference']['resubmission_cost']) -> List[str]:
+        """Decide which rejected papers to resubmit (costs 5 each)
+
+        Returns:
+            List of paper IDs to resubmit
+        """
+        if self.resources < 5 or not rejected_papers:
+            return []
+
+        papers_info = []
+        for idx, (arxiv_id, p) in enumerate(rejected_papers.items()):
+            paper_info = f"""### Paper {idx}
+Title: \"{p['title']}\"
+Abstract: {p['content'][:300]} ...
+arXiv ID: \"{arxiv_id}\"
+Review History:
+"""
+            for review_history in p['review_history']:
+                paper_info += f"""- Score: {review_history['score']:.2f} / 5 ({review_history['conference']} conference in year {review_history['year']}))
+"""
+
+            papers_info.append(paper_info)
+        prompt = f"""You are considering resubmitting some of your rejected papers. You have {self.resources} units of funding. Each resubmission costs {resubmission_cost} per paper.
+
+## Previously Rejected Papers
+"""
+        prompt += '\n'.join(papers_info)
+
+        prompt += """
+## Candidate Conferences
+
+Below are the candidate conferences you can resubmit to. For each paper, you MUST CHOOSE EXACTLY ONE of them that best suits the paper. Submitting to a conference with mismatch topics has a high chance of getting rejected, although not always.
+
+"""
+        candidate_conference_ids = set([conference.conference_id for conference in conferences])
+        for conference in conferences:
+            prompt += f"""- \"{conference.conference_id}\": primary topics: {', '.join(conference.topics[:3])} | less preferred topics: {', '.join(conference.topics[3:])}
+"""
+
+        prompt += """
+Please respond with a list of papers you want to RESUBMIT (the FULL URL) and its conference abbreviation (e.g. "NeurIPS" or "AAAI").
+        
+## Sample Response
+```json
+{
+    "resubmitted_papers": [{
+        "arxiv_id": "https://arxiv.org/abs/2407.12345v5",
+        "conference": "ACL"
+    },
+    {
+        "arxiv_id": "https://arxiv.org/abs/2305.67890v1",
+        "conference": "AAAI"
+    }]
+}
+```
+"""
+
+        result, _ = self.llm.generate(prompt=prompt, response_format="json_object")
+        assert 'resubmitted_papers' in result
+        result = result['resubmitted_papers']
+        
+        resubmitted_paper_ids = [p['arxiv_id'] for p in result]
+        assert set(resubmitted_paper_ids) <= set([p['id'] for id, p in rejected_papers.items()])
+        conferences = [p['conference'] for p in result]
+        assert set(conferences) <= candidate_conference_ids
+        return result
 
     # Helper methods (private)
     
@@ -533,35 +562,36 @@ Provide an  comprehensive review with:
         total_citations = len(citation_list)
         return unique_venues / total_citations if total_citations > 0 else 0.0
         
-    def _record_authoring_experience(self, idea: Dict, paper_output: Dict):
+    def _record_authoring_experience(self, idea: Dict, paper_output: Dict, year: int):
         """Record paper authoring experience"""
         self.memory_bank.append({
             'type': 'paper_submission',
             'timestamp': time.time(),
-            'expects_harsh': self._had_recent_negative_experience()
+            'expects_harsh': self._had_recent_negative_experience(),
+            'year': year,
         })
             
     def _extract_review_memory_context(self) -> str:
         """Extract relevant behavioral context from memory bank"""
-        recent_memories = [m for m in self.memory_bank if time.time() - m['timestamp'] < 86400*30]  # Last 30 days
+        recent_memories = sorted([m for m in self.memory_bank], key=lambda x: x['timestamp'], reverse=False)
 
         context_elements = []
         for memory in recent_memories[-5:]:  # Last 5 relevant memories
             mtype = memory.get('type', '')
             if mtype == 'excellent_reviews_received':
-                context_elements.append("- Your recent paper received excellent reviews, making you feel confident and generous")
+                context_elements.append(f"- (Year: {memory['year']}) Your recent paper received excellent reviews (percentile: {memory['percentile']:.1f}% on a scale of 1-5), making you feel confident and generous")
             elif mtype == 'good_reviews_received':
-                context_elements.append("- Your recent paper received good reviews, putting you in a positive mood")
+                context_elements.append(f"- (Year: {memory['year']}) Your recent paper received good reviews (percentile: {memory['percentile']:.1f}% on a scale of 1-5), putting you in a positive mood")
             elif mtype == 'average_reviews_received':
-                context_elements.append("- Your recent paper received mixed reviews, making you more critical in your evaluations")
+                context_elements.append(f"- (Year: {memory['year']}) Your recent paper received mixed reviews (percentile: {memory['percentile']:.1f}% on a scale of 1-5), making you more critical in your evaluations")
             elif mtype == 'poor_reviews_received':
-                context_elements.append("- Your recent paper received poor reviews, making you frustrated and potentially harsher on others")
+                context_elements.append(f"- (Year: {memory['year']}) Your recent paper received poor reviews (percentile: {memory['percentile']:.1f}% on a scale of 1-5), making you frustrated and potentially harsher on others")
             elif mtype == 'toxic_review_received':
-                context_elements.append("- You've received harsh reviews recently, making you more critical of others")
+                context_elements.append(f"- (Year: {memory['year']}) You've received harsh reviews recently (percentile: {memory['percentile']:.1f}% on a scale of 1-5), making you more critical of others")
             elif mtype == 'retaliatory_bias':
-                context_elements.append("- You tend to give stricter reviews after negative experiences")
+                context_elements.append(f"- (Year: {memory['year']}) You tend to give stricter reviews after negative experiences.")
             elif mtype == 'positive_collaboration':
-                context_elements.append("- Recent positive interactions make you more constructive")
+                context_elements.append(f"- (Year: {memory['year']}) Recent positive interactions make you more constructive.")
 
         return "\n".join(context_elements) if context_elements else ""
         
@@ -569,9 +599,6 @@ Provide an  comprehensive review with:
         """Get personality prompt for this agent - override in subclasses"""
         return f"You are a researcher specializing in {', '.join(self.specializations)}."
         
-    def _apply_agent_review_biases(self, review: Dict) -> Dict:
-        """Apply agent-specific biases to review - override in subclasses"""
-        return review
     
         
     def _had_recent_negative_experience(self) -> bool:
@@ -579,7 +606,13 @@ Provide an  comprehensive review with:
         recent = [e for e in self.review_experiences if time.time() - e['timestamp'] < 86400*7]
         return any(e.get('emotional_response') == 'negative' for e in recent)
     
-    def get_paper_submission_prompt(self, candidate_papers: List[Document], conferences: List[Conference], max_papers: int = 10, previous_papers: List[str] = None) -> str:
+    def get_bio(self) -> str:
+        """Get bio prompt for this agent"""
+        expertise = [research_direction.topic for research_direction in self.expertise]
+        prompt = f"You are a researcher specializing in {', '.join(expertise)}."
+        return prompt
+    
+    def get_paper_submission_prompt(self, candidate_papers: List[Document], year: int, conferences: List[Conference], paper_archive, max_papers: int = 10, previous_papers: List[str] = None) -> str:
         """
         Get research idea prompt for this agent
 
@@ -589,17 +622,25 @@ Provide an  comprehensive review with:
             max_papers: Maximum number of candidate papers to show
             previous_papers: Optional list of preview strings for previously accepted papers
         """
-
-        expertise = [research_direction.topic for research_direction in self.expertise]
-        prompt = f"""
-You are a researcher specializing in {', '.join(expertise)}.
+        prompt = self.get_bio() + f"""
 You plan to do a project and submit a paper to a conference.
 From the following candidate papers, please give me a paper ID that you want to submit. Then, give a conference name that you want to submit to.
 """
 
+        if year >= 2:
+            prompt += """
+## Previously Accepted Papers (for reference and citation)
+The following are previous papers you wrote, either accepted or rejected. You can use them to inspire your paper.
+"""
+            previous_papers = paper_archive.get_papers_by_author(self.id)
+            previous_papers.sort(key=lambda x: x.year, reverse=True)
+            for i, paper in enumerate(previous_papers[:10], 1):  # Show top 5
+                latest_score = paper.review_history[-1]['score'] if paper.review_history else 0.0
+                prompt += f"{i}. \"{paper.title}\" - Year: {paper.year}, Conference: {paper.conference} ({paper.decision} with score {latest_score:.2f})\n"
+
+
         # Add previously accepted papers if available (Year 2+)
         if previous_papers and len(previous_papers) > 0:
-            raise NotImplementedError("Previous papers are not supported yet")
             prompt += f"""
 ## Previously Accepted Papers (for reference and citation)
 The following papers were accepted in previous years and can be cited in your work:
@@ -624,45 +665,26 @@ Abstract: {paper.page_content}
 """
 
         prompt += """## Candidate Conferences
-Below are the candidate conferences you can submit to. Please choose one of them that suits the paper. Submitting to a conference with mismatch topics has a high chance of getting rejected, although not always.
+Below are the candidate conferences you can submit to. You MUST CHOOSE EXACTLY ONE of them that best suits the paper. Submitting to a conference with mismatch topics has a high chance of getting rejected, although not always.
+
 """
         candidate_conference_ids = set([conference.conference_id for conference in conferences])
         for conference in conferences:
             prompt += f"""- \"{conference.conference_id}\": primary topics: {', '.join(conference.topics[:3])} | less preferred topics: {', '.join(conference.topics[3:])}
 """
-        prompt += f"""
+        prompt += """
 ## Your Task
-Please respond with a paper ID you want to submit (the full URL) and its conference abbreviated name (e.g. "NeurIPS" or "AAAI").
+Please respond with a paper ID you want to submit (the FULL URL) and its conference abbreviation name (e.g. "NeurIPS" or "AAAI").
 
 ## Sample Response
 ```json
-{{
+{
     "id": 1,
     "arxiv_id": "http://arxiv.org/abs/2407.00005v1",
-    "conference": "NeurIPS"
-}}
+    "conference": "NeurIPS"  <- MUST be one of the candidate conferences listed above
+}
 ```
 """
-
-        schema = {
-            "name": "city_weather_schema",
-            "schema": {
-                "type": "object",
-                "properties": {
-                    "id": {
-                        "type": "number",
-                        "description": "ID of the paper"
-                    },
-                    "arxiv_id": {
-                        "type": "string",
-                        "description": "arXiv ID of the paper"
-                    },
-                },
-                "required": ["id", "arxiv_id"],
-                "additionalProperties": False
-            },
-            "strict": True  # ensures model cannot output extra fields
-        }
 
         # Note: as of 2025-10-20, gpt-4o dose not support the response_format parameter. "gpt-4o-2024-08-06" does.
         response_format = {
@@ -678,5 +700,66 @@ Please respond with a paper ID you want to submit (the full URL) and its confere
             },
         }
         return prompt, response_format
-    
-    
+
+
+    def get_potential_cited_papers_prompt(self, paper: Dict, candidate_papers: List[Dict], max_papers: int = 10) -> str:
+        """
+        Get potential cited papers prompt for this agent
+        """
+        prompt = f"""
+Now that you have submitted the following paper, please give me a list of potential cited papers that you want to cite. NOTE: It is fine if you do not cite any papers due to topic mismatch.
+
+## Your Submitted Paper
+ID: {paper['id']}
+Title: {paper['title']}
+Abstract: {paper['content']}
+Topics: {', '.join(paper['topics'])}
+
+
+## Candidate Papers
+
+"""
+        for i, cited_paper in enumerate(candidate_papers[:max_papers]):
+            prompt += f"""### Paper {i+1}
+ID: {i+1}
+arXiv ID: {cited_paper['id']}
+Title: {cited_paper['title']}
+Abstract: {cited_paper['content'][:300]}...
+
+"""
+
+        prompt += """
+## Sample Response
+```json
+{
+    "citations": [1, 3, 7] <- the indices of the candidate papers you want to cite
+}
+```
+"""
+
+        return prompt
+
+
+
+    def _extract_research_memory_context(self) -> str:
+        """Extract relevant research context from memory bank for direction selection"""
+        if not hasattr(self, 'memory_bank') or not self.memory_bank:
+            return ""
+
+        recent_memories = [m for m in self.memory_bank
+                          if time.time() - m.get('timestamp', 0) < 86400 * 365]  # Last year
+
+        context_elements = []
+        for memory in recent_memories[-5:]:  # Last 5 relevant memories
+            mtype = memory.get('type', '')
+            if mtype == 'excellent_reviews_received':
+                context_elements.append(f"- Your recent paper received excellent reviews (avg: {memory['percentile']:.2f}), validating your research direction")
+            elif mtype == 'good_reviews_received':
+                context_elements.append(f"- Your recent paper received positive reviews (avg: {memory['percentile']:.2f})")
+            elif mtype == 'average_reviews_received':
+                context_elements.append(f"- Your recent paper received mixed reviews (avg: {memory['percentile']:.2f}), suggesting room for improvement")
+            elif mtype == 'poor_reviews_received':
+                context_elements.append(f"- Your recent paper received poor reviews (avg: {memory['percentile']:.2f}), indicating possible need to pivot or strengthen foundation")
+
+        return "\n".join(context_elements) if context_elements else ""
+
