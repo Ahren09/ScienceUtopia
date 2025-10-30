@@ -52,7 +52,7 @@ from utopia.utils.citation_extractor import extract_citations_from_content
 
 from utopia.utils.generail_utils import project_setup
 from utopia.config import SIMULATION_CONFIG
-from utopia.metrics.tracker import calculate_gini_coefficient, calculate_citation_metrics, calculate_score_metrics
+from utopia.metrics.tracker import calculate_gini_coefficient, calculate_citation_metrics, calculate_conference_score_metrics
 from utopia.analysis.analyze_all_results import SimulationAnalyzer
 
 # Setup logging
@@ -258,8 +258,7 @@ class Simulation:
         research_direction_selection_mode = "batch" if year == 1 else "individual"
 
         year_results = {
-            'year': year,
-            'phases': {}
+            'year': year
         }
 
         # Phase 0: Resubmissions (year 2+)
@@ -322,9 +321,10 @@ class Simulation:
                 )
                 directions[agent.id] = direction
 
-        year_results['phases']['research_assignment'] = {
+        year_results['research_assignment'] = {
             'mode': research_direction_selection_mode,
-            'num_agents_assigned': len(directions)
+            'num_agents_assigned': len(directions),
+            "directions": {agent_id: direction.topic for agent_id, direction in directions.items()}
         }
 
         # Phase 2: Generate and submit papers
@@ -478,15 +478,15 @@ class Simulation:
             else:
                 raise ValueError(f"Paper {arxiv_id} submission to conference {paper_dict['conference']} failed")
 
-        year_results['phases']['paper_submission'] = {
+        year_results['paper_submission'] = {
             'num_papers_submitted': sum(len(papers) for author_id, papers in submitted_papers.items()),
-            'papers': submitted_papers
+            
         }
 
         # Phase 3: Peer review
         logger.info(f"Year {year} Phase 3: Conducting peer reviews...")
         self.conference_system.start_all_review_processes()
-
+        # Map conference ids to dict of papers
         average_scores = {}
         reviews_by_conference = {}  # {conf_id: {paper_id: [reviews]}}
         reviews_by_reviewer = defaultdict(list)  # {reviewer_id: [scores]}
@@ -514,6 +514,15 @@ class Simulation:
                             conference.add_review(paper['id'], review)
                             reviews_by_reviewer[reviewer.id].append(review['overall_score'])
                             break
+                        
+                        except json.decoder.JSONDecodeError as e:
+                            logger.warning(f"Error reviewing paper: {e}")
+                            traceback.print_exc()
+                            num_retries += 1
+                            if num_retries > 3:
+                                break
+                            time.sleep(1)
+                        
                         except Exception as e:
                             logger.warning(f"Error reviewing paper: {e}")
                             traceback.print_exc()
@@ -527,13 +536,18 @@ class Simulation:
                 average_scores[conference.conference_id][paper['id']] = sum(r['overall_score'] for r in paper_reviews) / len(paper_reviews)
                 
         # Calculate score metrics
-        score_metrics = calculate_score_metrics(reviews_by_conference, dict(reviews_by_reviewer))
+        conference_score_metrics = calculate_conference_score_metrics(reviews_by_conference, dict(reviews_by_reviewer))
 
-        year_results['phases']['peer_review'] = {
+        year_results['peer_review'] = {
             'reviews_conducted': sum(len(c.reviews) for c in self.conference_system.conferences),
-            'score_metrics': score_metrics,
-            'average_scores': average_scores
+            'score_metrics': conference_score_metrics,
+            # 'average_scores': average_scores
         }
+        
+        
+            
+        
+        
 
         # Process received reviews for authors
         logger.info(f"Year {year} Phase 3: Processing author experiences from received reviews...")
@@ -589,11 +603,17 @@ class Simulation:
         self.rag.mark_papers_as_submitted(accepted_paper_ids, rejected_paper_ids)
         # Save paper archive to disk
 
-        year_results['phases']['decisions'] = {
+        year_results['decisions'] = {
             'total_accepted': total_accepted,
             'total_rejected': total_rejected,
             'conference_decisions': decisions
         }
+        
+        
+        # for author_id in year_results['paper_submission']:
+        #     papers_of_author = year_results['paper_submission']['papers'][author_id]
+        #     for paper in papers_of_author:
+        #         paper_archive.add_paper(paper, year, 'accept')
 
         logger.info(f"  Accepted: {total_accepted}, Rejected: {total_rejected}")
 
@@ -677,12 +697,12 @@ class Simulation:
                 self.ecosystem.remove_agent(agent.id)
 
         # Calculate agent behavior and ecosystem health metrics
-        funding_levels = [agent.resources for agent_id, agent in self.ecosystem.agent_population.items() if getattr(agent, 'resources', None) is not None]
+        funding_levels = {agent_id: agent.resources for agent_id, agent in self.ecosystem.agent_population.items() if getattr(agent, 'resources', None) is not None}
         year_results['ecosystem_metrics'] = {
             'resource_distribution': {
-                'mean': float(np.mean(funding_levels)) if funding_levels else 0.0,
-                'std': float(np.std(funding_levels)) if funding_levels else 0.0,
-                'gini': calculate_gini_coefficient(funding_levels)
+                'mean': float(np.mean(list(funding_levels.values()))) if funding_levels else None,
+                'std': float(np.std(list(funding_levels.values()))) if funding_levels else None,
+                'gini': calculate_gini_coefficient(funding_levels.values())
             },
             'active_agents': len([a for a in self.ecosystem.agent_population.values() if hasattr(a, 'can_author') and a.can_author]),
             'funding_success_by_type': {
@@ -766,7 +786,6 @@ class Simulation:
                 for conf_name in conferences_in_category:
                     logger.info(f"    - {conf_name}")
 
-            logger.info("")
 
         # Initialize RAG (always reconstruct fresh from data source)
         logger.info("\nInitializing RAG system...")

@@ -1,12 +1,14 @@
 """Metrics calculation utilities for simulation analysis"""
 
 import numpy as np
-from typing import Dict, List, Set, Any
+from typing import Dict, List, Set, Any, Union
 from collections import defaultdict
 
 
-def calculate_gini_coefficient(values: List[float]) -> float:
+def calculate_gini_coefficient(values: Union[List[float], Dict[str, float]]) -> float:
     """Calculate Gini coefficient for inequality measurement"""
+    if isinstance(values, Dict):
+        values = list(values.values())
     if not values or len(values) == 0:
         return 0.0
     sorted_values = sorted(values)
@@ -15,7 +17,7 @@ def calculate_gini_coefficient(values: List[float]) -> float:
     return (2 * np.sum((np.arange(1, n + 1)) * sorted_values) - (n + 1) * cumsum[-1]) / (n * cumsum[-1]) if cumsum[-1] > 0 else 0.0
 
 
-def calculate_score_metrics(reviews_by_conference: Dict[str, Dict[str, List[Dict]]],
+def calculate_conference_score_metrics(reviews_by_conference: Dict[str, Dict[str, List[Dict]]],
                             reviews_by_reviewer: Dict[str, List[float]]) -> Dict[str, Any]:
     """Calculate score fluctuation metrics
 
