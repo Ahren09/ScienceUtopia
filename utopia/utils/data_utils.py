@@ -31,5 +31,5 @@ def load_data(debug: bool = False):
     
 def top_percentile(value, data):
     data = np.array(data)
-    percentile = np.sum(data >= value) / len(data) * 100
-    return percentile
+    percentile = np.sum(data > value) / len(data) * 100
+    return max(percentile, 1)

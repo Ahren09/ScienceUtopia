@@ -24,7 +24,6 @@ class ArchivedPaper:
     conference: str
     decision: str
     topics: List[str] = field(default_factory=list)
-    citation_count: int = 0  # Number of times this paper has been cited
     
     review_history: List[Dict] = field(default_factory=list)  # [{"conference": str, "year": int, "score": float}]
     
@@ -40,7 +39,6 @@ class ArchivedPaper:
             'conference': self.conference,
             'topics': self.topics,
             'decision': self.decision,
-            'citation_count': self.citation_count,
             'review_history': self.review_history
         }
 
@@ -56,7 +54,6 @@ class ArchivedPaper:
             conference=data['conference'],
             topics=data.get('topics', []),
             decision=data['decision'],
-            citation_count=data.get('citation_count', 0),
             review_history=data.get('review_history', [])
         )
 
@@ -71,17 +68,9 @@ class ArchivedPaper:
                 'year': self.year,
                 'conference': self.conference,
                 'topics': ', '.join(self.topics),
-                'citation_count': self.citation_count,
                 'source': 'simulation'
             }
         )
-
-    def get_preview(self, max_abstract_len: int = 100) -> str:
-        """Get a preview string for display to agents"""
-        abstract_preview = self.abstract[:max_abstract_len]
-        if len(self.abstract) > max_abstract_len:
-            abstract_preview += "..."
-        return f"[{self.year}] {self.title}\n  Abstract: {abstract_preview}"
 
 
 class PaperArchive:
@@ -95,7 +84,7 @@ class PaperArchive:
         self.papers_by_author: Dict[str, List[ArchivedPaper]] = {}
         self.archive_file = self.output_dir / "paper_archive.json"
 
-    def add_paper(self, paper_dict: Dict, year: int, decision: str) -> ArchivedPaper:
+    def add_or_update_paper(self, paper_dict: Dict) -> ArchivedPaper:
         """
         Add a paper to the archive (handles resubmissions)
 
@@ -108,40 +97,52 @@ class PaperArchive:
         Returns:
             ArchivedPaper object
         """
+        
         # Check if paper already exists (resubmission case)
-        if paper_dict['id'] in self.papers_by_id:
+        if paper_dict['type'] == 'resubmission':
+            
+            assert paper_dict['id'] in self.papers_by_id, f"Resubmitted paper {paper_dict['id']} not found in archive"
             archived_paper = self.papers_by_id[paper_dict['id']]
+            
+            # Update the latest conference, year, and decision
+            archived_paper.conference = paper_dict['conference']
+            archived_paper.year = paper_dict['year']
+            archived_paper.decision = paper_dict['decision']
             # Append to review history
             archived_paper.review_history.append({
                 'conference': paper_dict['conference'],
-                'year': year,
+                'year': paper_dict['year'],
                 'score': paper_dict['final_score'],
                 'reviews': paper_dict['reviews'],
-                'decision': decision,
+                'decision': paper_dict['decision'],
             })
             
 
-        else:
+        elif paper_dict['type'] == 'submission':
+            
             # New paper
+            assert paper_dict['id'] not in self.papers_by_id, f"Submitted paper {paper_dict['id']} already exists in archive"
             archived_paper = ArchivedPaper(
                 id=paper_dict['id'],
                 title=paper_dict['title'],
                 abstract=paper_dict.get('content', ''),
                 author_id=paper_dict['author_id'],
-                year=year,
+                year=paper_dict['year'],
                 conference=paper_dict['conference'],
                 topics=paper_dict.get('topics', []),
-                decision=decision,
-                citation_count=0,
+                decision=paper_dict['decision'],
                 review_history=[{
                     'conference': paper_dict['conference'], 
-                    'year': year, 
+                    'year': paper_dict['year'], 
                     'score': paper_dict['final_score'], 
                     'reviews': paper_dict['reviews'],
-                    'decision': decision
+                    'decision': paper_dict['decision']
                 }]
             )
             self.papers_by_id[archived_paper.id] = archived_paper
+            
+        else:
+            raise ValueError(f"Invalid paper type: {paper_dict['type']}. Must be 'resubmission' or 'submission'")
 
         # Update papers_by_author index
         if archived_paper.author_id not in self.papers_by_author:
@@ -150,23 +151,43 @@ class PaperArchive:
         if archived_paper not in self.papers_by_author[archived_paper.author_id]:
             self.papers_by_author[archived_paper.author_id].append(archived_paper)
 
-
+        year = paper_dict['year']
         # Update accept / reject paper index
-        if decision == 'accept':
+        if paper_dict['decision'] == 'accept':
 
             if year not in self.accepted_papers_by_year:
                 self.accepted_papers_by_year[year] = []
             self.accepted_papers_by_year[year].append(archived_paper)
             
-        elif decision == 'reject':
+        elif paper_dict['decision'] == 'reject':
             if year not in self.rejected_papers_by_year:
                 self.rejected_papers_by_year[year] = []
             self.rejected_papers_by_year[year].append(archived_paper)
             
         else:
-            raise ValueError(f"Invalid decision: {decision}. Must be 'accepted' or 'rejected'")
+            raise ValueError(f"Invalid decision: { paper_dict['decision']}. Must be 'accepted' or 'rejected'")
 
         return archived_paper
+
+
+    def update_paper(self, paper_id: str, citations: List[str] = None, decision: str = None, conference: str = None, year: int = None):
+        
+        if citations is not None:
+            citation_count = len(self.papers_by_id[paper_id].citations)
+            self.papers_by_id[paper_id].citations = list(set(self.papers_by_id[paper_id].citations + citations))
+            logger.info(f"Updated citations for paper {paper_id} ({citation_count}) -> {len(self.papers_by_id[paper_id].citations)})")
+        
+        elif decision is not None or conference is not None or year is not None:
+            
+            assert decision is not None and conference is not None and year is not None, "All of decision, conference, or year must be provided"
+            self.papers_by_id[paper_id].decision = decision
+            self.papers_by_id[paper_id].conference = conference
+            self.papers_by_id[paper_id].year = year
+            
+        else:
+            raise NotImplementedError("")
+        
+        return self.papers_by_id[paper_id]
 
     def get_papers_before_year(self, year: int) -> Tuple[List[ArchivedPaper], List[ArchivedPaper]]:
         """Get all papers accepted before a given year"""
@@ -184,10 +205,6 @@ class PaperArchive:
         """Get a specific paper by ID"""
         return self.papers_by_id.get(paper_id)
 
-    def increment_citation_count(self, paper_id: str):
-        """Increment citation count for a paper"""
-        if paper_id in self.papers_by_id:
-            self.papers_by_id[paper_id].citation_count += 1
 
     def get_papers_as_documents(self, year: Optional[int] = None) -> List[Document]:
         """

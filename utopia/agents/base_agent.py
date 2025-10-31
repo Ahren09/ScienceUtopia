@@ -54,7 +54,7 @@ class MultiAgentEcosystem:
         
     def get_agent_by_id(self, agent_id: str):
         """Get agent by ID"""
-        return self.agent_population.get(agent_id)
+        return self.agent_population[agent_id]
         
     def get_available_reviewers(self, exclude_agent_ids: List = None):
         """Get agents that can serve as reviewers"""
@@ -301,6 +301,15 @@ class SimulationAgent:
         assert isinstance(delta, (int, float)), "changes in funding level must be a valid number"
         self.resources += delta
         
+        
+    def get_memory_context(self) -> str:
+        """Get memory context for this agent"""
+        result = ""
+        for memory in self.memory_bank:
+            result += f"""- Event: {memory['type']} (Year: {memory['year']}) - Thought: {memory['thought']}
+"""
+        return result
+        
     def review_paper(self, paper: Dict) -> Dict:
         """Generate review for a paper using LLM
 
@@ -311,7 +320,7 @@ class SimulationAgent:
             Review dictionary with 'overall_score', 'strengths', 'weaknesses', 'summary'
         """
         expertise = [e.topic if hasattr(e, 'topic') else str(e) for e in getattr(self, 'expertise', [])]
-        memory_context = self._extract_review_memory_context()
+        memory_context = self.get_memory_context()
         
         # TODO: Generate topics for the papers
         
@@ -357,8 +366,18 @@ Provide a comprehensive review with:
 """
 
         review_json, message_history = self.llm.generate(prompt=prompt)
+        assert all(field in review_json for field in ['overall_score', "justification"])
+        review_json['overall_score'] = int(review_json['overall_score'])
+        review_json = {
+            'overall_score': review_json['overall_score'],
+            'justification': review_json['justification'],
+            'reviewer_id': self.id,
+            'conference_id': paper['conference'],
+            'year': paper['year'],
+            'arxiv_id': paper['id'],
+            'review_time': time.time(),
+        }
         
-        review_json['reviewer_id'] = self.id
 
         return review_json
         
@@ -381,17 +400,17 @@ Provide a comprehensive review with:
         status_string = f"(Top {percentile:.1f}% of all papers" #, average score: {avg_score:.1f} on a scale of 1-5)"
 
         # Determine emotional response based on average score
-        if percentile <= 0.1: # percentile >= 4.0:
+        if percentile <= 10: # percentile >= 4.0:
             
             thought = f"My paper received excellent reviews {status_string}! This validates my research direction and boosts my confidence."
             memory_type = 'excellent_reviews_received'
-        elif percentile <= 0.3: # percentile >= 3.0:
+        elif percentile <= 30: # percentile >= 3.0:
             thought = f"My paper received moderately good reviews {status_string}. There's room for improvement, but overall positive."
             memory_type = 'good_reviews_received'
-        elif percentile <= 0.5: # percentile >= 2.0:
+        elif percentile <= 50: # percentile >= 2.0:
             thought = f"My paper received average reviews {status_string}. I need to work harder to improve my research quality."
             memory_type = 'average_reviews_received'
-        elif percentile <= 0.7:
+        elif percentile <= 70:
             thought = f"My paper received poor reviews {status_string}. This is disappointing."
             memory_type = 'poor_reviews_received'
             
@@ -571,29 +590,6 @@ Please respond with a list of papers you want to RESUBMIT (the FULL URL) and its
             'year': year,
         })
             
-    def _extract_review_memory_context(self) -> str:
-        """Extract relevant behavioral context from memory bank"""
-        recent_memories = sorted([m for m in self.memory_bank], key=lambda x: x['timestamp'], reverse=False)
-
-        context_elements = []
-        for memory in recent_memories[-5:]:  # Last 5 relevant memories
-            mtype = memory.get('type', '')
-            if mtype == 'excellent_reviews_received':
-                context_elements.append(f"- (Year: {memory['year']}) Your recent paper received excellent reviews (percentile: {memory['percentile']:.1f}% on a scale of 1-5), making you feel confident and generous")
-            elif mtype == 'good_reviews_received':
-                context_elements.append(f"- (Year: {memory['year']}) Your recent paper received good reviews (percentile: {memory['percentile']:.1f}% on a scale of 1-5), putting you in a positive mood")
-            elif mtype == 'average_reviews_received':
-                context_elements.append(f"- (Year: {memory['year']}) Your recent paper received mixed reviews (percentile: {memory['percentile']:.1f}% on a scale of 1-5), making you more critical in your evaluations")
-            elif mtype == 'poor_reviews_received':
-                context_elements.append(f"- (Year: {memory['year']}) Your recent paper received poor reviews (percentile: {memory['percentile']:.1f}% on a scale of 1-5), making you frustrated and potentially harsher on others")
-            elif mtype == 'toxic_review_received':
-                context_elements.append(f"- (Year: {memory['year']}) You've received harsh reviews recently (percentile: {memory['percentile']:.1f}% on a scale of 1-5), making you more critical of others")
-            elif mtype == 'retaliatory_bias':
-                context_elements.append(f"- (Year: {memory['year']}) You tend to give stricter reviews after negative experiences.")
-            elif mtype == 'positive_collaboration':
-                context_elements.append(f"- (Year: {memory['year']}) Recent positive interactions make you more constructive.")
-
-        return "\n".join(context_elements) if context_elements else ""
         
     def _get_personality_prompt(self) -> str:
         """Get personality prompt for this agent - override in subclasses"""
@@ -680,7 +676,7 @@ Please respond with a paper ID you want to submit (the FULL URL) and its confere
 ```json
 {
     "id": 1,
-    "arxiv_id": "http://arxiv.org/abs/2407.00005v1",
+    "arxiv_id": "https://arxiv.org/abs/2407.00005v1", <- MUST be the full URL, including the "https://" prefix
     "conference": "NeurIPS"  <- MUST be one of the candidate conferences listed above
 }
 ```
@@ -732,7 +728,11 @@ Abstract: {cited_paper['content'][:300]}...
 ## Sample Response
 ```json
 {
-    "citations": [1, 3, 7] <- the indices of the candidate papers you want to cite
+    "citations": [ FULL URL of the candidate papers you want to cite, including the "https://" prefix
+        "https://arxiv.org/abs/2407.00005v1",
+        "https://arxiv.org/abs/2407.00006v1",
+        "https://arxiv.org/abs/2407.00007v1"
+    ]
 }
 ```
 """
@@ -741,25 +741,4 @@ Abstract: {cited_paper['content'][:300]}...
 
 
 
-    def _extract_research_memory_context(self) -> str:
-        """Extract relevant research context from memory bank for direction selection"""
-        if not hasattr(self, 'memory_bank') or not self.memory_bank:
-            return ""
-
-        recent_memories = [m for m in self.memory_bank
-                          if time.time() - m.get('timestamp', 0) < 86400 * 365]  # Last year
-
-        context_elements = []
-        for memory in recent_memories[-5:]:  # Last 5 relevant memories
-            mtype = memory.get('type', '')
-            if mtype == 'excellent_reviews_received':
-                context_elements.append(f"- Your recent paper received excellent reviews (avg: {memory['percentile']:.2f}), validating your research direction")
-            elif mtype == 'good_reviews_received':
-                context_elements.append(f"- Your recent paper received positive reviews (avg: {memory['percentile']:.2f})")
-            elif mtype == 'average_reviews_received':
-                context_elements.append(f"- Your recent paper received mixed reviews (avg: {memory['percentile']:.2f}), suggesting room for improvement")
-            elif mtype == 'poor_reviews_received':
-                context_elements.append(f"- Your recent paper received poor reviews (avg: {memory['percentile']:.2f}), indicating possible need to pivot or strengthen foundation")
-
-        return "\n".join(context_elements) if context_elements else ""
-
+    

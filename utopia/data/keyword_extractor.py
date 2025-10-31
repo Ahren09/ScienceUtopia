@@ -8,7 +8,9 @@ using various LLM models (GPT).
 import os
 import sys
 from typing import List, Optional
-
+import json
+from datasets import load_dataset
+from tqdm import trange, tqdm
 # Add parent directory to path to import models
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -34,124 +36,93 @@ class KeywordExtractor:
 
         Args:
             abstract: The research paper abstract text
-            num_keywords: Number of keywords to extract (default: 10)
+            num_keywords: Number of keywords to extract
 
         Returns:
             List of extracted keywords
         """
-        prompt = self._create_prompt(abstract, num_keywords)
+        
+        sample_response = """
+```json
+{
+    "keywords_in_abstract": ["Deep Learning", "Sentiment Analysis", "Convolutional Neural Networks", ...],  <- A list of keywords that are contained in the abstract, sorted by relevance to the abstract
+    "keywords_not_in_abstract": ["Natural Language Processing", "Large Language Models", "Keyword Extraction", ...] <- A list of keywords that are NOT contained in the abstract, sorted by relevance to the abstract
+}
+```
+"""
+        
+        prompt = f"""Given an abstract of a research paper, extract exactly {num_keywords} terminologies that best represent the technical terms, methods, and concepts in the paper.
 
-        response = self.model.generate(
+Instructions:
+- Extract both terminologies that are contained in the abstract (`keywords_in_abstract`) and keywords that are NOT contained in the abstract (`keywords_not_in_abstract`).
+- Write the keywords in title case (capitalize the first letter of each word),
+- Extract at most {num_keywords} keywords or short keyphrases (1-5 words each), You can extract fewer than {num_keywords} keywords if the abstract is short.
+- Keywords should be sorted by relevance (from most relevant to least relevant) to the abstract.
+- Do not include explanations, numbering, or any other text
+- Keywords like "NP-hard Problems" is allowed, but "Problems" alone is not allowed.
+
+## Sample Input
+This paper presents a novel deep learning approach for sentiment analysis of social media text. We propose a transformer-based architecture that combines convolutional neural networks with attention mechanisms to capture both local and global contextual information. Our model achieves state-of-the-art performance on three benchmark datasets, outperforming previous methods by 5-7% in accuracy. We also introduce a new dataset of Twitter posts with fine-grained emotion labels. Extensive experiments demonstrate the effectiveness of our approach across multiple languages and domains.
+
+## Sample Response
+{sample_response}
+
+## Abstract to extract keywords from
+
+{abstract}
+"""
+        
+        response, _ = self.model.generate(
             prompt=prompt,
             temperature=0.3,
-            system_prompt="You are an expert at analyzing academic papers and extracting relevant keywords."
+            system_prompt="You are an expert at analyzing academic papers and extracting relevant keywords.",
+            response_format="json_object"
         )
+        
+        assert 'keywords_in_abstract' in response and 'keywords_not_in_abstract' in response, "Failed to generate keywords from the model"
+        
 
         if response is None:
             raise ValueError("Failed to generate keywords from the model")
 
-        # Parse the response to extract keywords
-        keywords = self._parse_keywords(response)
-
-        return keywords[:num_keywords]  # Ensure we return exactly the requested number
-
-    def _create_prompt(self, abstract: str, num_keywords: int) -> str:
-        """
-        Create the prompt for keyword extraction.
-
-        Args:
-            abstract: The research paper abstract
-            num_keywords: Number of keywords to extract
-
-        Returns:
-            Formatted prompt string
-        """
-        prompt = f"""Given the following research paper abstract, extract exactly {num_keywords} keywords that best represent the main topics, methods, and concepts in the paper.
-
-Abstract:
-{abstract}
-
-Instructions:
-- Extract exactly {num_keywords} keywords or short keyphrases (1-3 words each)
-- Focus on technical terms, methods, domains, and key concepts
-- Keywords should be relevant to the research field and methodology
-- Return ONLY the keywords separated by commas, nothing else
-- Do not include explanations, numbering, or any other text
-
-Keywords:"""
-
-        return prompt
-
-    def _parse_keywords(self, response: str) -> List[str]:
-        """
-        Parse the LLM response to extract clean keywords.
-
-        Args:
-            response: Raw response from the LLM
-
-        Returns:
-            List of cleaned keywords
-        """
-        # Remove common prefixes/suffixes
-        response = response.strip()
-
-        # Split by comma and clean each keyword
-        keywords = [kw.strip() for kw in response.split(',')]
-
-        # Remove empty strings and filter out any non-keyword text
-        keywords = [kw for kw in keywords if kw and len(kw) > 0]
-
-        return keywords
-
-
-def extract_keywords_from_abstract(
-    abstract: str,
-    llm,
-    num_keywords: int = 10
-) -> List[str]:
-    """
-    Convenience function to extract keywords from an abstract.
-
-    Args:
-        abstract: The research paper abstract text
-        model_type: Type of model to use ('gpt' or 'gemini')
-        model_name: Specific model name (optional)
-        num_keywords: Number of keywords to extract (default: 10)
-
-    Returns:
-        List of extracted keywords
-
-    Example:
-        >>> abstract = "This paper presents a novel approach to..."
-        >>> keywords = extract_keywords_from_abstract(abstract, model_type="gpt")
-        >>> print(keywords)
-        ['machine learning', 'neural networks', 'deep learning', ...]
-    """
-    extractor = KeywordExtractor(llm)
-    return extractor.extract_keywords(abstract, num_keywords=num_keywords)
-
+        return response
 
 if __name__ == "__main__":
-    # Example usage
-    sample_abstract = """
-    This paper presents a novel deep learning approach for sentiment analysis
-    of social media text. We propose a transformer-based architecture that
-    combines convolutional neural networks with attention mechanisms to capture
-    both local and global contextual information. Our model achieves state-of-the-art
-    performance on three benchmark datasets, outperforming previous methods by 5-7%
-    in accuracy. We also introduce a new dataset of Twitter posts with fine-grained
-    emotion labels. Extensive experiments demonstrate the effectiveness of our
-    approach across multiple languages and domains.
-    """
-
-    print("Extracting keywords from sample abstract...\n")
-    print(f"Abstract: {sample_abstract.strip()}\n")
-
+    
     llm = GPT(model_name="gpt-4o")
-    print("Using GPT model:")
-    keywords = extract_keywords_from_abstract(
-        abstract=sample_abstract,
-        llm=llm,
-        num_keywords=10
-    )
-    print(f"Keywords: {', '.join(keywords)}\n")
+    
+    extractor = KeywordExtractor(llm)
+    
+    dataset = load_dataset("Ahren09/SciEvo", "arxiv", split="train")
+    
+    all_results = {}
+    
+    output_file = "outputs/keywords/keywords_scievo.json"
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    
+    if os.path.exists(output_file):
+        all_results = json.load(open(output_file))
+    
+    num_generated = 0
+    for i in trange(len(dataset) - 1, 0, -1, desc="Extracting keywords"):
+        item = dataset[i]
+        paper_id = item["id"]
+        if paper_id in all_results:
+            continue
+        else:
+            abstract = item["summary"]
+            keywords = extractor.extract_keywords(abstract, num_keywords=10)
+            all_results[paper_id] = {
+                "id": paper_id,
+                "keywords_in_abstract": keywords["keywords_in_abstract"],
+                "keywords_not_in_abstract": keywords["keywords_not_in_abstract"],
+            }
+            
+            num_generated += 1
+            if num_generated % 100 == 0:
+                json.dump(all_results, open(output_file, "w"), indent=2)
+            
+        
+        
+    
+

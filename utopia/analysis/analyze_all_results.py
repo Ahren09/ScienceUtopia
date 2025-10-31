@@ -12,21 +12,6 @@ from utopia.metrics.tracker import calculate_citation_metrics
 logger = logging.getLogger(__name__)
 
 
-def load_checkpoint(output_dir: str, year: Optional[int] = None) -> Dict[str, Any]:
-    """Load simulation checkpoint data"""
-    path = Path(output_dir)
-    if year is None:
-        checkpoints = list(path.glob("checkpoint_year_*.json"))
-        year = max(int(cp.stem.split('_')[-1]) for cp in checkpoints) if checkpoints else None
-
-    if year is None:
-        logger.error("No checkpoints found")
-        return {}
-
-    with open(path / f"checkpoint_year_{year}.json", 'r') as f:
-        return json.load(f)
-
-
 def analyze_citations(data: Dict[str, Any]) -> Dict[str, Any]:
     """Analyze citation metrics"""
     papers_by_year = defaultdict(list)
@@ -57,8 +42,8 @@ def analyze_papers(data: Dict[str, Any]) -> Dict[str, Any]:
     papers_list = data['paper_archive']['papers']
 
     return {
-        'total_submitted': sum(r['phases']['paper_submission']['num_papers_submitted'] for r in yearly_results),
-        'total_accepted': sum(r['phases']['decisions']['total_accepted'] for r in yearly_results),
+        'total_submitted': sum(r['paper_submission']['num_papers_submitted'] for r in yearly_results),
+        'total_accepted': sum(r['decisions']['total_accepted'] for r in yearly_results),
         'total_papers': len(papers_list),
         'acceptance_rate': sum(1 for p in papers_list if p['decision'] == 'accept') / len(papers_list) if papers_list else 0
     }
@@ -69,11 +54,11 @@ def analyze_scores(data: Dict[str, Any]) -> list[Dict[str, Any]]:
     return [
         {
             'year': r['year'],
-            'mean': r['phases']['peer_review']['score_metrics']['overall_mean'],
-            'std': r['phases']['peer_review']['score_metrics']['overall_std']
+            'mean': r['peer_review']['score_metrics']['overall_mean'],
+            'std': r['peer_review']['score_metrics']['overall_std']
         }
         for r in data['yearly_results']
-        if 'peer_review' in r['phases'] and 'score_metrics' in r['phases']['peer_review']
+        if 'peer_review' in r and 'score_metrics' in r['peer_review']
     ]
 
 
@@ -123,7 +108,7 @@ class SimulationAnalyzer:
         self.data = {
             'yearly_results': sim.yearly_results,
             'paper_archive': sim.paper_archive.to_dict(),
-            'citations': sim.citations,
+            'citations': sim.citation_tracker.citations,
             'ecosystem_data': sim.ecosystem.to_dict(),
             'industry_funding_system': {'funding_mode': sim.industry_funding_mode}
         }

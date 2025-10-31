@@ -14,7 +14,10 @@ import asyncio
 import json
 import matplotlib.pyplot as plt
 import numpy as np
+import os
 import re
+import datetime
+import pickle
 import pacmap
 import torch
 import torch.nn.functional as F
@@ -29,7 +32,7 @@ from sentence_transformers import SentenceTransformer
 # Scientific computing
 from sklearn.preprocessing import normalize
 from time import time
-from tqdm import trange
+from tqdm import trange, tqdm
 from typing import List, Dict, Tuple, Optional
 
 from utopia.utils.data_utils import read_json
@@ -43,7 +46,7 @@ class RAGConfig:
     batch_size: int = 64
     chunk_size: int = 512
     embedding_model: str = "thenlper/gte-small"  # 384-dimensional embeddings
-    num_retrieved_docs: int = 50
+    num_retrieved_docs: int = 1000
     num_docs_final: int = 5
     normalize_embeddings: bool = True
     use_langchain: bool = False
@@ -83,19 +86,32 @@ class RAG:
         
     def load_documents(self, data_path: str = None) -> List[Document]:
         """Load documents from JSON file"""
+        
+        def _normalize_whitespace(text: str) -> str:
+            return re.sub(r'\s+', ' ', (text or '').replace('\n', ' ')).strip()
+
+        def _as_datetime(ts):
+            """Ensure 'published' is a datetime-like object (prefer pd.Timestamp)."""
+            if ts is None or ts == '':
+                return pd.NaT
+            if isinstance(ts, (pd.Timestamp, datetime.datetime)):
+                return pd.Timestamp(ts)
+            
+            return pd.to_datetime(ts)
+        
+        self.id2docs = {}
         if self.debug:
             dataset = read_json("data/additional_data_2024_7.json")
             for item in dataset[:128]:
 
-                
                 title = re.sub(r'\s+', ' ', item.get('title', '').replace('\n', ' ')).strip()
                 abstract = re.sub(r'\s+', ' ', item.get('summary', '').replace('\n', ' ')).strip()
                 
                 metadata = {
                     'id': item.get('id', ''),
                     'title': title,
-                    'tags': ', '.join(item.get('tags', [])),
-                    'published': item.get('published', ''),
+                    # 'tags': ', '.join(item.get('tags', [])),
+                    'published': _as_datetime(item.get('published', '')),
                 }
 
                 # Create document with summary as content
@@ -107,11 +123,49 @@ class RAG:
 
             docs = list(self.id2docs.values())
             self.documents = docs
-            self.document_status = pd.DataFrame(columns=['id', 'status'], data=[{'id': doc.metadata['id'], 'status': 'unsubmitted'} for doc in docs])
+            
 
         else:
-            dataset = load_dataset("Ahren09/SciEvo", "arxiv", split="train")
-            self.documents = dataset
+            cache_path = "outputs/cache_scievo.pkl"
+            if os.path.exists(cache_path):
+                with open(cache_path, 'rb') as f:
+                    cache_data = pickle.load(f)
+                self.documents = cache_data['documents']
+                
+                
+            else:
+                dataset = load_dataset("Ahren09/SciEvo", "arxiv", split="train")
+                
+                self.id2docs = {}
+                
+                for item in tqdm(dataset.select(range(len(dataset) - 20_000, len(dataset))), desc="Processing dataset"):
+                    title = _normalize_whitespace(item.get('title', ''))
+                    abstract = _normalize_whitespace(item.get('summary', ''))
+
+                    # tags_list = _as_tag_list(item)
+                    published = _as_datetime(item.get('published', ''))
+
+                    metadata = {
+                        'id': item.get('id', '').replace('http://', 'https://'),
+                        'title': title,
+                        # 'tags': ', '.join(tags_list),
+                        'published': published,
+                    }
+
+                    doc = Document(page_content=abstract, metadata=metadata)
+                    
+                    self.id2docs[metadata['id']] = doc
+
+                docs = list(self.id2docs.values())
+                self.documents = docs
+                cache_data = {
+                    'documents': self.documents,
+                }
+                with open(cache_path, 'wb') as f:
+                    pickle.dump(cache_data, f)
+            
+            self.id2docs = {doc.metadata['id']: doc for doc in self.documents}
+            self.document_status = pd.DataFrame(columns=['id', 'status'], data=[{'id': doc.metadata['id'], 'status': 'unsubmitted'} for doc in self.documents])
             
         
     def mark_papers_as_submitted(self, paper_ids: List[str]):
@@ -233,17 +287,21 @@ class RAG:
         Returns:
             Dictionary with 'topk_indices' and 'similarity_scores'
         """
+        
+        assert retrieval_type in ["submission", "accepted_papers", "accepted_or_rejected_papers"], "Invalid retrieval_type"
+        
         # Select the appropriate index
         if retrieval_type == "submission":
             indices = (self.document_status[self.document_status['status'] == "unsubmitted"]).index.values
             assert len(indices) > 0, "No candidate papers found!"
             
             print(f"[SUBMISSION INDEX] Retrieving papers for {len(queries)} queries from {len(indices)} papers ...")
-        elif retrieval_type == "citation":
-            if cite_only_accepted_papers:
+            
+        elif retrieval_type in ["accepted_papers", "accepted_or_rejected_papers"]:
+            if retrieval_type == "accepted_papers":
                 indices = (self.document_status[self.document_status['status'] == "accepted"]).index.values
             else:
-                indices = (self.document_status[(self.document_status['status'] == "accepted") | (self.document_status['status'] == "rejected")]).index.values
+                indices = (self.document_status[(self.document_status['status'].isin({"accepted", "rejected"}))]).index.values
             assert len(indices) > 0, "No candidate papers found!"
             print(f"\n[CITATION INDEX] Batch retrieving for {len(queries)} queries...")
             
@@ -482,7 +540,7 @@ class RAG:
         """Mark papers as submitted"""
         self.document_status.loc[self.document_status['id'].isin(accepted_paper_ids), 'status'] = 'accepted'
         self.document_status.loc[self.document_status['id'].isin(rejected_paper_ids), 'status'] = 'rejected'
-        
+        assert len(self.document_status.loc[self.document_status['status'] == 'submitted']) == 0, "Some papers still require a decision!"
 
     def to_dict(self) -> Dict:
         """Serialize RAG state (document status only, embeddings rebuilt on load)"""

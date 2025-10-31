@@ -42,11 +42,11 @@ from utopia.agents.funding_agents import (
     FundingAgency,
     FundingProgram,
     IndustryFundingSystem
-    
+
 )
-from utopia.agents.citation import Citation
 from utopia.data.rag import RAG, RAGConfig
 from utopia.data.paper_archive import PaperArchive
+from utopia.data.citation_tracker import CitationTracker
 from utopia.models.models import GPT, LLM
 from utopia.utils.citation_extractor import extract_citations_from_content
 
@@ -54,7 +54,7 @@ from utopia.utils.generail_utils import project_setup
 from utopia.config import SIMULATION_CONFIG
 from utopia.metrics.tracker import calculate_gini_coefficient, calculate_citation_metrics, calculate_conference_score_metrics
 from utopia.analysis.analyze_all_results import SimulationAnalyzer
-
+from utopia.arguments import parse_arguments
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
@@ -87,12 +87,13 @@ class Simulation:
         self.llm: LLM = llm
         self.num_years = num_years
         self.output_dir = output_dir
-        self.current_year = 0
+        self.current_year = 1
         self.debug = kwargs.get('debug', False)
-        self.citations: Dict[str, Set[Citation]] = {} # arxiv_id of paper A -> list of arxiv_ids of papers citing paper A
+        self.citation_tracker = CitationTracker()
         self.industry_funding_mode = kwargs.get('industry_funding_mode', 'performance')
         self.always_rerun = kwargs.get('always_rerun', False)
         self.use_langchain = kwargs.get('use_langchain', False)
+        self.max_retries = kwargs.get('max_retries', 5)
         # Create output directory
         
 
@@ -103,7 +104,6 @@ class Simulation:
         self.conference_system: ConferenceSystem = None
         self.industry_funding_system = IndustryFundingSystem(base_budget=SIMULATION_CONFIG['funding']['industry_base_budget'])
         self.yearly_results: List[Dict] = []
-        self.all_papers_history: List[Dict] = []  # Track all papers for hot topic analysis
         self.paper_archive = PaperArchive(output_dir=output_dir)  # Archive for accepted papers
         self.submitted_paper_ids: Set[str] = set()  # Track all submitted papers across years
         
@@ -117,18 +117,6 @@ class Simulation:
         
         
 
-    def get_citations_for_paper(self, arxiv_id: str) -> Set[Citation]:
-        """Get citations for a paper"""
-        return self.citations.get(arxiv_id, set())
-    
-    def update_citations_for_paper(self, arxiv_id: str, citations: Union[Set[Citation], List[Citation], Citation]):
-        """Update citations for a paper"""
-        if isinstance(citations, Citation):
-            citations = {citations}
-        elif isinstance(citations, list):
-            citations = set(citations)
-        self.citations[arxiv_id].update(citations)
-        
 
     def initialize_agents(self):
         """Initialize the agent population
@@ -138,15 +126,40 @@ class Simulation:
         logger.info("Initializing agent population...")
 
         # Create multiple university researchers mapped to same universities
-        universities = ["MIT", "Stanford", "Berkeley", "CMU", "GeorgiaTech"]
-        universities = universities[:2]
-        print(f"TODO: select {len(universities)} universities ONLY")
+        universities = [
+            # Top US Universities
+            "MIT", "Stanford", "Berkeley", "CMU", "GeorgiaTech",
+            "Harvard", "Princeton", "Cornell", "Yale", "Caltech",
+            "UCLA", "UCSD", "UW", "UIUC", "UT Austin",
+            "UMich", "Columbia", "NYU", "USC", "Northwestern",
+            "UPenn", "Duke", "Johns Hopkins", "Brown", "Dartmouth",
+            "UChicago", "Rice", "Vanderbilt", "Notre Dame", "Emory",
+            "UNC Chapel Hill", "UVA", "UCSB", "UCI", "UC Davis",
+            "Purdue", "Penn State", "OSU", "Wisconsin", "Maryland",
+            # European Universities
+            "Oxford", "Cambridge", "Imperial College", "UCL", "Edinburgh",
+            "ETH Zurich", "EPFL", "TU Munich", "KU Leuven", "Heidelberg",
+            # Asian Universities
+            "Tsinghua", "Peking University", "NUS", "NTU", "HKUST",
+            "Tokyo", "Kyoto", "KAIST", "SNU", "IIT Bombay",
+            # Others
+            "Toronto", "UBC", "McGill", "Melbourne", "ANU"
+        ]
+        if self.debug:
+            universities = universities[:2]
+            num_researchers = 2
+        else:
+            universities = universities[:5]
+            num_researchers = 3
+
+        logger.info(f"Selecting {len(universities)} universities")
 
         counter = 0
         for university in universities:
             # Create 2-3 researchers per university]
             researcher_names = []
-            for i in range(2):
+            
+            for i in range(num_researchers):
                 
                 expertise = [AVAILABLE_DIRECTIONS[0]] if self.debug else random.sample(AVAILABLE_DIRECTIONS, 3)
                 researcher_name = f"university_researcher_{counter}"
@@ -172,15 +185,45 @@ class Simulation:
         
 
         # Create multiple industry researchers mapped to same companies
-        companies = ["Google", "Meta", "OpenAI", "Microsoft", "Amazon", "IBM", "Apple", "Tesla"]
-        companies = companies[:2]
-        print(f"TODO: select {len(companies)} companies ONLY")
+        companies = [
+            # Major Tech Giants
+            "Google", "Meta", "Microsoft", "Amazon", "Apple",
+            "IBM", "Oracle", "Salesforce", "SAP", "Cisco",
+            # AI Companies & Labs
+            "OpenAI", "DeepMind", "Anthropic", "Cohere", "Stability AI",
+            "Hugging Face", "Mistral AI", "Inflection AI", "Adept AI", "Character.AI",
+            # Hardware & Semiconductors
+            "Nvidia", "Intel", "AMD", "Qualcomm", "Broadcom",
+            "TSMC", "Samsung Electronics", "SK Hynix", "Micron", "ARM",
+            # Software & Cloud
+            "Adobe", "Autodesk", "ServiceNow", "Workday", "Snowflake",
+            "Databricks", "MongoDB", "Atlassian", "VMware", "Red Hat",
+            # Research Labs & Institutes
+            "Allen Institute", "FAIR", "Google Research", "MSR", "Sony AI",
+            "NVIDIA Research", "IBM Research", "Bosch Research", "Toyota Research", "Samsung Research",
+            # Chinese Tech Companies
+            "Tencent", "Alibaba", "Baidu", "ByteDance", "Huawei",
+            "JD.com", "Xiaomi", "Meituan", "DiDi", "SenseTime",
+            # Others
+            "Tesla", "Uber", "Lyft", "Spotify", "Netflix",
+            "Shopify", "Square", "Stripe", "Airbnb", "DoorDash"
+        ]
+        if self.debug:
+            companies = companies[:2]
+            print(f"TODO: select {len(companies)} companies ONLY")
+            num_researchers = 2
+            
+        else:
+            companies = companies[:5]
+            num_researchers = 3
 
         counter = 0
         for company in companies:
             # Create 2-3 researchers per company
             researcher_names = []
-            for i in range(2):
+            
+            
+            for i in range(num_researchers):
                 expertise = random.sample(AVAILABLE_DIRECTIONS, 3) if self.debug else [AVAILABLE_DIRECTIONS[0]]
                 researcher = IndustryResearcher(
                     researcher_name=f"industry_researcher_{counter}",
@@ -253,6 +296,9 @@ class Simulation:
         logger.info(f"\n{'=' * 60}")
         logger.info(f"YEAR {year}")
         logger.info(f"{'=' * 60}\n")
+        
+        # Reset conferences for the new year of simulation
+        self.conference_system.reset_all_for_new_year(year)
 
         # Determine assignment mode based on year
         research_direction_selection_mode = "batch" if year == 1 else "individual"
@@ -379,6 +425,10 @@ class Simulation:
             candidate_paper_indices = topk_indices[agent_idx]
             # Use submission_documents since we retrieved from submission index
             candidate_papers = [self.rag.documents[idx] for idx in candidate_paper_indices if self.rag.document_status.loc[idx, 'status'] == 'unsubmitted']
+            
+            
+            assert len(candidate_papers) > 0, f"No candidate papers found for agent {agent.id}"
+            
             prompt, response_format = agent.get_paper_submission_prompt(
                 candidate_papers=candidate_papers,
                 year=year,
@@ -386,19 +436,33 @@ class Simulation:
                 paper_archive=self.paper_archive
             )
             
-            
-            for _ in range(3):
+            num_retries = 0
+            while True:
                 
                 try:
                     submission_metadata, message_history = self.llm.generate(prompt=prompt, response_format=response_format)
                     arxiv_id = submission_metadata['arxiv_id']
                     assert arxiv_id in [p.metadata['id'] for p in candidate_papers]
-                    assert submission_metadata['conference'] in self.conference_system.conference_map
+                    assert submission_metadata['conference'] in self.conference_system.conference_map, f"Generated invalid conference name: {submission_metadata['conference']}"
+                    break
+                
+                except AssertionError as e:
+                    if "Generated invalid conference name" in str(e):
+                        pass
+                    else:
+                        traceback.print_exc()
                     
+                    num_retries += 1
+                    if num_retries >= self.max_retries:
+                        raise Exception("Failed to submit paper after 3 retries")
+                
+
                 except Exception as e:
                     logger.warning(f"Error submitting paper: {e}")
                     traceback.print_exc()
-            
+                    num_retries += 1
+                    if num_retries >= self.max_retries:
+                        raise Exception("Failed to submit paper after 3 retries")
 
             
             paper_doc = self.rag.id2docs[arxiv_id]
@@ -428,23 +492,24 @@ class Simulation:
             for submitted_paper in resubmissions_list + submissions_list:
                 retrieval_prompts.append(f"{submitted_paper['title']} \n{submitted_paper['content']}")
                 
-            retrieval_results = self.rag.batch_retrieve(
+            # First we try to cite accepted papers. If no proper ones, we add rejected papers.
+            topk_indices_citation_accepted = self.rag.batch_retrieve(
                 retrieval_prompts,
-                retrieval_type="citation"
-            )
+                retrieval_type="accepted_papers"
+            )['topk_indices']
             
-            topk_indices_citation = retrieval_results['topk_indices']
+            topk_indices_citation_both = self.rag.batch_retrieve(
+                retrieval_prompts,
+                retrieval_type="accepted_or_rejected_papers"
+            )['topk_indices']
+            
             
             accepted_papers_arxiv_ids = set(self.rag.document_status[self.rag.document_status['status'] == "accepted"].id.values.tolist())
             
             for i in range(len(submissions_list)):
                 submitted_paper = submissions_list[i]
-                candidate_citation_indices = topk_indices_citation[i]
                 
-                candidate_papers = [self.rag.documents[idx] for idx in candidate_citation_indices[:30]]
-                
-                
-                
+                candidate_papers = [self.rag.documents[idx] for idx in topk_indices_citation_accepted[i][:SIMULATION_CONFIG['citation']['num_candidate_papers']]]
                 
                 candidate_papers = [{'id': paper.metadata['id'], 'title': paper.metadata['title'], 'content': paper.page_content} for paper in candidate_papers]
                 
@@ -455,11 +520,67 @@ class Simulation:
                     candidate_papers=candidate_papers,
                     max_papers=10
                 )
-                llm_response, message_history = self.llm.generate(prompt=prompt, message_history=message_history_dict[agent.id])
                 
-                assert llm_response.get('citations') is not None
+                num_retries = 0
                 
-                submissions_list[i]['citations'] = [candidate_papers[int(idx)]['id'] for idx in llm_response['citations']]
+                while True:
+                    try:
+                        llm_response, message_history = self.llm.generate(prompt=prompt, message_history=message_history_dict[agent.id])
+                        
+                        assert llm_response.get('citations') is not None
+                        citations_of_paper = llm_response.get('citations')
+                        
+                        assert set(citations_of_paper) <= set([candidate_paper['id'] for candidate_paper in candidate_papers])
+                        
+                        break
+                    
+                    except Exception as e:
+                        logger.warning(f"Error getting potential cited papers: {e}")
+                        traceback.print_exc()
+                        num_retries += 1
+                        if num_retries >= self.max_retries:
+                            raise Exception("Failed to get potential cited papers after 3 retries")
+                
+                
+                # Too few citations, we try to cite rejected papers.
+                if len(citations_of_paper) <= SIMULATION_CONFIG['citation']['expected_citation_per_round']:
+                    
+                    # Get candidates from all papers, including rejected papers.
+                    candidate_papers = [self.rag.documents[idx] for idx in topk_indices_citation_both[i][:SIMULATION_CONFIG['citation']['num_candidate_papers']]]
+                    
+                    candidate_papers = [{'id': paper.metadata['id'], 'title': paper.metadata['title'], 'content': paper.page_content} for paper in candidate_papers]
+                    
+                    prompt = agent.get_potential_cited_papers_prompt(
+                        paper=submitted_paper,
+                        candidate_papers=candidate_papers,
+                        max_papers=10
+                    )
+                    
+                    num_retries = 0
+                    
+                    while True:
+                        try:
+                            
+                            llm_response, message_history = self.llm.generate(prompt=prompt, message_history=message_history_dict[agent.id])
+                            assert llm_response.get('citations') is not None
+                            citations_of_paper = llm_response.get('citations')
+                            assert set(citations_of_paper) <= set([candidate_paper['id'] for candidate_paper in candidate_papers])
+                            break
+                        
+                        except Exception as e:
+                            logger.warning(f"Error getting potential cited papers: {e}")
+                            traceback.print_exc()
+                            num_retries += 1
+                            if num_retries >= self.max_retries:
+                                raise Exception("Failed to get potential cited papers after 3 retries")
+                    
+                    
+                    
+                    
+                
+                
+                self.citation_tracker.add_citations(submitted_paper['id'], citations_of_paper, year)
+                
         
 
         del message_history_dict
@@ -471,7 +592,7 @@ class Simulation:
             if paper_dict['author_id'] not in submitted_papers:
                 submitted_papers[paper_dict['author_id']] = []
             
-            if conf.submit_paper(paper_dict):
+            if conf.submit_paper(paper_dict, year=year):
                 submitted_papers[paper_dict['author_id']].append(paper_dict)
                 self.submitted_paper_ids.add(paper_dict['id'])
             
@@ -495,7 +616,7 @@ class Simulation:
             average_scores[conference.conference_id] = {}
             reviews_by_conference[conference.conference_id] = {}
 
-            for paper in conference.submitted_papers:
+            for paper in tqdm(conference.submitted_papers, desc=f"{conference.conference_id}"):
                 # Assign reviewers (excluding paper author)
                 author = self.ecosystem.get_agent_by_id(paper['author_id'])
                 reviewers = self.ecosystem.get_available_reviewers(
@@ -513,22 +634,26 @@ class Simulation:
                             review = reviewer.review_paper(paper)
                             conference.add_review(paper['id'], review)
                             reviews_by_reviewer[reviewer.id].append(review['overall_score'])
+                            
                             break
                         
                         except json.decoder.JSONDecodeError as e:
                             logger.warning(f"Error reviewing paper: {e}")
-                            traceback.print_exc()
+                            
+                            if not "Unterminated string" in str(e):
+                                traceback.print_exc()
+                            
                             num_retries += 1
-                            if num_retries > 3:
-                                break
+                            if num_retries >= self.max_retries:
+                                raise Exception("Failed to review paper after 3 retries")
                             time.sleep(1)
                         
                         except Exception as e:
                             logger.warning(f"Error reviewing paper: {e}")
                             traceback.print_exc()
                             num_retries += 1
-                            if num_retries > 3:
-                                break
+                            if num_retries >= self.max_retries:
+                                raise Exception("Failed to review paper after 3 retries")
                             time.sleep(1)
 
                 paper_reviews = conference.reviews[paper['id']]
@@ -565,40 +690,25 @@ class Simulation:
 
         # Phase 4: Make acceptance decisions
         logger.info(f"Year {year} Phase 4: Making acceptance decisions...")
-        decisions = {}
-        authors_to_accepted_papers = {}
-        authors_to_rejected_papers = {}
-        for conf in self.conference_system.conferences:
-            decision_one_conf = conf.make_acceptance_decisions()
-            decisions[conf.conference_id] = decision_one_conf
-            for paper in decision_one_conf['accept']:
-                if paper['author_id'] not in authors_to_accepted_papers:
-                    authors_to_accepted_papers[paper['author_id']] = []
-                authors_to_accepted_papers[paper['author_id']].append(paper)
-            for paper in decision_one_conf['reject']:
-                if paper['author_id'] not in authors_to_rejected_papers:
-                    authors_to_rejected_papers[paper['author_id']] = []
-                authors_to_rejected_papers[paper['author_id']].append(paper)
+        
+        
+        self.conference_system.make_all_decisions()
 
-        total_accepted = sum(len(d['accept']) for d in decisions.values())
-        total_rejected = sum(len(d['reject']) for d in decisions.values())
+        total_accepted = sum(len(conf.decisions['accept']) for conf in self.conference_system.conferences)
+        total_rejected = sum(len(conf.decisions['reject']) for conf in self.conference_system.conferences)
 
         # Track accepted papers for hot topic analysis and archive them
         accepted_paper_ids, rejected_paper_ids = [], []
-        for conf_decisions in decisions.values():
-            for decision in ['accept', 'reject']:
-                for paper in conf_decisions[decision]:
-                    self.all_papers_history.append({
-                        'id': paper['id'],
-                        'year': year,
-                        'keywords': paper.get('topics', [])
-                    })
-                    
-                    if decision == 'accept':
-                        accepted_paper_ids.append(paper['id'])
-                    else:
-                        rejected_paper_ids.append(paper['id'])
-                    self.paper_archive.add_paper(paper, year, decision)
+        for conf in self.conference_system.conferences:
+
+            for paper in conf.decisions['accept']:
+                accepted_paper_ids.append(paper['id'])
+                self.paper_archive.add_or_update_paper(paper)
+            for paper in conf.decisions['reject']:
+                rejected_paper_ids.append(paper['id'])
+                self.paper_archive.add_or_update_paper(paper)
+                
+            # self.paper_archive.update_paper(submitted_paper['id'], citations=citations_of_paper)
                     
         self.rag.mark_papers_as_submitted(accepted_paper_ids, rejected_paper_ids)
         # Save paper archive to disk
@@ -606,14 +716,8 @@ class Simulation:
         year_results['decisions'] = {
             'total_accepted': total_accepted,
             'total_rejected': total_rejected,
-            'conference_decisions': decisions
+            
         }
-        
-        
-        # for author_id in year_results['paper_submission']:
-        #     papers_of_author = year_results['paper_submission']['papers'][author_id]
-        #     for paper in papers_of_author:
-        #         paper_archive.add_paper(paper, year, 'accept')
 
         logger.info(f"  Accepted: {total_accepted}, Rejected: {total_rejected}")
 
@@ -622,7 +726,7 @@ class Simulation:
         funding_updates = {}
 
         # Update hot topics from recent papers
-        self.industry_funding_system.update_hot_topics(self.all_papers_history, year)
+        # self.industry_funding_system.update_hot_topics(self.all_papers_history, year)
 
         
 
@@ -630,17 +734,19 @@ class Simulation:
         university_applications = []
         
         # Update funding for industry researchers. Ask university researchers to apply for funding.
-        for agent in self.ecosystem.get_available_authors():
+        for agent in tqdm(self.ecosystem.get_available_authors(), desc="Updating funding"):
             if isinstance(agent, IndustryResearcher):
                 # Update industry budget based on performance
-                accepted = len(authors_to_accepted_papers.get(agent.id, []))
-                rejected = len(authors_to_rejected_papers.get(agent.id, []))
-                
-                print(f"TODO: Track real citations for {agent.id}.")
-                citations = self.citations[agent.id] = [0] * accepted  # TODO: track real citations
+                accepted = len(self.conference_system.authors_to_accepted_papers.get(agent.id, []))
+                rejected = len(self.conference_system.authors_to_rejected_papers.get(agent.id, []))
+
+                # Count citations for each accepted paper
+                citation_counts = []
+                for paper in self.conference_system.authors_to_accepted_papers.get(agent.id, []):
+                    citation_counts.append(self.citation_tracker.get_citation_count(paper['id']))
 
                 new_budget = self.industry_funding_system.update_budget(
-                    accepted, rejected, citations
+                    accepted, rejected, citation_counts
                 )
                 agent.update_resources(delta=new_budget)
 
@@ -652,13 +758,30 @@ class Simulation:
                     num_submitted_proposals=3 # at most 3 programs to apply to
                 )
                 if selected_program_ids:
-                    application = agent.prepare_funding_application(
-                        past_accepted_papers=authors_to_accepted_papers.get(agent.id, []),
-                        past_rejected_papers=authors_to_rejected_papers.get(agent.id, []),
-                        programs=all_funding_programs_dict,
-                        selected_program_ids=selected_program_ids,
-                        success_history=success_history
-                    )
+                    application = None
+                    num_retries = 0
+                    while True:
+                        try:
+                        
+                            application = agent.prepare_funding_application(
+                                past_accepted_papers=self.conference_system.authors_to_accepted_papers.get(agent.id, []),
+                                past_rejected_papers=self.conference_system.authors_to_rejected_papers.get(agent.id, []),
+                                programs=all_funding_programs_dict,
+                                selected_program_ids=selected_program_ids,
+                                success_history=success_history
+                            )
+                            
+                            break
+                        
+                        
+                        except Exception as e:
+                            logger.warning(f"Error preparing funding application: {e}")
+                            traceback.print_exc()
+                            num_retries += 1
+                            if num_retries >= self.max_retries:
+                                raise Exception("Failed to prepare funding application after 3 retries")
+                            time.sleep(1)
+                            
                     if application:
                         application['author'] = agent
                         university_applications.append(application)
@@ -713,13 +836,9 @@ class Simulation:
 
         # Get conference statistics
         year_results['conference_statistics'] = self.conference_system.get_all_statistics()
+        
 
-        # Save checkpoint after each year in debug mode
-        if self.debug:
-            self._save_checkpoint(year)
-
-        # Reset conferences for next year
-        self.conference_system.reset_all_for_next_year(year + 1)
+        
 
         return year_results
 
@@ -739,7 +858,7 @@ class Simulation:
                 checkpoint_path = os.path.join(self.output_dir, f"checkpoint_year_{year}.json")
                 if os.path.exists(checkpoint_path):
                     logger.info(f"Found checkpoint at year {year}, attempting to load...")
-                    if self._load_checkpoint(year):
+                    if self.load_checkpoint(year):
                         start_year = year + 1
                         checkpoint_loaded = True
                         logger.info(f"Resuming simulation from year {start_year}")
@@ -796,14 +915,14 @@ class Simulation:
         for year in range(start_year, self.num_years + 1):
             year_results = self.run_one_round(year)
             self.yearly_results.append(year_results)
-
+            self._save_checkpoint(year, phase=5)
         # Generate final report
         self._generate_final_report()
 
         logger.info("\nSimulation completed!")
         logger.info(f"Results saved to: {self.output_dir}")
 
-    def _save_checkpoint(self, year: int):
+    def _save_checkpoint(self, year: int, phase: int = 5):
         """Save complete simulation state as checkpoint
 
         Args:
@@ -811,16 +930,14 @@ class Simulation:
         """
         checkpoint_path = os.path.join(self.output_dir, f"checkpoint_year_{year}.json")
 
-        # Convert citations from Dict[str, Set[Citation]] to JSON-serializable format
-
         # Serialize everything to JSON-compatible format
         checkpoint_data = {
             'year': year,
+            'phase': phase,
             'ecosystem_data': self.ecosystem.to_dict(),
             'conference_system': self.conference_system.to_dict(),
-            'citations': self.citations,
+            'citation_tracker': self.citation_tracker.to_dict(),
             'rag': self.rag.to_dict(),
-            'all_papers_history': self.all_papers_history,
             'paper_archive': self.paper_archive.to_dict(),
             'yearly_results': self.yearly_results,
             'industry_funding_system': self.industry_funding_system.to_dict(),
@@ -832,7 +949,7 @@ class Simulation:
 
         logger.info(f"Checkpoint saved for year {year}: {checkpoint_path}")
 
-    def _load_checkpoint(self, year: int):
+    def load_checkpoint(self, year: int):
         """Load complete simulation state from checkpoint
 
         Args:
@@ -857,18 +974,15 @@ class Simulation:
             checkpoint_data['ecosystem_data'],
             llm=self.llm
         )
-        
 
         # Reconstruct conference system
         self.conference_system = ConferenceSystem.from_dict(checkpoint_data['conference_system'])
 
         # Reset conferences for the next year (checkpoint was saved before reset)
-        self.conference_system.reset_all_for_next_year(year + 1)
+        self.conference_system.reset_all_for_new_year(year)
 
-        # Reconstruct citations from JSON format
-        self.citations = checkpoint_data['citations']
-
-        self.all_papers_history = checkpoint_data['all_papers_history']
+        # Reconstruct citation tracker
+        self.citation_tracker = CitationTracker.from_dict(checkpoint_data.get('citation_tracker', {'citations': {}}))
 
         # Reconstruct paper archive
         self.paper_archive = PaperArchive.from_dict(checkpoint_data['paper_archive'])
@@ -908,62 +1022,13 @@ class Simulation:
 
 def main():
     """Main entry point"""
-    parser = argparse.ArgumentParser(
-        description="Run Academic Society Ecosystem Simulation"
-    )
-    parser.add_argument(
-        '--num_years',
-        type=int,
-        default=4,
-        help='Number of years to simulate (default: 5)'
-    )
-    parser.add_argument(
-        '--output-dir',
-        type=str,
-        default='./outputs',
-        help='Output directory for results (default: ./simulation_output)'
-    )
 
-    parser.add_argument(
-        '--debug',
-        action='store_true',
-        default=False,
-        help='Enable debug mode'
-    )
-    
-    parser.add_argument(
-        '--model',
-        type=str,
-        default='gpt-4o',
-        help='Model to use for LLM (default: gpt-4o)'
-    )
-
-    parser.add_argument(
-        '--industry_funding_mode',
-        type=str,
-        default='performance',
-        choices=['performance', 'consistent'],
-        help='Funding mode for industry researchers: "performance" (based on papers) or "consistent" (fixed allocation) (default: performance)'
-    )
-
-    parser.add_argument(
-        '--always_rerun',
-        action='store_true',
-        default=False,
-        help='Ignore all checkpoints and start simulation from scratch (default: resume from latest checkpoint if available)'
-    )
-    parser.add_argument(
-        '--use_langchain',
-        action='store_true',
-        default=False,
-        help='Use LangChain for RAG (by default, we use SentenceTransformer)'
-    )
-
-    args = parser.parse_args()
 
     project_setup()
     
-    os.makedirs(args.output_dir, exist_ok=True)
+    args = parse_arguments()
+    
+    
 
     llm = GPT(model_name=args.model)
 
@@ -975,7 +1040,9 @@ def main():
         debug=args.debug,
         industry_funding_mode=args.industry_funding_mode,
         always_rerun=args.always_rerun,
-        use_langchain=args.use_langchain
+        use_langchain=args.use_langchain,
+        max_retries=args.max_retries
+        
     )
 
     simulation.run()

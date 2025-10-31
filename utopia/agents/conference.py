@@ -7,6 +7,7 @@ Each conference has its own submission deadlines, review processes, and acceptan
 
 from typing import List, Dict, Set, Optional
 from dataclasses import dataclass, field
+from collections import defaultdict
 import time
 from enum import Enum
 
@@ -42,14 +43,18 @@ class Conference:
     topics: List[str]  # All research topics (first 3 are most preferred, sorted by preference)
     category: str = None  # General research category (e.g., "Artificial Intelligence", "Computer Networks")
     acceptance_rate: float = None  # Target acceptance rate (0-1), None = use default from config
-    year: int = 0
+    year: int = 1
     status: ConferenceStatus = ConferenceStatus.ACCEPTING_SUBMISSIONS
 
     # Paper tracking
     submitted_papers: List[Dict] = field(default_factory=list)
-    accepted_papers: List[Dict] = field(default_factory=list)
-    rejected_papers: List[Dict] = field(default_factory=list)
-
+    decisions: Dict[str, List[Dict]] = field(default_factory=lambda: {
+        'accept': [],
+        'reject': [],
+    })
+    
+    authors_to_accepted_papers: Dict[str, List[Dict]] = field(default_factory=lambda: defaultdict(list))  # author_id -> [accepted_papers]
+    authors_to_rejected_papers: Dict[str, List[Dict]] = field(default_factory=lambda: defaultdict(list))  # author_id -> [rejected_papers]
     # Review tracking
     reviews: Dict[str, List[Dict]] = field(default_factory=dict)  # paper_id -> [reviews]
 
@@ -81,7 +86,7 @@ class Conference:
         conf_topic_set = set(t.lower() for t in self.topics)
         return bool(paper_topic_set.intersection(conf_topic_set))
 
-    def submit_paper(self, paper: Dict) -> bool:
+    def submit_paper(self, paper: Dict, year: int) -> bool:
         """Submit a paper to this conference
 
         Args:
@@ -103,6 +108,8 @@ class Conference:
             paper['conference'] = self.conference_id
         else:
             assert paper['conference'] == self.conference_id
+            
+        paper['year'] = year
         paper['submission_time'] = time.time()
         self.submitted_papers.append(paper)
         return True
@@ -123,10 +130,11 @@ class Conference:
             self.reviews[paper_id] = []
 
         review['conference_id'] = self.conference_id
+        review['year'] = self.year
         review['review_time'] = time.time()
         self.reviews[paper_id].append(review)
 
-    def make_acceptance_decisions(self) -> Dict[str, List[Dict]]:
+    def make_acceptance_decisions(self) -> None:
         """Make final acceptance/rejection decisions
 
         Uses aggregate review scores and acceptance rate to determine which papers to accept.
@@ -135,7 +143,7 @@ class Conference:
             Dictionary with 'accepted' and 'rejected' lists
         """
         if self.status != ConferenceStatus.UNDER_REVIEW:
-            return {'accepted': [], 'rejected': []}
+            return
 
         # Calculate aggregate scores for each paper
         paper_scores = []
@@ -169,22 +177,57 @@ class Conference:
             paper = item['paper']
             paper['final_score'] = item['score']
             paper['decision_time'] = time.time()
+            
+            
 
             if i < num_to_accept:
                 paper['decision'] = 'accept'
-                self.accepted_papers.append(paper)
+                
+                
+                
+                """
+                paper_decision = {
+                    'id': paper['id'],
+                    'author_id': paper['author_id'],
+                    'year': self.year,
+                    'score': item['score'],
+                    'conference_id': self.conference_id,
+                    'decision': 'accept',
+                    'type': paper['type'],
+                }
+                
+                """
+                
+                self.decisions['accept'].append(paper)
+                self.authors_to_accepted_papers[paper['author_id']].append(paper)
+                
+                
+                
             else:
                 paper['decision'] = 'reject'
-                self.rejected_papers.append(paper)
+                
+                """
+                paper_decision = {
+                    'id': paper['id'],
+                    'author_id': paper['author_id'],
+                    'year': self.year,
+                    'score': item['score'],
+                    'conference_id': self.conference_id,
+                    'decision': 'reject',
+                    'type': paper['type'],
+                }
+                """
+                
+                self.decisions['reject'].append(paper)
+                self.authors_to_rejected_papers[paper['author_id']].append(paper)
+                
 
         self.status = ConferenceStatus.DECISIONS_MADE
         
-        print(f"Conference {self.conference_id}: Total: {len(self.submitted_papers)}. Accepted: {len(self.accepted_papers)}. Reject: {len(self.rejected_papers)}. ")
+        print(f"Conference {self.conference_id}: Total: {len(self.submitted_papers)}. Accepted: {len(self.decisions['accept'])}. Reject: {len(self.decisions['reject'])}. ")
+        
+        self.submitted_papers.clear()
 
-        return {
-            'accept': self.accepted_papers,
-            'reject': self.rejected_papers
-        }
 
     def _calculate_paper_score(self, reviews: List[Dict]) -> float:
         """Calculate aggregate score for a paper from its reviews
@@ -221,8 +264,8 @@ class Conference:
         self.year = new_year
         self.status = ConferenceStatus.ACCEPTING_SUBMISSIONS
         self.submitted_papers = []
-        self.accepted_papers = []
-        self.rejected_papers = []
+        self.decisions['accept'].clear()
+        self.decisions['reject'].clear()
         self.reviews = {}
 
     def get_statistics(self) -> Dict:
@@ -238,9 +281,9 @@ class Conference:
             'topics': self.topics,
             'status': self.status.value,
             'num_submissions': len(self.submitted_papers),
-            'num_accepted': len(self.accepted_papers),
-            'num_rejected': len(self.rejected_papers),
-            'actual_acceptance_rate': len(self.accepted_papers) / len(self.submitted_papers) if self.submitted_papers else 0.0,
+            'num_accepted': len(self.decisions['accept']),
+            'num_rejected': len(self.decisions['reject']),
+            'actual_acceptance_rate': len(self.decisions['accept']) / len(self.submitted_papers) if self.submitted_papers else 0.0,
             'avg_reviews_per_paper': sum(len(reviews) for reviews in self.reviews.values()) / len(self.reviews) if self.reviews else 0.0
         }
 
@@ -253,10 +296,10 @@ class Conference:
             'category': self.category,
             'acceptance_rate': self.acceptance_rate,
             'year': self.year,
+            'decisions': self.decisions,
+            'authors_to_accepted_papers': self.authors_to_accepted_papers,
+            'authors_to_rejected_papers': self.authors_to_rejected_papers,
             'status': self.status.value,  # Convert enum to string
-            'submitted_papers': self.submitted_papers,
-            'accepted_papers': self.accepted_papers,
-            'rejected_papers': self.rejected_papers,
             'reviews': self.reviews
         }
 
@@ -275,9 +318,10 @@ class Conference:
         conf.status = ConferenceStatus(data.get('status', ConferenceStatus.ACCEPTING_SUBMISSIONS.value))
         # Restore papers and reviews
         conf.submitted_papers = data.get('submitted_papers', [])
-        conf.accepted_papers = data.get('accepted_papers', [])
-        conf.rejected_papers = data.get('rejected_papers', [])
-        conf.reviews = data.get('reviews', {})
+        conf.decisions = defaultdict(list, data.get('decisions', {}))
+        conf.authors_to_accepted_papers = defaultdict(list, data.get('authors_to_accepted_papers', {}))
+        conf.authors_to_rejected_papers = defaultdict(list, data.get('authors_to_rejected_papers', {}))
+        conf.reviews = defaultdict(list, data.get('reviews', {}))
         return conf
 
 
@@ -296,6 +340,9 @@ class ConferenceSystem:
         """
         self.conferences: List[Conference] = conferences or []
         self.conference_map: Dict[str, Conference] = {}
+        
+        self.authors_to_accepted_papers: Dict[str, List[Dict]] = defaultdict(list)  # author_id -> [accepted_papers]
+        self.authors_to_rejected_papers: Dict[str, List[Dict]] = defaultdict(list)  # author_id -> [rejected_papers]
 
         for conf in self.conferences:
             self.conference_map[conf.conference_id] = conf
@@ -346,27 +393,30 @@ class ConferenceSystem:
 
     def make_all_decisions(self) -> Dict[str, Dict]:
         """Make acceptance decisions for all conferences
-
-        Returns:
-            Dictionary mapping conference_id to decision results
         """
-        results = {}
+        
         for conf in self.conferences:
-            decisions = conf.make_acceptance_decisions()
-            results[conf.conference_id] = decisions
-        return results
+            conf.make_acceptance_decisions()
+            
+            for paper in conf.decisions['accept']:
+                self.authors_to_accepted_papers[paper['author_id']].append(paper)
+            for paper in conf.decisions['reject']:
+                self.authors_to_rejected_papers[paper['author_id']].append(paper)
 
     def conclude_all_conferences(self):
         """Mark all conferences as concluded"""
         for conf in self.conferences:
             conf.conclude_conference()
 
-    def reset_all_for_next_year(self, new_year: int):
+    def reset_all_for_new_year(self, new_year: int):
         """Reset all conferences for the next year
 
         Args:
             new_year: The year number for the next cycle
         """
+        self.authors_to_accepted_papers.clear()
+        self.authors_to_rejected_papers.clear()
+        
         for conf in self.conferences:
             conf.reset_for_next_year(new_year)
 

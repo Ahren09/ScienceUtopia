@@ -62,9 +62,10 @@ SIMULATION_CONFIG = {
         'confidence_range': (1, 5),        # Confidence range for reviewers
     },
 
-    # Success history tracking
-    'learning': {
-        'success_history_alpha': 0.3,      # Exponential moving average weight
+    # 
+    'citation': {
+        'expected_citation_per_round': 2,      # Expected numbers of citations generated per round for each paper. If lower than this number, we try to cite rejected papers.
+        'num_candidate_papers': 20,      # Number of candidate papers to consider for citations.
         'initial_success_rate': 0.5,       # Initial assumed success rate
     },
 
