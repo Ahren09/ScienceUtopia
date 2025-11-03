@@ -5,12 +5,12 @@ Supports multiple conferences targeting different research topics.
 Each conference has its own submission deadlines, review processes, and acceptance criteria.
 """
 
-from typing import List, Dict, Set, Optional
-from dataclasses import dataclass, field
-from collections import defaultdict
 import time
+from collections import defaultdict
+from dataclasses import dataclass, field
 from enum import Enum
-
+from typing import List, Dict, Optional
+import random
 
 class ConferenceStatus(Enum):
     """Status of a conference in the yearly cycle"""
@@ -52,9 +52,11 @@ class Conference:
         'accept': [],
         'reject': [],
     })
-    
-    authors_to_accepted_papers: Dict[str, List[Dict]] = field(default_factory=lambda: defaultdict(list))  # author_id -> [accepted_papers]
-    authors_to_rejected_papers: Dict[str, List[Dict]] = field(default_factory=lambda: defaultdict(list))  # author_id -> [rejected_papers]
+
+    authors_to_accepted_papers: Dict[str, List[Dict]] = field(
+        default_factory=lambda: defaultdict(list))  # author_id -> [accepted_papers]
+    authors_to_rejected_papers: Dict[str, List[Dict]] = field(
+        default_factory=lambda: defaultdict(list))  # author_id -> [rejected_papers]
     # Review tracking
     reviews: Dict[str, List[Dict]] = field(default_factory=dict)  # paper_id -> [reviews]
 
@@ -98,17 +100,17 @@ class Conference:
         if self.status != ConferenceStatus.ACCEPTING_SUBMISSIONS:
             return False
 
-        # Check topic match
-        paper_topics = paper.get('topics', [])
-        if paper_topics and not self.is_topic_match(paper_topics):
-            return False
+        # # Check topic match
+        # paper_topics = paper.get('topics', [])
+        # if paper_topics and not self.is_topic_match(paper_topics):
+        #     return False
 
         # Add conference metadata to paper
         if 'conference' not in paper:
             paper['conference'] = self.conference_id
         else:
             assert paper['conference'] == self.conference_id
-            
+
         paper['year'] = year
         paper['submission_time'] = time.time()
         self.submitted_papers.append(paper)
@@ -157,8 +159,7 @@ class Conference:
             else:
                 # Calculate weighted average score
                 avg_score = self._calculate_paper_score(paper_reviews)
-                
-                
+
             paper["reviews"] = paper_reviews
 
             paper_scores.append({
@@ -177,14 +178,10 @@ class Conference:
             paper = item['paper']
             paper['final_score'] = item['score']
             paper['decision_time'] = time.time()
-            
-            
 
             if i < num_to_accept:
-                paper['decision'] = 'accept'
-                
-                
-                
+                paper['status'] = 'accept'
+
                 """
                 paper_decision = {
                     'id': paper['id'],
@@ -192,20 +189,20 @@ class Conference:
                     'year': self.year,
                     'score': item['score'],
                     'conference_id': self.conference_id,
-                    'decision': 'accept',
+                    'status': 'accept',
                     'type': paper['type'],
                 }
                 
                 """
-                
+
                 self.decisions['accept'].append(paper)
                 self.authors_to_accepted_papers[paper['author_id']].append(paper)
-                
-                
-                
+
+
+
             else:
-                paper['decision'] = 'reject'
-                
+                paper['status'] = 'reject'
+
                 """
                 paper_decision = {
                     'id': paper['id'],
@@ -213,21 +210,20 @@ class Conference:
                     'year': self.year,
                     'score': item['score'],
                     'conference_id': self.conference_id,
-                    'decision': 'reject',
+                    'status': 'reject',
                     'type': paper['type'],
                 }
                 """
-                
+
                 self.decisions['reject'].append(paper)
                 self.authors_to_rejected_papers[paper['author_id']].append(paper)
-                
 
         self.status = ConferenceStatus.DECISIONS_MADE
-        
-        print(f"Conference {self.conference_id}: Total: {len(self.submitted_papers)}. Accepted: {len(self.decisions['accept'])}. Reject: {len(self.decisions['reject'])}. ")
-        
-        self.submitted_papers.clear()
 
+        print(
+            f"Conference {self.conference_id}: Total: {len(self.submitted_papers)}. Accepted: {len(self.decisions['accept'])}. Reject: {len(self.decisions['reject'])}. ")
+
+        self.submitted_papers.clear()
 
     def _calculate_paper_score(self, reviews: List[Dict]) -> float:
         """Calculate aggregate score for a paper from its reviews
@@ -244,7 +240,6 @@ class Conference:
         # Extract scores from reviews
         scores = []
         for review in reviews:
-            
             scores.append(review['overall_score'])
 
         # Calculate average
@@ -283,8 +278,10 @@ class Conference:
             'num_submissions': len(self.submitted_papers),
             'num_accepted': len(self.decisions['accept']),
             'num_rejected': len(self.decisions['reject']),
-            'actual_acceptance_rate': len(self.decisions['accept']) / len(self.submitted_papers) if self.submitted_papers else 0.0,
-            'avg_reviews_per_paper': sum(len(reviews) for reviews in self.reviews.values()) / len(self.reviews) if self.reviews else 0.0
+            'actual_acceptance_rate': len(self.decisions['accept']) / len(
+                self.submitted_papers) if self.submitted_papers else 0.0,
+            'avg_reviews_per_paper': sum(len(reviews) for reviews in self.reviews.values()) / len(
+                self.reviews) if self.reviews else 0.0
         }
 
     def to_dict(self) -> Dict:
@@ -340,7 +337,7 @@ class ConferenceSystem:
         """
         self.conferences: List[Conference] = conferences or []
         self.conference_map: Dict[str, Conference] = {}
-        
+
         self.authors_to_accepted_papers: Dict[str, List[Dict]] = defaultdict(list)  # author_id -> [accepted_papers]
         self.authors_to_rejected_papers: Dict[str, List[Dict]] = defaultdict(list)  # author_id -> [rejected_papers]
 
@@ -360,31 +357,10 @@ class ConferenceSystem:
         for conf in self.conferences:
             if conf.status == ConferenceStatus.ACCEPTING_SUBMISSIONS and conf.is_topic_match(paper_topics):
                 matching.append(conf)
+                
+        if not matching:
+            matching = random.sample(self.conferences, min(3, len(self.conferences)))
         return matching
-
-    def submit_paper_to_best_match(self, paper: Dict) -> Optional[Conference]:
-        """Submit paper to the best matching conference
-
-        Finds conferences matching the paper's topics and submits to the first match.
-        In future versions, could implement more sophisticated matching algorithms.
-
-        Args:
-            paper: Paper dictionary with 'topics' field
-
-        Returns:
-            Conference object where paper was submitted, or None if no match found
-        """
-        paper_topics = paper.get('topics', [])
-        matching_conferences = self.get_matching_conferences(paper_topics)
-
-        if not matching_conferences:
-            return None
-
-        # Submit to first matching conference (could be made more sophisticated)
-        conference = matching_conferences[0]
-        success = conference.submit_paper(paper)
-
-        return conference if success else None
 
     def start_all_review_processes(self):
         """Start review process for all conferences"""
@@ -394,10 +370,10 @@ class ConferenceSystem:
     def make_all_decisions(self) -> Dict[str, Dict]:
         """Make acceptance decisions for all conferences
         """
-        
+
         for conf in self.conferences:
             conf.make_acceptance_decisions()
-            
+
             for paper in conf.decisions['accept']:
                 self.authors_to_accepted_papers[paper['author_id']].append(paper)
             for paper in conf.decisions['reject']:
@@ -416,7 +392,7 @@ class ConferenceSystem:
         """
         self.authors_to_accepted_papers.clear()
         self.authors_to_rejected_papers.clear()
-        
+
         for conf in self.conferences:
             conf.reset_for_next_year(new_year)
 
@@ -449,7 +425,9 @@ class ConferenceSystem:
     def from_dict(cls, data: Dict) -> 'ConferenceSystem':
         """Deserialize from dictionary"""
         conferences = [Conference.from_dict(conf_data) for conf_data in data.get('conferences', [])]
-        return cls(conferences=conferences)
+
+        conference_system = cls(conferences=conferences)
+        return conference_system
 
 
 CONFERENCES = {
@@ -866,7 +844,6 @@ for conference in CONFERENCES.values():
         CONFERENCES_BY_CATEGORY[conference.category] = []
     CONFERENCES_BY_CATEGORY[conference.category].append(conference)
 
-
 # Mapping from research direction topics to conference categories
 # This maps the topics in ResearchDirection to the conference categories
 TOPIC_TO_CATEGORY_MAPPING = {
@@ -948,9 +925,9 @@ TOPIC_TO_CATEGORY_MAPPING = {
 
 
 def select_conferences_for_simulation(
-    agents: List,
-    num_conferences: int = 5,
-    min_submissions_per_conf: int = 3
+        agents: List,
+        num_conferences: int = 5,
+        min_submissions_per_conf: int = 3
 ) -> List[Conference]:
     """Select conferences ensuring each gets sufficient submissions
 
@@ -968,7 +945,8 @@ def select_conferences_for_simulation(
     for agent in agents:
         if hasattr(agent, 'expertise'):
             for expertise_item in agent.expertise:
-                topic = expertise_item.topic if hasattr(expertise_item, 'topic') else str(expertise_item) if not isinstance(expertise_item, str) else expertise_item
+                topic = expertise_item.topic if hasattr(expertise_item, 'topic') else str(
+                    expertise_item) if not isinstance(expertise_item, str) else expertise_item
                 category_counts[TOPIC_TO_CATEGORY_MAPPING.get(topic, 'Interdisciplinary')] += 1
 
     num_agents = sum(category_counts.values())
@@ -979,17 +957,13 @@ def select_conferences_for_simulation(
     for category, count in category_counts.items():
         num_confs = max(1, round((count / num_agents) * num_conferences))
         if count < 3:
-            
             print(f"  ❌ Category {category}: {count} agents -> NO conference due to low number of agents")
             continue
-        
+
         print(f"  ✅ Category {category}: {count} agents -> {num_confs} conference(s)")
         selected_conferences.extend(CONFERENCES_BY_CATEGORY[category][:num_confs])
 
     return selected_conferences[:num_conferences]
-
-    
-    
 
 
 def create_default_conference_system() -> ConferenceSystem:

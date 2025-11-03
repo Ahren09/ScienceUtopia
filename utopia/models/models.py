@@ -1,24 +1,25 @@
 import base64
-import google.generativeai as genai
+import json
 import math
-import numpy as np
 import os
 import sys
-from PIL import Image
-from io import BytesIO
-from openai import AzureOpenAI, OpenAI, BadRequestError
-from typing import List, Optional, Union, Dict, Tuple
-import json
 import traceback
+from io import BytesIO
+from typing import List, Optional, Union, Dict, Tuple
+
+import google.generativeai as genai
+import numpy as np
+from PIL import Image
+from openai import AzureOpenAI, OpenAI, BadRequestError
 
 
 class LLM:
     def __init__(self, model_name):
         self.model_name = model_name
-        
+
     def generate(self, **kwargs):
         raise NotImplementedError("Subclasses must implement this method")
-    
+
 
 class GPT(LLM):
 
@@ -39,7 +40,10 @@ class GPT(LLM):
         else:
             raise ValueError("No API key found")
 
-    def generate(self, prompt: Optional[str] = None, image: Optional[List[Union[str, Image.Image]]] = None, temperature: float = 0.7, system_prompt: Optional[str] = "This is a simulation of an academic ecosystem, where researchers choose research directions and submit papers, reviewers conduct peer reviews of papers, and funding agencies allocate fundings.", response_format = None, message_history: Optional[List[Dict]] = []) -> Tuple[Dict, List[Dict]]:
+    def generate(self, prompt: Optional[str] = None, image: Optional[List[Union[str, Image.Image]]] = None,
+                 temperature: float = 0.7, system_prompt: Optional[
+                str] = "This is a simulation of an academic ecosystem, where researchers choose research directions and submit papers, reviewers conduct peer reviews of papers, and funding agencies allocate fundings.",
+                 response_format=None, message_history: Optional[List[Dict]] = []) -> Tuple[Dict, List[Dict]]:
         # System instructions for the GPT model
 
         try:
@@ -55,7 +59,7 @@ class GPT(LLM):
             if image is not None:
                 if isinstance(image, Image.Image):
                     image = [image]
-                
+
                 if isinstance(image, list):
                     for img in image:
                         if isinstance(img, str):
@@ -74,7 +78,6 @@ class GPT(LLM):
                             "image_url": {"url": f"data:image/jpeg;base64,{encoded_image}"}
                         })
 
-            
             messages = []
             if message_history != []:
                 new_message = [{
@@ -82,36 +85,35 @@ class GPT(LLM):
                     "content": content
                 }]
                 messages = message_history + new_message
-                
+
             else:
                 messages = [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": content}
                 ]
-                
+
             assert len(messages) > 0, "Message history is empty"
 
             response = self.client.chat.completions.create(
                 model=self.model_name,
                 messages=messages,
                 temperature=temperature,
-                response_format={"type": "json_object"} # response_format
+                response_format={"type": "json_object"}  # response_format
             )
 
             response_content = response.choices[0].message.content
-            
+
             if response_content is None:
                 raise ValueError("Empty response from model")
-            
+
             response_json = json.loads(response_content.strip())
             messages.append({
                 "role": "assistant",
                 "content": [{
-                    "type": "text", 
+                    "type": "text",
                     "text": response_content
                 }]
             })
-
 
             return response_json, messages
 
@@ -229,10 +231,9 @@ def load_base64_image(image_input: Union[str, Image.Image], format: str = "JPEG"
         img = image_input
         if img.mode in ('RGBA', 'P'):
             img = img.convert('RGB')
-        
+
         buffer = BytesIO()
         img.save(buffer, format=format)
         return base64.b64encode(buffer.getvalue()).decode('utf-8')
     else:
         raise ValueError(f"Unsupported image input type: {type(image_input)}. Expected str (file path) or PIL.Image")
-

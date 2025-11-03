@@ -5,12 +5,16 @@ This module provides functionality to extract keywords from academic abstracts
 using various LLM models (GPT).
 """
 
+import json
 import os
 import sys
-from typing import List, Optional
-import json
+import time
+import traceback
+from typing import List
+
 from datasets import load_dataset
-from tqdm import trange, tqdm
+from tqdm import trange
+
 # Add parent directory to path to import models
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -29,7 +33,7 @@ class KeywordExtractor:
             model_name: Specific model name (optional, uses defaults if not provided)
         """
         self.model = llm
-        
+
     def extract_keywords(self, abstract: str, num_keywords: int = 10) -> List[str]:
         """
         Extract keywords from an abstract.
@@ -41,7 +45,7 @@ class KeywordExtractor:
         Returns:
             List of extracted keywords
         """
-        
+
         sample_response = """
 ```json
 {
@@ -50,7 +54,7 @@ class KeywordExtractor:
 }
 ```
 """
-        
+
         prompt = f"""Given an abstract of a research paper, extract exactly {num_keywords} terminologies that best represent the technical terms, methods, and concepts in the paper.
 
 Instructions:
@@ -71,38 +75,38 @@ This paper presents a novel deep learning approach for sentiment analysis of soc
 
 {abstract}
 """
-        
+
         response, _ = self.model.generate(
             prompt=prompt,
             temperature=0.3,
             system_prompt="You are an expert at analyzing academic papers and extracting relevant keywords.",
             response_format="json_object"
         )
-        
+
         assert 'keywords_in_abstract' in response and 'keywords_not_in_abstract' in response, "Failed to generate keywords from the model"
-        
 
         if response is None:
             raise ValueError("Failed to generate keywords from the model")
 
         return response
 
+
 if __name__ == "__main__":
-    
+
     llm = GPT(model_name="gpt-4o")
-    
+
     extractor = KeywordExtractor(llm)
-    
+
     dataset = load_dataset("Ahren09/SciEvo", "arxiv", split="train")
-    
+
     all_results = {}
-    
+
     output_file = "outputs/keywords/keywords_scievo.json"
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
-    
+
     if os.path.exists(output_file):
         all_results = json.load(open(output_file))
-    
+
     num_generated = 0
     for i in trange(len(dataset) - 1, 0, -1, desc="Extracting keywords"):
         item = dataset[i]
@@ -111,18 +115,27 @@ if __name__ == "__main__":
             continue
         else:
             abstract = item["summary"]
-            keywords = extractor.extract_keywords(abstract, num_keywords=10)
-            all_results[paper_id] = {
-                "id": paper_id,
-                "keywords_in_abstract": keywords["keywords_in_abstract"],
-                "keywords_not_in_abstract": keywords["keywords_not_in_abstract"],
-            }
-            
-            num_generated += 1
+
+            num_retries = 0
+
+            for _ in range(5):
+                try:
+                    keywords = extractor.extract_keywords(abstract, num_keywords=10)
+                    all_results[paper_id] = {
+                        "id": paper_id,
+                        "keywords_in_abstract": keywords["keywords_in_abstract"],
+                        "keywords_not_in_abstract": keywords["keywords_not_in_abstract"],
+                    }
+                    num_generated += 1
+                    break
+
+                except Exception as e:
+                    traceback.print_exc()
+                    num_retries += 1
+                    if num_retries >= 5:
+                        raise Exception("Failed to extract keywords after 5 retries")
+
+                    time.sleep(1)
+
             if num_generated % 100 == 0:
                 json.dump(all_results, open(output_file, "w"), indent=2)
-            
-        
-        
-    
-

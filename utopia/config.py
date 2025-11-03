@@ -19,7 +19,8 @@ SIMULATION_CONFIG = {
     'conference': {
         'acceptance_rate': 0.3,  # 25% acceptance rate if not specified
         'use_default_acceptance_rate': True,
-        'resubmission_cost': 5,
+        'resubmission_cost': 5, # Fixed cost for resubmitting a paper
+        'annual_cost': 10, # Fixed cost for each year of research
     },
 
     # Funding agency settings
@@ -30,24 +31,7 @@ SIMULATION_CONFIG = {
         'darpa_funding_rate': 0.20,       # DARPA: more selective (applied research)
         'academic_base_budget': 50, 
         'industry_base_budget': 50, 
-    },
-
-    # Agent resource settings
-    'agent': {
-        # Initial resources
-        'university_initial_funding': 70,
-        'industry_initial_funding': 90,
-        'freelancer_initial_funding': 30,
-
-        # Resource bounds
-        'min_funding': 0,
-        'max_funding': 100,
-
-        # Initial reputation
-        'university_initial_reputation': 5,
-        'industry_initial_reputation': 6,
-        'freelancer_initial_reputation': 4,
-        'funding_agent_initial_reputation': 8,
+        'funding_growth_rate': 0.1,
     },
     
     # Paper generation settings

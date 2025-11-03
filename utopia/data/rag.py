@@ -102,7 +102,9 @@ class RAG:
         self.id2docs = {}
         if self.debug:
             dataset = read_json("data/additional_data_2024_7.json")
-            for item in dataset[:128]:
+            
+            
+            for item in dataset[:256]:
 
                 title = re.sub(r'\s+', ' ', item.get('title', '').replace('\n', ' ')).strip()
                 abstract = re.sub(r'\s+', ' ', item.get('summary', '').replace('\n', ' ')).strip()
@@ -120,6 +122,7 @@ class RAG:
                     metadata=metadata
                 )
                 self.id2docs[item['id']] = doc
+                
 
             docs = list(self.id2docs.values())
             self.documents = docs
@@ -138,7 +141,7 @@ class RAG:
                 
                 self.id2docs = {}
                 
-                for item in tqdm(dataset.select(range(len(dataset) - 20_000, len(dataset))), desc="Processing dataset"):
+                for item in tqdm(dataset.select(range(len(dataset) - 100000, len(dataset))), desc="Processing dataset"):
                     title = _normalize_whitespace(item.get('title', ''))
                     abstract = _normalize_whitespace(item.get('summary', ''))
 
@@ -165,7 +168,8 @@ class RAG:
                     pickle.dump(cache_data, f)
             
             self.id2docs = {doc.metadata['id']: doc for doc in self.documents}
-            self.document_status = pd.DataFrame(columns=['id', 'status'], data=[{'id': doc.metadata['id'], 'status': 'unsubmitted'} for doc in self.documents])
+        
+        self.document_status = pd.DataFrame(columns=['id', 'status'], data=[{'id': doc.metadata['id'], 'status': 'unsubmitted'} for doc in self.documents])
             
         
     def mark_papers_as_submitted(self, paper_ids: List[str]):
@@ -299,9 +303,9 @@ class RAG:
             
         elif retrieval_type in ["accepted_papers", "accepted_or_rejected_papers"]:
             if retrieval_type == "accepted_papers":
-                indices = (self.document_status[self.document_status['status'] == "accepted"]).index.values
+                indices = (self.document_status[self.document_status['status'] == "accept"]).index.values
             else:
-                indices = (self.document_status[(self.document_status['status'].isin({"accepted", "rejected"}))]).index.values
+                indices = (self.document_status[(self.document_status['status'].isin({"accept", "reject"}))]).index.values
             assert len(indices) > 0, "No candidate papers found!"
             print(f"\n[CITATION INDEX] Batch retrieving for {len(queries)} queries...")
             
@@ -538,8 +542,8 @@ class RAG:
                 
     def mark_papers_as_submitted(self, accepted_paper_ids: List[str], rejected_paper_ids: List[str]):
         """Mark papers as submitted"""
-        self.document_status.loc[self.document_status['id'].isin(accepted_paper_ids), 'status'] = 'accepted'
-        self.document_status.loc[self.document_status['id'].isin(rejected_paper_ids), 'status'] = 'rejected'
+        self.document_status.loc[self.document_status['id'].isin(accepted_paper_ids), 'status'] = 'accept'
+        self.document_status.loc[self.document_status['id'].isin(rejected_paper_ids), 'status'] = 'reject'
         assert len(self.document_status.loc[self.document_status['status'] == 'submitted']) == 0, "Some papers still require a decision!"
 
     def to_dict(self) -> Dict:

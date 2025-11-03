@@ -4,16 +4,13 @@ Specialized Agent Types for Multi-Agent Scientific Ecosystem
 EXTENDS base agent classes WITHOUT modifying existing AI-Scientist code
 """
 
-import json
-import random
-import traceback
-from .base_agent import SimulationAgent
-from .research_direction import ResearchDirection
-from .funding_agents import FundingProgram
-from typing import List, Dict, Optional, Set, Union 
-from utopia.models.models import LLM, GPT
+from typing import List, Dict, Optional, Set
 
 from utopia.config import SIMULATION_CONFIG
+from utopia.models.models import LLM
+from .base_agent import SimulationAgent
+from .funding_agents import FundingProgram
+from .research_direction import ResearchDirection
 
 
 class UniversityResearcher(SimulationAgent):
@@ -24,13 +21,14 @@ class UniversityResearcher(SimulationAgent):
     """
 
     def __init__(
-        self,
-        researcher_name: str,
-        university_name: str,
-        funding_level: int = 70,
-        expertise: Optional[List] = None,
-        llm = None,
-        generate_research_proposal: bool = True
+            self,
+            researcher_name: str,
+            university_name: str,
+            funding_level: int = 70,
+            expertise: Optional[List] = None,
+            llm=None,
+            generate_research_proposal: bool = True,
+            max_retries: int = 10
     ):
         """Initialize a university researcher
 
@@ -44,7 +42,8 @@ class UniversityResearcher(SimulationAgent):
         super().__init__(
             reputation=5,
             agent_id=researcher_name,
-            llm=llm
+            llm=llm,
+            max_retries=max_retries
         )
         self.university_name = university_name
         self.can_author = True  # University researchers can write papers
@@ -52,30 +51,26 @@ class UniversityResearcher(SimulationAgent):
         self.resources = funding_level
         # Do we use LLM to generate research proposal?
         self.generate_research_proposal = generate_research_proposal
+        self.newest_direction = None
 
-        assert isinstance(expertise, List) and all(isinstance(rd, ResearchDirection) for rd in expertise), "expertise must be a list of ResearchDirection objects"
+        assert isinstance(expertise, List) and all(isinstance(rd, ResearchDirection) for rd in
+                                                   expertise), "expertise must be a list of ResearchDirection objects"
         assert len(expertise) > 0, "expertise must be a non-empty list"
         # Inherent expertise (3 research directions)
         self.expertise = expertise
-        
-        self.funding_success_history = {} # program_id -> successes
-        self.conflict_of_interest = set() # set of authors they have collaborated with or belong to the same institution   
-        
-        
+
+        self.funding_success_history = {}  # program_id -> successes
+        self.conflict_of_interest = set()  # set of authors they have collaborated with or belong to the same institution
+
+    def get_type(self) -> str:
+        return "university"
+
     def _get_personality_prompt(self) -> str:
         return """You are a university researcher who both authors papers and reviews them for conferences. 
                You focus on theoretical contributions, novel methodologies, and advancing fundamental knowledge. 
                You value reproducibility, peer review rigor, and long-term scientific impact. Your reviewing 
                style is influenced by your own experiences as an author in the academic ecosystem."""
-               
-    def add_conflict_of_interest(self, other_researcher_names: Union[Set[str], List[str], str]):
-        """Add conflict of interest with other researchers"""
-        if isinstance(other_researcher_names, str):
-            other_researcher_names = {other_researcher_names}
-        elif isinstance(other_researcher_names, list):
-            other_researcher_names = set(other_researcher_names)
-        self.conflict_of_interest.update(other_researcher_names)
-               
+
     def _apply_agent_review_biases(self, review: Dict) -> Dict:
         """Apply university-specific biases to reviews"""
         # Universities tend to value theoretical rigor and reproducibility
@@ -91,10 +86,10 @@ class UniversityResearcher(SimulationAgent):
         return review
 
     def select_funding_programs(
-        self,
-        funding_programs: List['FundingProgram'],
-        success_history: Optional[Dict[str, float]] = None,
-        num_submitted_proposals: int = 3
+            self,
+            funding_programs: List['FundingProgram'],
+            success_history: Optional[Dict[str, float]] = None,
+            num_submitted_proposals: int = 3
     ) -> List[str]:
         """Select funding programs to apply to based on expertise overlap and success rates
 
@@ -105,7 +100,7 @@ class UniversityResearcher(SimulationAgent):
         Returns:
             List of selected program IDs
         """
-        
+
         if not self.expertise:
             return []
 
@@ -113,7 +108,7 @@ class UniversityResearcher(SimulationAgent):
         for program_id, program in funding_programs.items():
             # Calculate expertise overlap
             # focus_areas: List[str] = [area.topic for area in program.focus_areas]
-            
+
             overlap = sum(1 for exp in self.expertise if exp in program.research_directions)
             scores.append((program.program_id, overlap))
 
@@ -122,12 +117,12 @@ class UniversityResearcher(SimulationAgent):
         return [pid for pid, score in scores[:num_submitted_proposals] if score >= 1]
 
     def prepare_funding_application(
-        self,
-        past_accepted_papers: List[Dict],
-        past_rejected_papers: List[Dict],
-        programs: List['FundingProgram'],
-        selected_program_ids: List[str],
-        success_history: Optional[Dict[str, float]] = None
+            self,
+            past_accepted_papers: List[Dict],
+            past_rejected_papers: List[Dict],
+            programs: List['FundingProgram'],
+            selected_program_ids: List[str],
+            success_history: Optional[Dict[str, float]] = None
     ) -> Dict:
         """Prepare a funding application for submission to funding agencies
 
@@ -153,10 +148,10 @@ class UniversityResearcher(SimulationAgent):
         # Generate targeted proposal using LLM
         if self.generate_research_proposal:
             expertise_topics = [rd.topic if isinstance(rd, ResearchDirection) else str(rd)
-                              for rd in self.expertise]
-            
+                                for rd in self.expertise]
+
             program_details = ""
-            
+
             for program in selected_programs:
                 program_details += f"""### Program ID: \"{program.program_id}\"
 Name: \"{program.name}\"
@@ -164,7 +159,7 @@ Focus Areas: {', '.join([rd.topic for rd in program.research_directions])}
 
 """
 
-            prompt = f"""You are a university researcher applying for research funding.
+            prompt = f"""You are a university researcher from {self.university_name} applying for research funding based on your expertise and past papers.
 
 ## Your Profile
 - Expertise: {', '.join(expertise_topics)}
@@ -187,21 +182,21 @@ The research proposal should be:
             for paper in past_accepted_papers:
                 prompt += f"""Title: {paper['title']}
 Arxiv ID: {paper['id']}
-Abstract: {paper['content']}
-Status: {paper['decision']}
-                
+Abstract: {paper['abstract']}
+Status: {paper['status']}
+
 """
 
             prompt += "## Past Rejected Papers"
             for paper in past_rejected_papers:
                 prompt += f"""Title: {paper['title']}
 Arxiv ID: \"{paper['id']}\"
-Abstract: {paper['content']}
-Status: {paper['decision']}
+Abstract: {paper['abstract']}
+Status: {paper['status']}
 
 """
 
-## Past Accepted Papers
+            ## Past Accepted Papers
             prompt += """## Sample Response
 ```json
 {
@@ -211,13 +206,13 @@ Status: {paper['decision']}
         "relevant_projects": [  //<- If you decide to submit, set to a list of your past accepted papers
             {
                 "arxiv_id": "https://arxiv.org/abs/2406.12708v2", <- must be a full URL
-                "status": "accepted"
+                "status": "accept"
             },
             {
                 "arxiv_id": "https://arxiv.org/abs/2406.00001v1",
-                "status": "rejected"
+                "status": "reject"
             },
-        ], 
+        ],
     },
     "DARPA_AI_APPS": {
         "research_proposal": null, <- If you decide not to submit, set to null
@@ -236,9 +231,9 @@ Status: {paper['decision']}
                 if program.get('submit', True):
                     referred_papers = program['relevant_projects']
                     all_paper_ids_in_proposals.update([paper['arxiv_id'] for paper in referred_papers])
-            
+
             assert all_paper_ids_in_proposals <= all_paper_ids_of_current_author
-            
+
         else:
             raise NotImplementedError("This method is not supported for generate_research_proposal == False")
 
@@ -253,13 +248,14 @@ class IndustryResearcher(SimulationAgent):
     """
 
     def __init__(
-        self,
-        researcher_name: str,
-        company_name: str,
-        funding_level: int = 90,
-        expertise: Optional[List] = None,
-        llm: LLM = None,
-        funding_mode: str = "performance"  # "performance" or "consistent"
+            self,
+            researcher_name: str,
+            company_name: str,
+            funding_level: int = 90,
+            expertise: Optional[List] = None,
+            llm: LLM = None,
+            funding_mode: str = "performance",  # "performance" or "consistent"
+            max_retries: int = 10
     ):
         """Initialize an industry researcher
 
@@ -275,10 +271,12 @@ class IndustryResearcher(SimulationAgent):
         super().__init__(
             reputation=6,
             agent_id=researcher_name,
-            llm=llm
+            llm=llm,
+            max_retries=max_retries
         )
         self.resources = funding_level
-        assert isinstance(expertise, List) and all(isinstance(rd, ResearchDirection) for rd in expertise), "expertise must be a list of ResearchDirection objects"
+        assert isinstance(expertise, List) and all(isinstance(rd, ResearchDirection) for rd in
+                                                   expertise), "expertise must be a list of ResearchDirection objects"
         assert len(expertise) > 0, "expertise must be a non-empty list"
         self.expertise = expertise
         self.company_name = company_name
@@ -288,17 +286,22 @@ class IndustryResearcher(SimulationAgent):
         self.funding_success_history = {}
         self.budget = SIMULATION_CONFIG['funding']['industry_base_budget']
         self.research_priorities: Set[str] = set()
+
+        self.newest_direction = None
         if expertise:
             self.research_priorities = {rd.topic if hasattr(rd, 'topic') else str(rd) for rd in expertise}
-            
-        self.conflict_of_interest = set() # set of authors they have collaborated with or belong to the same institution 
-        
+
+        self.conflict_of_interest = set()  # set of authors they have collaborated with or belong to the same institution
+
+    def get_type(self) -> str:
+        return "industry"
+
     def _get_personality_prompt(self) -> str:
         return """You are an industry researcher who both authors papers and reviews them for conferences.
                You focus on practical applications, scalable solutions, and commercially viable innovations. 
                You prioritize efficiency, real-world impact, and competitive advantages. Your reviewing style 
                is influenced by your commercial perspective and your own publication experiences."""
-               
+
     def _apply_agent_review_biases(self, review: Dict) -> Dict:
         """Apply industry-specific biases to reviews"""
         # Industry agents prefer practical applications and scalability
@@ -314,9 +317,9 @@ class IndustryResearcher(SimulationAgent):
         return review
 
     def select_funding_programs(
-        self,
-        funding_programs: List['FundingProgram'],
-        success_history: Optional[Dict[str, float]] = None
+            self,
+            funding_programs: List['FundingProgram'],
+            success_history: Optional[Dict[str, float]] = None
     ) -> List[str]:
         """Select funding programs based on practical application focus and success rates"""
         if not self.expertise:
@@ -339,10 +342,10 @@ class IndustryResearcher(SimulationAgent):
         return [pid for pid, score in scores[:2] if score > 0.3]
 
     def prepare_funding_application(
-        self,
-        past_performance: int,
-        funding_programs: List['FundingProgram'],
-        selected_program_ids: List[str]
+            self,
+            past_performance: int,
+            funding_programs: List['FundingProgram'],
+            selected_program_ids: List[str]
     ) -> Dict:
         """Prepare industry funding application focused on practical impact"""
         if not selected_program_ids:
@@ -352,7 +355,7 @@ class IndustryResearcher(SimulationAgent):
         focus_topics = list(set([rd.topic for p in selected_programs for rd in p.focus_areas]))
 
         expertise_topics = [rd.topic if isinstance(rd, ResearchDirection) else str(rd)
-                          for rd in self.expertise]
+                            for rd in self.expertise]
 
         prompt = f"""You are an industry researcher applying for research funding.
 
@@ -421,12 +424,12 @@ class FreelancerAgent(SimulationAgent):
     """Freelancer agents primarily focus on authoring but may occasionally review"""
 
     def __init__(
-        self,
-        researcher_name: str,
-        funding_level: int = 30,
-        agent_id: str = None,
-        expertise_directions: Optional[List] = None,
-        llm: LLM = None
+            self,
+            researcher_name: str,
+            funding_level: int = 30,
+            agent_id: str = None,
+            expertise_directions: Optional[List] = None,
+            llm: LLM = None
     ):
 
         assert agent_id is not None, "agent_id is required"
@@ -437,29 +440,27 @@ class FreelancerAgent(SimulationAgent):
             llm=llm
         )
 
-        self.can_author = True   # Freelancers primarily write papers
-        self.can_review = True   # Freelancers can review, but less frequently invited
+        self.can_author = True  # Freelancers primarily write papers
+        self.can_review = True  # Freelancers can review, but less frequently invited
 
         # Store inherent expertise (3 research directions)
         self.expertise_directions = expertise_directions or []
-        
+
     def _get_personality_prompt(self) -> str:
         return """You are an independent researcher who challenges conventional wisdom 
                and pursues unconventional approaches. You value radical innovation, 
                interdisciplinary thinking, and paradigm-shifting discoveries. When reviewing,
                you appreciate bold ideas and are willing to champion unconventional work."""
-               
+
     def _apply_agent_review_biases(self, review: Dict) -> Dict:
         """Apply freelancer-specific biases to reviews"""
         # Freelancers appreciate novelty and unconventional approaches
-        if any(term in str(review.get('strengths', [])).lower() 
+        if any(term in str(review.get('strengths', [])).lower()
                for term in ['novel', 'innovative', 'unconventional', 'creative']):
             review['overall_score'] = min(10, review.get('overall_score', 5) + 1.0)
-            
+
         if 'lacks novelty' in str(review.get('weaknesses', [])).lower():
             # Strong penalty for lack of novelty
             review['overall_score'] = max(1, review.get('overall_score', 5) - 1.5)
-            
+
         return review
-
-

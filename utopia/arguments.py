@@ -15,7 +15,7 @@ def parse_arguments():
     parser.add_argument(
         '--output-dir',
         type=str,
-        default='./outputs',
+        default='outputs',
         help='Output directory for results (default: ./simulation_output)'
     )
     
@@ -27,11 +27,17 @@ def parse_arguments():
         default=False,
         help='Enable debug mode'
     )
+    parser.add_argument(
+        '--verbose',
+        action='store_true',
+        default=False,
+        help='Verbose mode'
+    )
     
     parser.add_argument(
         '--max_retries',
         type=int,
-        default=5,
+        default=10,
         help='Maximum number of retries for LLM calls (default: 5)'
     )
     
@@ -69,11 +75,29 @@ def parse_arguments():
         default=False,
         help='Use LangChain for RAG (by default, we use SentenceTransformer)'
     )
+    
+    parser.add_argument(
+        '--experiment_name',
+        type=str,
+        default='default',
+        help='Name of the experiment (default: default)'
+    )
+    parser.add_argument(
+        '--weighted_funding_assignment',
+        action='store_true',
+        help='Funding assignment is weighted by the maturity of the paper'
+    )
 
     args = parser.parse_args()
-    
+   
     if args.debug:
         args.output_dir = os.path.join(args.output_dir, 'debug')
+        
+    elif args.experiment_name:
+        args.output_dir = os.path.join(args.output_dir, args.experiment_name)
+    
+    else:
+        raise ValueError("Please specify the `experiment_name` or enable debug mode.")
         
     args.visual_dir = os.path.join(args.output_dir, 'visual')
     

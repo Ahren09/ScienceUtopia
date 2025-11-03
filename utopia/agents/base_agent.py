@@ -5,21 +5,24 @@ IMPORTANT: This creates NEW classes that extend existing AI-Scientist infrastruc
 WITHOUT modifying any original files.
 """
 
-import time
-import json
-import tempfile
-import subprocess
 import hashlib
+import logging
+import subprocess
+import time
+from typing import List, Dict, Set, Union
+
 import networkx as nx
-from typing import List, Dict
-from const import RESEARCH_COST, PAPER_SUBMISSION_COST, REVIEW_CRITERIA
 from langchain_core.documents import Document
-from utopia.models.models import LLM, GPT
 
-from utopia.config import SIMULATION_CONFIG
-
+from const import REVIEW_CRITERIA
 from utopia.agents.conference import Conference
+from utopia.agents.research_direction import ResearchDirection
+from utopia.config import SIMULATION_CONFIG
+from utopia.data.paper_tracker import PaperTracker
+from utopia.models.models import LLM
 from utopia.utils.data_utils import top_percentile
+
+logger = logging.getLogger(__name__)
 
 
 class MultiAgentEcosystem:
@@ -27,18 +30,19 @@ class MultiAgentEcosystem:
     Multi-agent ecosystem that manages scientific agents without inheriting from AgentManager
     to avoid complex dependency issues during Phase 1 testing
     """
+
     def __init__(self, agent_configs: Dict):
         # Initialize without inheriting from AgentManager for Phase 1 simplicity
         self.config = agent_configs
         self.citation_graph = nx.DiGraph()  # NetworkX graph for citations
         self.simulation_metrics = self._create_metrics_tracker()
         self.agent_population = {}  # Store all simulation agents
-        
+
     def remove_agent(self, agent_id: str):
         """Remove agent from ecosystem population"""
         assert self.agent_population[agent_id].is_active, f"Agent {agent_id} is already not active"
         self.agent_population[agent_id].is_active = False
-        
+
     def _create_metrics_tracker(self):
         """Initialize metrics tracking system"""
         return {
@@ -47,26 +51,26 @@ class MultiAgentEcosystem:
             'citation_evolution': [],
             'review_patterns': []
         }
-        
+
     def add_agent(self, agent):
         """Add agent to ecosystem population"""
         self.agent_population[agent.id] = agent
-        
+
     def get_agent_by_id(self, agent_id: str):
         """Get agent by ID"""
         return self.agent_population[agent_id]
-        
+
     def get_available_reviewers(self, exclude_agent_ids: List = None):
         """Get agents that can serve as reviewers"""
         exclude_agent_ids = exclude_agent_ids or []
-        return [agent for agent_id, agent in self.agent_population.items() 
-                if hasattr(agent, 'can_review') and agent.can_review 
+        return [agent for agent_id, agent in self.agent_population.items()
+                if hasattr(agent, 'can_review') and agent.can_review
                 and agent.id not in exclude_agent_ids]
-                
+
     def get_available_authors(self):
         """Get agents that can author papers"""
         return [agent for agent_id, agent in self.agent_population.items()
-                if hasattr(agent, 'can_author') and agent.can_author]
+                if hasattr(agent, 'can_author') and agent.can_author and agent.is_active]
 
     def to_dict(self) -> Dict:
         """Serialize ecosystem to dictionary (without LLM objects)
@@ -79,8 +83,18 @@ class MultiAgentEcosystem:
 
         agents_data = []
         for agent_id, agent in self.agent_population.items():
+            if agent.newest_direction is not None:
+                newest_direction = {
+                    'direction': agent.newest_direction['direction'].topic,
+                    'detailed_focus': agent.newest_direction.get('detailed_focus'),
+                    'reason': agent.newest_direction.get('reason')
+                }
+            else:
+                newest_direction = None
+
             agent_dict = {
                 'id': agent.id,
+                'type': agent.get_type(),
                 'resources': getattr(agent, 'resources', None),
                 'reputation': agent.reputation,
                 'memory_bank': agent.memory_bank,
@@ -88,11 +102,12 @@ class MultiAgentEcosystem:
                 'is_active': agent.is_active,
                 'can_author': agent.can_author,
                 'can_review': agent.can_review,
-                
+                'project_start_year': agent.project_start_year,
+                'project_end_year': agent.project_end_year,
+                'newest_direction': newest_direction,
             }
 
             if isinstance(agent, UniversityResearcher):
-                agent_dict['type'] = 'UniversityResearcher'
                 agent_dict['university_name'] = agent.university_name
                 agent_dict['expertise'] = [exp.topic for exp in agent.expertise]
                 agent_dict['funding_success_history'] = agent.funding_success_history
@@ -100,7 +115,6 @@ class MultiAgentEcosystem:
                 agent_dict['generate_research_proposal'] = agent.generate_research_proposal
 
             elif isinstance(agent, IndustryResearcher):
-                agent_dict['type'] = 'IndustryResearcher'
                 agent_dict['company_name'] = agent.company_name
                 agent_dict['expertise'] = [exp.topic for exp in agent.expertise]
                 agent_dict['funding_mode'] = agent.funding_mode
@@ -109,7 +123,6 @@ class MultiAgentEcosystem:
                 agent_dict['funding_success_history'] = agent.funding_success_history
 
             elif isinstance(agent, FundingAgency):
-                agent_dict['type'] = 'FundingAgency'
                 agent_dict['agency_name'] = agent.id
                 agent_dict['default_funding_rate'] = getattr(agent, 'default_funding_rate', None)
                 # Serialize funding programs
@@ -118,7 +131,8 @@ class MultiAgentEcosystem:
                     programs_data[prog_id] = {
                         'program_id': program.program_id,
                         'name': program.name,
-                        'research_directions': [rd.to_dict() if hasattr(rd, 'to_dict') else rd for rd in program.research_directions],
+                        'research_directions': [rd.to_dict() if hasattr(rd, 'to_dict') else rd for rd in
+                                                program.research_directions],
                         'funding_mode': program.funding_mode,
                         'budget': getattr(program, 'budget', None),
                         'budget_per_winner': getattr(program, 'budget_per_winner', None),
@@ -160,12 +174,25 @@ class MultiAgentEcosystem:
         ecosystem.simulation_metrics = data.get('simulation_metrics', ecosystem._create_metrics_tracker())
         # Reconstruct agents
         all_agent_data = data.get('agents', [])
-        
+
         from utopia.agents.research_direction import DIRECTIONS_DICT
         for agent_data in all_agent_data:
             agent_type = agent_data['type']
 
-            if agent_type == 'UniversityResearcher':
+            newest_direction_data = agent_data['newest_direction']
+            if newest_direction_data is None:
+                assert agent_type == "funding_agency"
+                newest_direction = None
+            else:
+                direction_topic = newest_direction_data['direction']
+                assert direction_topic in DIRECTIONS_DICT, f"Direction {direction_topic} not found in DIRECTIONS_DICT"
+                newest_direction = {
+                    'direction': DIRECTIONS_DICT[direction_topic],
+                    'detailed_focus': newest_direction_data.get('detailed_focus'),
+                    'reason': newest_direction_data.get('reason')
+                }
+
+            if agent_type == 'university':
                 # Reconstruct expertise
                 expertise = []
                 for direction in agent_data.get('expertise', []):
@@ -187,18 +214,21 @@ class MultiAgentEcosystem:
                 agent.memory_bank = agent_data.get('memory_bank', [])
                 agent.review_experiences = agent_data.get('review_experiences', [])
                 agent.is_active = agent_data.get('is_active', True)
+                agent.project_start_year = agent_data.get('project_start_year', 0)
+                agent.project_end_year = agent_data.get('project_end_year', 0)
+                agent.newest_direction = newest_direction
                 agent.funding_success_history = agent_data.get('funding_success_history', {})
                 agent.conflict_of_interest = set(agent_data.get('conflict_of_interest', []))
 
-            elif agent_type == 'IndustryResearcher':
+            elif agent_type == 'industry':
                 # Reconstruct expertise
                 expertise = []
                 for exp_data in agent_data.get('expertise', []):
                     if isinstance(exp_data, dict):
                         expertise.append(ResearchDirection.from_dict(exp_data))
                     else:
-                        assert direction in DIRECTIONS_DICT, f"Direction {direction} not found in DIRECTIONS_DICT"
-                        expertise.append(DIRECTIONS_DICT[direction])
+                        assert exp_data in DIRECTIONS_DICT, f"Direction {exp_data} not found in DIRECTIONS_DICT"
+                        expertise.append(DIRECTIONS_DICT[exp_data])
 
                 agent = IndustryResearcher(
                     researcher_name=agent_data['id'],
@@ -212,12 +242,15 @@ class MultiAgentEcosystem:
                 agent.memory_bank = agent_data.get('memory_bank', [])
                 agent.review_experiences = agent_data.get('review_experiences', [])
                 agent.is_active = agent_data.get('is_active', True)
+                agent.project_start_year = agent_data.get('project_start_year', 0)
+                agent.project_end_year = agent_data.get('project_end_year', 0)
+                agent.newest_direction = newest_direction
                 agent.budget = agent_data.get('budget', agent.budget)
                 agent.research_priorities = set(agent_data.get('research_priorities', []))
                 agent.conflict_of_interest = set(agent_data.get('conflict_of_interest', []))
                 agent.funding_success_history = agent_data.get('funding_success_history', {})
 
-            elif agent_type == 'FundingAgency':
+            elif agent_type == 'funding_agency':
                 agent = FundingAgency(
                     agency_name=agent_data['agency_name'],
                     funding_level=agent_data['resources'],
@@ -228,6 +261,9 @@ class MultiAgentEcosystem:
                 agent.memory_bank = agent_data.get('memory_bank', [])
                 agent.review_experiences = agent_data.get('review_experiences', [])
                 agent.is_active = agent_data.get('is_active', True)
+                agent.project_start_year = agent_data.get('project_start_year', 0)
+                agent.project_end_year = agent_data.get('project_end_year', 0)
+                agent.newest_direction = newest_direction
 
                 # Reconstruct funding programs
                 for prog_id, prog_data in agent_data.get('funding_programs', {}).items():
@@ -260,48 +296,39 @@ class SimulationAgent:
     """Base class for simulation agents"""
 
     def __init__(self, reputation: int,
-                 agent_id: str = None, llm: LLM = None):
+                 agent_id: str = None, llm: LLM = None, max_retries: int = 10):
         self.id = agent_id or f"agent_{int(time.time() * 1000)}"
-        self.reputation = reputation    # 1-10 scale
+        self.reputation = reputation  # 1-10 scale
         self.memory_bank = []  # Store experiences and thoughts from interactions
         self.review_experiences = []  # Track experiences as both author and reviewer
         self.llm = llm
         self.is_active = True
-        
-    def generate_research_idea(self, citation_context: List, research_focus: str = None) -> Dict:
-        """
-        WRAPPER around existing ai_scientist/perform_ideation_temp_free.py
-        Does NOT modify the original function
-        """
-        from utopia.perform_ideation_temp_free import generate_temp_free_idea
-        
-        # Check if agent has sufficient resources
-        if self.resources < RESEARCH_COST:
-            raise ValueError(f"Agent {self.id} has insufficient resources ({self.resources}) for research")
-        
-        # WRAPPER: Call existing ideation function without modification
-        # Add agent-specific behavior through parameters only
-        ideas = generate_temp_free_idea(
-            workshop_description=research_focus if research_focus else f"Research in {', '.join(self.specializations)}",
-            model=self._get_agent_model(),
-            max_num_generations=1,  # Use existing parameters
-            num_reflections=3       # Use existing parameters
-        )
-        
-        # POST-PROCESS: Add agent-specific filtering without changing original
-        agent_filtered_ideas = self._filter_ideas_by_specialization(ideas)
-        
-        # Deduct research cost for idea generation
-        self.resources = max(0, self.resources - RESEARCH_COST)
-        
-        return agent_filtered_ideas
-     
+        self.project_start_year = 0  # The year when the research project started
+        self.project_end_year = 0  # The year when the research paper will be ready for submission
+        self.newest_direction = None
+        self.max_retries = max_retries
+
     def update_resources(self, delta: float):
         """Update researcher resources"""
         assert isinstance(delta, (int, float)), "changes in funding level must be a valid number"
+        original_resources = self.resources
+        if self.resources + delta < 0:
+            logger.warning(f"[Resource] {self.id} runs out of funding - {original_resources} -> {self.resources} is negative.")
+            self.resources = 0
+            self.is_active = False
+            return
+        
         self.resources += delta
-        
-        
+        logger.debug(f"[Resource] {self.id} - {original_resources} -> {self.resources}")
+
+    def add_conflict_of_interest(self, other_researcher_names: Union[Set[str], List[str], str]):
+        """Add conflict of interest with other researchers"""
+        if isinstance(other_researcher_names, str):
+            other_researcher_names = {other_researcher_names}
+        elif isinstance(other_researcher_names, list):
+            other_researcher_names = set(other_researcher_names)
+        self.conflict_of_interest.update(other_researcher_names)
+
     def get_memory_context(self) -> str:
         """Get memory context for this agent"""
         result = ""
@@ -309,7 +336,7 @@ class SimulationAgent:
             result += f"""- Event: {memory['type']} (Year: {memory['year']}) - Thought: {memory['thought']}
 """
         return result
-        
+
     def review_paper(self, paper: Dict) -> Dict:
         """Generate review for a paper using LLM
 
@@ -321,14 +348,14 @@ class SimulationAgent:
         """
         expertise = [e.topic if hasattr(e, 'topic') else str(e) for e in getattr(self, 'expertise', [])]
         memory_context = self.get_memory_context()
-        
+
         # TODO: Generate topics for the papers
-        
+
         if memory_context:
             memory_context = f"""## Your Recent Experiences 
 {memory_context}
 """
-            
+
         else:
             memory_context = ""
 
@@ -341,7 +368,7 @@ Your Expertise: {', '.join(expertise)}
 Title: {paper.get('title', 'Unknown')}
 
 Abstract:
-{paper.get('content', '')}
+{paper.get('abstract', '')}
 
 Paper Topics: {', '.join(paper.get('topics', []))}
 
@@ -377,10 +404,9 @@ Provide a comprehensive review with:
             'arxiv_id': paper['id'],
             'review_time': time.time(),
         }
-        
 
         return review_json
-        
+
     def process_received_reviews(self, reviews: List[Dict], paper_id: str, year: int, average_scores_of_venue: dict):
         """Process reviews received for submitted paper and update memory
 
@@ -394,26 +420,26 @@ Provide a comprehensive review with:
 
         # Calculate average score
         avg_score = sum(r.get('overall_score', 0) for r in reviews) / len(reviews)
-        
+
         percentile = top_percentile(avg_score, list(average_scores_of_venue.values()))
-        
-        status_string = f"(Top {percentile:.1f}% of all papers" #, average score: {avg_score:.1f} on a scale of 1-5)"
+
+        status_string = f"(Top {percentile:.1f}% of all papers"  # , average score: {avg_score:.1f} on a scale of 1-5)"
 
         # Determine emotional response based on average score
-        if percentile <= 10: # percentile >= 4.0:
-            
+        if percentile <= 10:  # percentile >= 4.0:
+
             thought = f"My paper received excellent reviews {status_string}! This validates my research direction and boosts my confidence."
             memory_type = 'excellent_reviews_received'
-        elif percentile <= 30: # percentile >= 3.0:
+        elif percentile <= 30:  # percentile >= 3.0:
             thought = f"My paper received moderately good reviews {status_string}. There's room for improvement, but overall positive."
             memory_type = 'good_reviews_received'
-        elif percentile <= 50: # percentile >= 2.0:
+        elif percentile <= 50:  # percentile >= 2.0:
             thought = f"My paper received average reviews {status_string}. I need to work harder to improve my research quality."
             memory_type = 'average_reviews_received'
         elif percentile <= 70:
             thought = f"My paper received poor reviews {status_string}. This is disappointing."
             memory_type = 'poor_reviews_received'
-            
+
         else:
             thought = f"My paper received VERY harsh reviews {status_string}. This is too UNFAIR, harsh, and frustrating."
             memory_type = 'harsh_reviews_received'
@@ -429,7 +455,8 @@ Provide a comprehensive review with:
             'year': year,
         })
 
-    def decide_resubmission(self, rejected_papers: Dict[str, Dict], conferences: List[Conference], resubmission_cost: int = SIMULATION_CONFIG['conference']['resubmission_cost']) -> List[str]:
+    def decide_resubmission(self, rejected_papers: Dict[str, Dict], conferences: List[Conference],
+                            resubmission_cost: int = SIMULATION_CONFIG['conference']['resubmission_cost']) -> List[str]:
         """Decide which rejected papers to resubmit (costs 5 each)
 
         Returns:
@@ -442,7 +469,7 @@ Provide a comprehensive review with:
         for idx, (arxiv_id, p) in enumerate(rejected_papers.items()):
             paper_info = f"""### Paper {idx}
 Title: \"{p['title']}\"
-Abstract: {p['content'][:300]} ...
+Abstract: {p['abstract'][:300]} ...
 arXiv ID: \"{arxiv_id}\"
 Review History:
 """
@@ -451,7 +478,7 @@ Review History:
 """
 
             papers_info.append(paper_info)
-        prompt = f"""You are considering resubmitting some of your rejected papers. You have {self.resources} units of funding. Each resubmission costs {resubmission_cost} per paper.
+        prompt = f"""You are a researcher. You have submitted a few papers to previous conferences but were rejected. You are considering resubmitting some of your rejected papers. You have {self.resources} units of funding. Each resubmission costs {resubmission_cost} per paper.
 
 ## Previously Rejected Papers
 """
@@ -460,7 +487,7 @@ Review History:
         prompt += """
 ## Candidate Conferences
 
-Below are the candidate conferences you can resubmit to. For each paper, you MUST CHOOSE EXACTLY ONE of them that best suits the paper. Submitting to a conference with mismatch topics has a high chance of getting rejected, although not always.
+Below are the candidate conferences you can resubmit to. For each paper, you MUST CHOOSE EXACTLY ONE of the conferences that best suits the paper. Submitting to a conference with mismatch topics has a high chance of getting rejected, although not always.
 
 """
         candidate_conference_ids = set([conference.conference_id for conference in conferences])
@@ -469,9 +496,11 @@ Below are the candidate conferences you can resubmit to. For each paper, you MUS
 """
 
         prompt += """
-Please respond with a list of papers you want to RESUBMIT (the FULL URL) and its conference abbreviation (e.g. "NeurIPS" or "AAAI").
+## Your Task
+Please respond with a list of papers you want to RESUBMIT (the FULL URL) and its conference abbreviation (e.g. "NeurIPS" or "AAAI"). For each paper, if you decide to resubmit, you must choose exactly 1 conference that best suits the paper.
         
 ## Sample Response
+If you choose to resubmit, respond with the following JSON format:
 ```json
 {
     "resubmitted_papers": [{
@@ -484,12 +513,17 @@ Please respond with a list of papers you want to RESUBMIT (the FULL URL) and its
     }]
 }
 ```
+If you choose not to resubmit, respond with a json file that contains an empty list:
+```json
+{
+    "resubmitted_papers": []
+}
+```
 """
 
         result, _ = self.llm.generate(prompt=prompt, response_format="json_object")
         assert 'resubmitted_papers' in result
         result = result['resubmitted_papers']
-        
         resubmitted_paper_ids = [p['arxiv_id'] for p in result]
         assert set(resubmitted_paper_ids) <= set([p['id'] for id, p in rejected_papers.items()])
         conferences = [p['conference'] for p in result]
@@ -497,12 +531,12 @@ Please respond with a list of papers you want to RESUBMIT (the FULL URL) and its
         return result
 
     # Helper methods (private)
-    
+
     def _parse_pipeline_output(self, result: subprocess.CompletedProcess, output_dir: str) -> Dict:
         """Parse output from AI-Scientist pipeline"""
         if result.returncode != 0:
             raise RuntimeError(f"Pipeline failed: {result.stderr}")
-            
+
         # Try to read generated files
         import os
         paper_output = {
@@ -513,7 +547,7 @@ Please respond with a list of papers you want to RESUBMIT (the FULL URL) and its
             'stdout': result.stdout,
             'stderr': result.stderr
         }
-        
+
         # Check if output files exist and read them
         if os.path.exists(output_dir):
             for file in os.listdir(output_dir):
@@ -526,21 +560,21 @@ Please respond with a list of papers you want to RESUBMIT (the FULL URL) and its
                 elif file.endswith('.py') and 'experiment' in file:
                     with open(os.path.join(output_dir, file), 'r') as f:
                         paper_output['experiment_py'] = f.read()
-        
+
         return paper_output
-        
+
     def _add_traceable_citations(self, paper_output: Dict, references: List) -> Dict:
         """Ensure every paper has traceable citations with complete metadata"""
         citation_list = []
-        
+
         # Extract citations from paper content and enrich with metadata
         cited_papers = self._extract_citations_from_content(paper_output.get('writeup_md', ''))
-        
+
         for i, cited_paper in enumerate(cited_papers):
             # Create structured citation entry with traceable fields
             citation_entry = {
                 'id': cited_paper.get('paper_id', f"paper_{hashlib.md5(str(cited_paper).encode()).hexdigest()[:8]}"),
-                'title': cited_paper.get('title', f'Unknown Title {i+1}'),
+                'title': cited_paper.get('title', f'Unknown Title {i + 1}'),
                 'authors': cited_paper.get('authors', ['Unknown Author']),
                 'venue': cited_paper.get('venue', 'Unknown Venue'),
                 'year': cited_paper.get('year', 'Unknown Year'),
@@ -552,7 +586,7 @@ Please respond with a list of papers you want to RESUBMIT (the FULL URL) and its
                 'simulation_id': cited_paper.get('sim_id', None)  # For simulation-generated papers
             }
             citation_list.append(citation_entry)
-        
+
         # Add structured citation list to paper output
         paper_output['citations'] = citation_list
         paper_output['citation_metadata'] = {
@@ -561,26 +595,26 @@ Please respond with a list of papers you want to RESUBMIT (the FULL URL) and its
             'ai_papers_cited': len([c for c in citation_list if c['paper_type'] == 'ai_generated']),
             'citation_diversity_score': self._calculate_citation_diversity(citation_list)
         }
-        
+
         return paper_output
-        
+
     def _extract_citations_from_content(self, content: str) -> List[Dict]:
         """Extract citations from paper content - simplified implementation"""
         # Simple implementation - in practice would use more sophisticated parsing
         citations = []
         # For now, return empty list - would implement actual citation extraction
         return citations
-        
+
     def _calculate_citation_diversity(self, citation_list: List[Dict]) -> float:
         """Calculate citation diversity score"""
         if not citation_list:
             return 0.0
-        
+
         # Simple diversity measure: ratio of unique venues
         unique_venues = len(set(c['venue'] for c in citation_list))
         total_citations = len(citation_list)
         return unique_venues / total_citations if total_citations > 0 else 0.0
-        
+
     def _record_authoring_experience(self, idea: Dict, paper_output: Dict, year: int):
         """Record paper authoring experience"""
         self.memory_bank.append({
@@ -589,26 +623,25 @@ Please respond with a list of papers you want to RESUBMIT (the FULL URL) and its
             'expects_harsh': self._had_recent_negative_experience(),
             'year': year,
         })
-            
-        
+
     def _get_personality_prompt(self) -> str:
         """Get personality prompt for this agent - override in subclasses"""
         return f"You are a researcher specializing in {', '.join(self.specializations)}."
-        
-    
-        
+
     def _had_recent_negative_experience(self) -> bool:
         """Check if agent had recent negative review experiences"""
-        recent = [e for e in self.review_experiences if time.time() - e['timestamp'] < 86400*7]
+        recent = [e for e in self.review_experiences if time.time() - e['timestamp'] < 86400 * 7]
         return any(e.get('emotional_response') == 'negative' for e in recent)
-    
+
     def get_bio(self) -> str:
         """Get bio prompt for this agent"""
         expertise = [research_direction.topic for research_direction in self.expertise]
-        prompt = f"You are a researcher specializing in {', '.join(expertise)}."
+        prompt = f"You are a researcher specializing in {', '.join(expertise)}. Your current funding level is {self.resources}.\n"
         return prompt
-    
-    def get_paper_submission_prompt(self, candidate_papers: List[Document], year: int, conferences: List[Conference], paper_archive, max_papers: int = 10, previous_papers: List[str] = None) -> str:
+
+    def get_paper_submission_prompt(self, candidate_papers: List[Document], year: int, conferences: List[Conference],
+                                    direction: ResearchDirection, paper_tracker: PaperTracker, max_papers: int = 10,
+                                    previous_papers: List[str] = None) -> str:
         """
         Get research idea prompt for this agent
 
@@ -619,7 +652,12 @@ Please respond with a list of papers you want to RESUBMIT (the FULL URL) and its
             previous_papers: Optional list of preview strings for previously accepted papers
         """
         prompt = self.get_bio() + f"""
-You plan to do a project and submit a paper to a conference.
+        
+## Your Research Direction in This Round
+Detailed Focus: {direction['detailed_focus']}
+Keywords: {', '.join(direction['direction'].keywords)}
+
+You plan to do a research project and submit a paper to a conference.
 From the following candidate papers, please give me a paper ID that you want to submit. Then, give a conference name that you want to submit to.
 """
 
@@ -628,12 +666,11 @@ From the following candidate papers, please give me a paper ID that you want to 
 ## Previously Accepted Papers (for reference and citation)
 The following are previous papers you wrote, either accepted or rejected. You can use them to inspire your paper.
 """
-            previous_papers = paper_archive.get_papers_by_author(self.id)
+            previous_papers = paper_tracker.get_papers_by_author(self.id)
             previous_papers.sort(key=lambda x: x.year, reverse=True)
             for i, paper in enumerate(previous_papers[:10], 1):  # Show top 5
                 latest_score = paper.review_history[-1]['score'] if paper.review_history else 0.0
-                prompt += f"{i}. \"{paper.title}\" - Year: {paper.year}, Conference: {paper.conference} ({paper.decision} with score {latest_score:.2f})\n"
-
+                prompt += f"{i}. \"{paper.title}\" - Year: {paper.year}, Conference: {paper.conference} ({paper.status} with score {latest_score:.2f})\n"
 
         # Add previously accepted papers if available (Year 2+)
         if previous_papers and len(previous_papers) > 0:
@@ -652,8 +689,8 @@ The following papers were accepted in previous years and can be cited in your wo
 ## Candidate Papers
 """
         for i, paper in enumerate(candidate_papers[:max_papers]):
-            prompt += f"""### Paper {i+1}
-ID: {i+1}
+            prompt += f"""### Paper {i + 1}
+ID: {i + 1}
 arXiv ID: {paper.metadata['id']}
 Title: {paper.metadata['title']}
 Abstract: {paper.page_content}
@@ -661,8 +698,7 @@ Abstract: {paper.page_content}
 """
 
         prompt += """## Candidate Conferences
-Below are the candidate conferences you can submit to. You MUST CHOOSE EXACTLY ONE of them that best suits the paper. Submitting to a conference with mismatch topics has a high chance of getting rejected, although not always.
-
+Below are the candidate conferences you can submit to. You MUST CHOOSE EXACTLY ONE of them that best suits the paper.
 """
         candidate_conference_ids = set([conference.conference_id for conference in conferences])
         for conference in conferences:
@@ -670,14 +706,29 @@ Below are the candidate conferences you can submit to. You MUST CHOOSE EXACTLY O
 """
         prompt += """
 ## Your Task
-Please respond with a paper ID you want to submit (the FULL URL) and its conference abbreviation name (e.g. "NeurIPS" or "AAAI").
+Based on the detailed focus of your research direction, respond with a paper ID you want to submit (the FULL URL) and its conference abbreviation name (e.g. "NeurIPS" or "AAAI"). 
+
+NOTE: You can also choose to not submit any paper to any conference, but this must be due to funding issues or competition being too fierce. Reasons such as "no paper matches my expertise" is not a valid reason.
 
 ## Sample Response
+
+If you choose to submit, respond with the following JSON format:
 ```json
 {
     "id": 1,
-    "arxiv_id": "https://arxiv.org/abs/2407.00005v1", <- MUST be the full URL, including the "https://" prefix
-    "conference": "NeurIPS"  <- MUST be one of the candidate conferences listed above
+    "arxiv_id": "https://arxiv.org/abs/2407.00005v1", <- MUST be the full URL, including the "https://", prefix
+    "conference": "NeurIPS",  <- MUST be one of the candidate conferences listed above
+    "reason": "...", <- Reason for submitting this particular paper to this particular conference
+}
+```
+
+If you choose not to submit (only due to funding issues), explain using factors such as funding, competition, etc. and respond with the following JSON format:
+```json
+{
+    "id": 1,
+    "arxiv_id": "DO_NOT_SUBMIT", <- MUST be the string "DO_NOT_SUBMIT"
+    "conference": "DO_NOT_SUBMIT", <- MUST be the string "DO_NOT_SUBMIT"
+    "reason": "...", <- Reason for not submitting any paper to any conference. 
 }
 ```
 """
@@ -697,18 +748,22 @@ Please respond with a paper ID you want to submit (the FULL URL) and its confere
         }
         return prompt, response_format
 
-
-    def get_potential_cited_papers_prompt(self, paper: Dict, candidate_papers: List[Dict], max_papers: int = 10) -> str:
+    def get_potential_cited_papers_prompt(self, paper: Dict, direction: ResearchDirection, candidate_papers: List[Dict], max_papers: int = 10) -> str:
         """
         Get potential cited papers prompt for this agent
         """
-        prompt = f"""
-Now that you have submitted the following paper, please give me a list of potential cited papers that you want to cite. NOTE: It is fine if you do not cite any papers due to topic mismatch.
+
+        prompt = self.get_bio() + f"""
+You did a research project and submitted the following paper to a conference. Please give me a list of potential cited papers that you want to cite. NOTE: It is fine if you do not cite any papers due to topic mismatch.
+
+## Your Research Direction in This Round
+Detailed Focus: {direction['detailed_focus']}
+Keywords: {', '.join(direction['direction'].keywords)}
 
 ## Your Submitted Paper
 ID: {paper['id']}
 Title: {paper['title']}
-Abstract: {paper['content']}
+Abstract: {paper['abstract']}
 Topics: {', '.join(paper['topics'])}
 
 
@@ -716,11 +771,11 @@ Topics: {', '.join(paper['topics'])}
 
 """
         for i, cited_paper in enumerate(candidate_papers[:max_papers]):
-            prompt += f"""### Paper {i+1}
-ID: {i+1}
+            prompt += f"""### Paper {i + 1}
+ID: {i + 1}
 arXiv ID: {cited_paper['id']}
 Title: {cited_paper['title']}
-Abstract: {cited_paper['content'][:300]}...
+Abstract: {cited_paper['abstract'][:300]}...
 
 """
 
@@ -739,6 +794,60 @@ Abstract: {cited_paper['content'][:300]}...
 
         return prompt
 
+    def get_self_citation_prompt(self, paper: Dict, direction: ResearchDirection, own_papers: List) -> str:
+        """
+        Get self-citation prompt for this agent
 
+        Args:
+            paper: Current paper being submitted
+            direction: Current research direction
+            own_papers: List of agent's own previously accepted papers
 
-    
+        Returns:
+            Prompt string asking agent to select their own papers to cite
+        """
+        if not own_papers:
+            return None
+
+        prompt = self.get_bio() + f"""
+You submitted a paper to a conference. Please decide if you want to cite any of your own previous work.
+
+## Your Current Paper
+Title: {paper['title']}
+Abstract: {paper['abstract']}
+Topics: {', '.join(paper['topics'])}
+
+## Your Research Direction
+Detailed Focus: {direction['detailed_focus']}
+Keywords: {', '.join(direction['direction'].keywords)}
+
+## Your Previous Accepted Papers
+
+"""
+        for i, own_paper in enumerate(own_papers):
+            latest_score = own_paper.review_history[-1]['score'] if own_paper.review_history else 0.0
+            prompt += f"""### Paper {i + 1}
+arXiv ID: {own_paper.id}
+Title: {own_paper.title}
+Abstract: {own_paper.abstract[:300]}...
+Year: {own_paper.year}
+"""
+
+        prompt += """
+## Sample Response
+If you want to cite any of your own previous work, respond with the following JSON format:
+```json
+{
+    "self_citations": [ <- arXiv IDs of your own papers you want to cite. Return empty list if none are relevant
+        "https://arxiv.org/abs/2407.00005v1",
+        "https://arxiv.org/abs/2407.00006v1"
+    ]
+}
+```
+If you do not want to cite any of your own previous work, respond with an empty list:
+```json
+{
+    "self_citations": []
+}
+"""
+        return prompt

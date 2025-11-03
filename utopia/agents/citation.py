@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import Dict
 
+
 @dataclass(frozen=True)
 class Citation:
     """Citation entry - frozen to allow use in sets and as dict keys"""
@@ -21,4 +22,3 @@ class Citation:
             current_paper_id=data['current_paper_id'],
             cited_paper_id=data['cited_paper_id']
         )
-    

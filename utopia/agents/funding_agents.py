@@ -1,14 +1,14 @@
 """Funding agents and systems for academic and industry funding"""
+import logging
 import random
-from typing import Dict, Set, List, Optional
+import traceback
 from collections import Counter
+from typing import Dict, Set, List
+
+from utopia.config import SIMULATION_CONFIG
+from utopia.models.models import LLM
 from .base_agent import SimulationAgent
 from .research_direction import ResearchDirection
-from utopia.models.models import LLM
-from utopia.config import SIMULATION_CONFIG
-import traceback
-import json
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -16,20 +16,26 @@ logger = logging.getLogger(__name__)
 class IndustryFundingSystem:
     """Manages industry self-funding through performance and topic alignment"""
 
-    def __init__(self, base_budget: int = 20, acceptance_bonus: int = 20, rejection_penalty: int = 10, hot_window_years: int = 2):
+    def __init__(self, base_budget: int = 20, acceptance_bonus: int = 20, rejection_penalty: int = 10,
+                 hot_window_years: int = 2):
         self.base_budget = base_budget
         self.acceptance_bonus = acceptance_bonus
         self.rejection_penalty = rejection_penalty
         self.hot_window_years = hot_window_years
         self.hot_topics: Dict[str, float] = {}
 
-    def update_budget(self, accepted: int, rejected: int, citations: List[int]) -> float:
+    def update_budget(self, funding_per_unit: int, accepted: int, maturity: int, weighted_funding_assignment: bool = False) -> float:
         """Update industry lab budget based on performance"""
-        new_budget = self.base_budget + self.acceptance_bonus * accepted - self.rejection_penalty * rejected
         
-        # TODO: Add citation impcts
+        assert maturity > 0, f"Maturity must be greater than 0. Got {maturity}"
+        # new_budget = self.base_budget + self.acceptance_bonus * accepted - self.rejection_penalty * rejected
+        if weighted_funding_assignment:
+            new_budget = funding_per_unit * accepted * maturity  # We assume that industry researchers are awarded only if they have accepted papers
+        else:
+            new_budget = funding_per_unit * accepted
+
         return new_budget
-    
+
     def evaluate_proposal(self, keywords: Set[str], priorities: Set[str], budget: float, amount: float) -> bool:
         """Decide whether to fund a proposal (heuristic-based)"""
         if budget < amount:
@@ -79,14 +85,14 @@ class FundingProgram:
     """Represents a specific funding program offered by a funding agency"""
 
     def __init__(
-        self,
-        program_id: str,
-        name: str,
-        research_directions: List[ResearchDirection],
-        funding_mode: str = "fixed_rate",
-        budget: int = None,
-        budget_per_winner: int = None,
-        funding_rate: float = None
+            self,
+            program_id: str,
+            name: str,
+            research_directions: List[ResearchDirection],
+            funding_mode: str = "fixed_rate",
+            budget: int = None,
+            budget_per_winner: int = None,
+            funding_rate: float = None
     ):
         self.program_id = program_id
         self.name = name
@@ -96,8 +102,10 @@ class FundingProgram:
         if funding_mode == "fixed_budget":
             self.budget = budget if budget is not None else SIMULATION_CONFIG['funding']['default_budget']
         elif funding_mode == "fixed_rate":
-            self.funding_rate = funding_rate if funding_rate is not None else SIMULATION_CONFIG['funding']['default_funding_rate']
-            self.budget_per_winner = budget_per_winner if budget_per_winner is not None else SIMULATION_CONFIG['funding']['academic_base_budget']
+            self.funding_rate = funding_rate if funding_rate is not None else SIMULATION_CONFIG['funding'][
+                'default_funding_rate']
+            self.budget_per_winner = budget_per_winner if budget_per_winner is not None else \
+            SIMULATION_CONFIG['funding']['academic_base_budget']
         else:
             raise ValueError(f"Unknown funding mode: {funding_mode}")
 
@@ -114,19 +122,24 @@ class FundingProgram:
 class FundingAgency(SimulationAgent):
     """Funding agents primarily review and allocate resources"""
 
-    def __init__(self, agency_name: str, funding_level: int = 100, llm: LLM = None, default_funding_rate: float = None):
+    def __init__(self, agency_name: str, funding_level: int = 100, llm: LLM = None, default_funding_rate: float = None, max_retries: int = 10):
         super().__init__(
             reputation=8,
             agent_id=agency_name,
-            llm=llm
+            llm=llm,
+            max_retries=max_retries
         )
         self.funding_priorities = []
         self.risk_aversion = "moderate"
         self.can_author = False
         self.can_review = False
-        self.default_funding_rate = default_funding_rate if default_funding_rate is not None else SIMULATION_CONFIG['funding']['default_funding_rate']
+        self.default_funding_rate = default_funding_rate if default_funding_rate is not None else \
+        SIMULATION_CONFIG['funding']['default_funding_rate']
         self.funding_programs: Dict[str, FundingProgram] = {}
         self._initialize_funding_programs(agency_name)
+
+    def get_type(self) -> str:
+        return "funding_agency"
 
     def _get_personality_prompt(self) -> str:
         return """You are a funding agency representative who evaluates research from a strategic funding perspective,
@@ -246,12 +259,11 @@ class FundingAgency(SimulationAgent):
                     funding_rate=self.default_funding_rate
                 )
             }
-            
-            
+
     def evaluate_funding_applications(
-        self,
-        applications: List[Dict],
-        submitted_papers_dict: Dict[str, Dict]
+            self,
+            applications: List[Dict],
+            submitted_papers_dict: Dict[str, Dict]
     ) -> List[Dict]:
         """Evaluate funding applications using simplified funding modes
 
@@ -265,28 +277,28 @@ class FundingAgency(SimulationAgent):
         Returns:
             List of funding decisions
         """
-        decisions = []
-        
+
         # Group applications by program
         program_to_applications = {}
-        
+
         # Populate program_to_applications from the applications format
-        for author_applications in applications:
-            author = author_applications['author']
-            
+        for apps in applications:
+
             # Each author_applications dict contains program_id -> application_data
-            for program_id, application_data in author_applications.items():
-                if program_id == 'author' or not application_data['submit']:
+            for program_id, application_data in apps.items():
+
+                if not application_data['submit']:
                     continue
-                    
+
+                author = application_data['author']
+
                 if program_id not in program_to_applications:
                     program_to_applications[program_id] = []
-                
+
                 # Add author info to the application
-                application_data['author'] = author
                 application_data['applicant_id'] = author.id
                 program_to_applications[program_id].append(application_data)
-        
+
         winners_all_programs = {}
         # Process each program's applications using LLM to decide winners
         for program_id, apps in program_to_applications.items():
@@ -295,38 +307,33 @@ class FundingAgency(SimulationAgent):
             # Find the corresponding program object
             program = self.funding_programs[program_id]
             logger.info(f"Eval funding apps for {program_id}")
-            
-            # Calculate number of winners based on funding mode
-            if program.funding_mode == "fixed_rate":
-                num_winners = max(1, round(len(apps) * program.funding_rate))
-            
-            else:  # fixed_budget mode
-                raise NotImplementedError("Fixed budget mode is not supported for evaluation")
-                # For fixed budget, we'll let LLM decide but cap at reasonable number
-                num_winners = min(len(apps), max(1, len(apps) // 2))
-            
+
             # Prepare applications for LLM evaluation
             applications_text = ""
             for i, app in enumerate(apps):
                 author = app.get('author')
                 expertise_topics = [rd.topic if isinstance(rd, ResearchDirection) else str(rd)
-                                  for rd in (author.expertise if author and hasattr(author, 'expertise') else [])]
+                                    for rd in (author.expertise if author and hasattr(author, 'expertise') else [])]
+
+                accepted_papers = [paper for paper in app['relevant_projects'] if paper['status'] == 'accept']
+                rejected_papers = [paper for paper in app['relevant_projects'] if paper['status'] == 'reject']
                 
-                accepted_papers = [paper for paper in app['relevant_projects'] if paper['status'] == 'accepted']
-                rejected_papers = [paper for paper in app['relevant_projects'] if paper['status'] == 'rejected']
-                past_performance = f"""{len(accepted_papers)} accepted papers, {len(rejected_papers)} rejected papers.
+                if len(accepted_papers) == 0 and len(rejected_papers) == 0:
+                    past_performance = "The agent has no research projects completed yet."
+                past_performance = f"""The agent has completed {len(accepted_papers) + len(rejected_papers)} research projects, with {len(accepted_papers)} accepted papers and {len(rejected_papers)} rejected papers.
+                
 """
-                
+
                 if len(accepted_papers) > 0:
-                    past_performance += "- Recent accepted papers:\n"
+                    past_performance += "### Recent accepted papers:\n"
                     for paper in accepted_papers:
                         past_performance += f" - {submitted_papers_dict[paper['arxiv_id']]['title']}\n"
-                
+
                 if len(rejected_papers) > 0:
-                    past_performance += "- Recent rejected papers:\n"
+                    past_performance += "### Recent rejected papers:\n"
                     for paper in rejected_papers:
                         past_performance += f" - {submitted_papers_dict[paper['arxiv_id']]['title']}\n"
-                applications_text += f"""### Application {i+1}
+                applications_text += f"""### Application {i + 1}
 Applicant ID: {app['applicant_id']}
 Research Proposal: {app.get('research_proposal', 'No proposal provided')}
 Expertise: {', '.join(expertise_topics)}
@@ -335,22 +342,33 @@ Past Performance:
 {past_performance}
 
 """
-            
+
             # Create LLM prompt for funding decisions
             focus_topics = [rd.topic for rd in program.research_directions]
-            
+
+            # Extract all valid applicant IDs
+            valid_ids = [app['applicant_id'] for app in apps]
+            valid_ids_text = '\n'.join([f"  - {aid}" for aid in valid_ids])
+
             sample_response = """
 ```json
 {
-    "winners": [{
+    "ranked_applications": [{  <- Must be a ranked list according to preferences.
         "id": "University_Researcher_888", <- Must be EXACTLY the same as the applicant_id in the application
-        "reason": "Reason for selection" <- a 1-sentence brief explanation for why this applicant is selected
+        "rank": 1, <- Must be 1.
+        "reason": "Reason for this ranking" <- a 1-sentence brief explanation for the ranking
     },
     {
         "id": "University_Researcher_404",
-        "reason": "Reason for selection"
+        "rank": 2, <- Must be 2
+        "reason": "Reason for this ranking"
     },
     ...
+    {
+        "id": "Industry_Researcher_325",
+        "rank": N, <- Must be N
+        "reason": "Reason for this ranking"
+    },
     ]
 }
 ```
@@ -359,11 +377,11 @@ Past Performance:
 
 ## Program Details
 Program Focus Areas: {', '.join(focus_topics)}
-You MUST select EXACTLY {num_winners} winner(s) from the {len(apps)} applications.
-
 
 ## Selection Criteria
-Evaluate all applications and select the top {num_winners} winners, from the most preferred to the least preferred. 
+You MUST rank ALL {len(apps)} applications from most preferred (rank 1) to least preferred (rank {len(apps)}).
+
+Based on the following criteria, provide a complete ranking of all applications:
 1. Alignment with program focus areas
 2. Research quality and innovation potential
 3. Past performance and track record. Focus more on recent works and accepted papers. Focus less on older works and rejected papers.
@@ -375,19 +393,56 @@ Evaluate all applications and select the top {num_winners} winners, from the mos
 ## Sample Response
 {sample_response}
 """
-            winners = None
-            try:
-                result, message_history = self.llm.generate(prompt=prompt)
-                
-                winners = result.get('winners', [])
-                assert len(winners) == num_winners
-                # Ensure we don't exceed the number of applications
-                winners_all_programs[program_id] = winners[:len(apps)]
-                
-            except Exception as e:
-                traceback.print_exc()
-                # Fallback: select first N applications
+            ranked_apps = None
+            max_retries = self.max_retries
+            for retry in range(self.max_retries):
+                try:
+                    result, message_history = self.llm.generate(prompt=prompt)
 
+                    ranked_apps = result.get('ranked_applications', [])
+
+                    # Validate count
+                    if len(ranked_apps) < len(apps) // 2:
+                        if retry < self.max_retries - 1:
+                            logger.error(f"Expected {len(apps)} ranked applications, got {len(ranked_apps)}. Retrying... (attempt {retry + 1}/{max_retries})")
+                            continue
+                        else:
+                            raise AssertionError(f"Expected {len(apps)} ranked applications, got {len(ranked_apps)}")
+
+                    # Validate all application IDs are present
+                    ranked_ids = {app['id'] for app in ranked_apps}
+                    expected_ids = {app['applicant_id'] for app in apps}
+                    
+                    
+
+                    if ranked_ids != expected_ids:
+                        
+                        logger.debug(f"Ranked IDs (length: {len(ranked_ids)}): {ranked_ids}")
+                        logger.debug(f"Expected IDs (length: {len(expected_ids)}): {expected_ids}")
+                        ranked_apps = [app for app in ranked_apps if app['id'] in expected_ids & ranked_ids]
+                        
+                        for id in expected_ids - ranked_ids:
+                            ranked_apps.append({
+                                'id': id,
+                                'rank': len(ranked_apps) + 1,
+                                'reason': ""
+                            })
+                    # Sort by rank to ensure proper ordering (rank 1 is most =
+                    ranked_apps_sorted = sorted(ranked_apps, key=lambda x: x.get('rank', float('inf')))
+                    num_winners = max(1, int(len(ranked_apps_sorted) * program.funding_rate))
+
+                    ranked_apps_sorted = ranked_apps_sorted[:num_winners]
+                    winners_all_programs[program_id] = ranked_apps_sorted
+                    break  # Success, exit retry loop
+
+                except Exception as e:
+                    if retry == max_retries - 1:
+                        logger.error(f"Error evaluating funding applications for {program_id} after {max_retries} attempts: {e}")
+                        traceback.print_exc()
+                        # Fallback: select first N applications
+                        winners_all_programs[program_id] = []
+                    else:
+                        logger.warning(f"Error on attempt {retry + 1}/{max_retries}: {e}")
+                        continue
             
-        
         return winners_all_programs

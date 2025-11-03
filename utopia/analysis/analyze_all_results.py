@@ -20,7 +20,7 @@ def analyze_citations(data: Dict[str, Any]) -> Dict[str, Any]:
 
     # Build lookups
     agent_lookup = {agent['id']: agent for agent in data['ecosystem_data']['agents']}
-    papers_list = data['paper_archive']['papers']
+    papers_list = data['paper_tracker']['papers']
 
     for paper_data in papers_list:
         paper_id = paper_data['id']
@@ -39,13 +39,13 @@ def analyze_citations(data: Dict[str, Any]) -> Dict[str, Any]:
 def analyze_papers(data: Dict[str, Any]) -> Dict[str, Any]:
     """Analyze paper statistics"""
     yearly_results = data['yearly_results']
-    papers_list = data['paper_archive']['papers']
+    papers_list = data['paper_tracker']['papers']
 
     return {
         'total_submitted': sum(r['paper_submission']['num_papers_submitted'] for r in yearly_results),
         'total_accepted': sum(r['decisions']['total_accepted'] for r in yearly_results),
         'total_papers': len(papers_list),
-        'acceptance_rate': sum(1 for p in papers_list if p['decision'] == 'accept') / len(papers_list) if papers_list else 0
+        'acceptance_rate': sum(1 for p in papers_list if p['status'] == 'accept') / len(papers_list) if papers_list else 0
     }
 
 
@@ -107,7 +107,7 @@ class SimulationAnalyzer:
         """Load from simulation object"""
         self.data = {
             'yearly_results': sim.yearly_results,
-            'paper_archive': sim.paper_archive.to_dict(),
+            'paper_tracker': sim.paper_tracker.to_dict(),
             'citations': sim.citation_tracker.citations,
             'ecosystem_data': sim.ecosystem.to_dict(),
             'industry_funding_system': {'funding_mode': sim.industry_funding_mode}
@@ -120,18 +120,36 @@ class SimulationAnalyzer:
 
 def main():
     """CLI entry point"""
-    parser = argparse.ArgumentParser(description="Analyze simulation results")
-    parser.add_argument('--output-dir', type=str, required=True, help='Output directory')
-    parser.add_argument('--year', type=int, default=None, help='Year to analyze')
-    parser.add_argument('--verbose', action='store_true', help='Verbose logging')
-    args = parser.parse_args()
+    from run_simulation import Simulation
+    from utopia.arguments import parse_arguments
+    from utopia.utils.generail_utils import project_setup
 
-    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
-                       format='%(asctime)s - %(levelname)s - %(message)s')
+    args = parse_arguments()
+    project_setup()
+    simulation = Simulation(
+        llm=None,
+        num_years=args.num_years,
+        output_dir=args.output_dir,
+        debug=args.debug,
+        industry_funding_mode=args.industry_funding_mode,
+        always_rerun=args.always_rerun,
+        use_langchain=args.use_langchain
+    )
 
-    data = load_checkpoint(args.output_dir, args.year)
-    if data:
-        generate_report(data, str(Path(args.output_dir) / "simulation_report.json"))
+
+    success = simulation.load_checkpoint(year=args.num_years)
+    if success:
+        # Generate analysis report
+        analyzer = SimulationAnalyzer(output_dir=args.output_dir)
+        analyzer.load_from_simulation(simulation)
+        analyzer.generate_report(str(Path(args.output_dir) / "simulation_report.json"))
+
+        # Generate visualizations using the same simulation object
+        logger.info("Generating visualizations...")
+        from utopia.visual.visualizer import VisualizationOrchestrator
+        visualizer = VisualizationOrchestrator(simulation, output_dir=args.output_dir)
+        visualizer.generate_all_plots()
+        logger.info("Analysis and visualizations complete!")
 
 
 if __name__ == '__main__':

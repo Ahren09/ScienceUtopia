@@ -10,6 +10,11 @@ import json
 import argparse
 import torch
 
+import logging
+import warnings
+import pandas as pd
+
+
 def check_cwd():
     """
     Checks if the current working directory is the repository root directory (ScienceUtopia/)
@@ -51,11 +56,65 @@ def set_seed(seed: int = 42, use_torch: bool = True):
             print("Fail to import torch. Skipping torch seed setting")
 
 
+
+def print_colored(text, color):
+    # Define ANSI color codes
+    colors = {
+        "black": "\033[30m",
+        "red": "\033[31m",
+        "green": "\033[32m",
+        "yellow": "\033[33m",
+        "blue": "\033[34m",
+        "magenta": "\033[35m",
+        "cyan": "\033[36m",
+        "white": "\033[37m",
+        "reset": "\033[0m"  # Reset to default color
+    }
+
+    # Get the color code from the dictionary (default to reset if not found)
+    color_code = colors.get(color.lower(), colors["reset"])
+
+    # Print the colored text
+    print(f"{color_code}{text}{colors['reset']}")
+    
+class ColorFormatter(logging.Formatter):
+    COLORS = {
+        'DEBUG': '\033[36m',    # Cyan
+        'INFO': '\033[32m',     # Green
+        'WARNING': '\033[33m',  # Yellow
+        'ERROR': '\033[31m',    # Red
+        'CRITICAL': '\033[41m', # Red background
+    }
+    RESET = '\033[0m'
+
+    def format(self, record):
+        log_fmt = '%(levelname)s | %(asctime)s | %(name)s | %(message)s'
+        formatter = logging.Formatter(log_fmt, datefmt='%m-%d %H:%M:%S')
+        log_msg = formatter.format(record)
+
+        color = self.COLORS.get(record.levelname, self.RESET)
+        return f"{color}{log_msg}{self.RESET}"
+
+
 def project_setup():
     check_cwd()
-    import logging
-    import warnings
-    import pandas as pd
+    
+    
+    # Create handler and set formatter
+    handler = logging.StreamHandler()
+    handler.setFormatter(ColorFormatter())
+
+    # Setup logging
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format='%(levelname)s | %(asctime)s | %(filename)s:%(lineno)d - %(message)s',
+        datefmt='%m-%d %H:%M:%S',
+        handlers=[handler]
+    )
+
+    for package_name in ["urllib3", "httpx", "httpcore", "openai", "langchain", "matplotlib", "PIL", "h5py"]:
+        logging.getLogger(package_name).setLevel(logging.ERROR)
+        
     warnings.simplefilter(action='ignore', category=FutureWarning)
     pd.set_option('display.max_rows', 40)
     pd.set_option('display.max_columns', 20)

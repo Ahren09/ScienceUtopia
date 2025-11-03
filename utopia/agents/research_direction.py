@@ -5,14 +5,13 @@ Each agent has inherent expertise (3 research directions sampled at initializati
 When selecting research directions, agents randomly sample from their expertise.
 """
 
-from typing import List, Dict, Optional
 import random
-from dataclasses import dataclass
-from utopia.data.paper_archive import PaperArchive
-import json
-from tqdm import tqdm
-import traceback
 import time
+from dataclasses import dataclass
+from typing import List, Dict, Optional
+import traceback
+
+from utopia.data.paper_tracker import PaperTracker
 
 
 @dataclass
@@ -51,9 +50,9 @@ class ResearchDirection:
 
 
 def initialize_agent_expertise(
-    agents: List,
-    directions: Optional[List[ResearchDirection]] = None,
-    num_expertise: int = 3
+        agents: List,
+        directions: Optional[List[ResearchDirection]] = None,
+        num_expertise: int = 3
 ) -> None:
     """Initialize each agent's inherent expertise by randomly sampling research directions
 
@@ -76,8 +75,8 @@ def initialize_agent_expertise(
 
 
 def assign_directions_batch(
-    agents: List,
-    directions: Optional[List[ResearchDirection]] = None
+        agents: List,
+        directions: Optional[List[ResearchDirection]] = None
 ) -> Dict[str, ResearchDirection]:
     """Assign research directions to all agents simultaneously
 
@@ -98,17 +97,21 @@ def assign_directions_batch(
     assignments = {}
     for agent in agents:
         # Randomly select from agent's expertise
-        assignments[agent.id] = random.choice(agent.expertise)
+        assignments[agent.id] = {
+            "direction": random.choice(agent.expertise),
+            "detailed_focus": None,
+            "reason": None,
+        }
 
     return assignments
 
 
 def assign_directions_individual(
-    agent, # SimulationAgent
-    year: int,
-    paper_archive: PaperArchive,
-    candidate_directions: List[ResearchDirection] = None,
-    average_funding_level: float = None
+        agent,  # SimulationAgent
+        year: int,
+        paper_tracker: PaperTracker,
+        candidate_directions: List[ResearchDirection] = None,
+        average_funding_level: float = None
 ) -> Dict[str, ResearchDirection]:
     """Assign research directions one agent at a time using LLM-based selection
 
@@ -130,53 +133,67 @@ def assign_directions_individual(
     """
     if not candidate_directions:
         candidate_directions = agent.expertise
-        
+
     core_expertise = []
     related_expertise = set()
     for direction in agent.expertise:
         core_expertise.append(direction.topic)
         related_expertise.update(direction.related_topics)
-    
+
     related_expertise = list(related_expertise)
-    
+
     candidate_directions = core_expertise + related_expertise
+
+    past_accepted_papers, past_rejected_papers = paper_tracker.get_papers_by_decision(agent.id)
     
-    past_accepted_papers = []
-    past_rejected_papers = []
+    if len(past_accepted_papers) > 0 or len(past_rejected_papers) > 0:
+        print()
 
     institution_name = agent.university_name if hasattr(agent, 'university_name') else agent.company_name
 
-    prompt = f"""You are a researcher at {institution_name} trying to decide the research direction of your next project.
+    prompt = f"""You are a researcher at {institution_name} trying to decide the research direction of your next project. 
+
 """
 
     if len(past_accepted_papers) > 0:
 
         prompt += f"""## Your Past Publications (Accepted Papers)
+The following are your past accepted papers. You can use them to inspire your next project. Ratings in the conference reviews are from 1 to 5.
 """
         for paper in past_accepted_papers:
-            prompt += f"  - {paper.get('title', 'Untitled')} (Conference: {paper.get('conference', 'Unknown')})\n"
+            prompt += f"  - \"{paper.title}\" (Conference: {paper.conference}). Average score: {paper.review_history[-1]['score']:.2f}. Abstract: {paper.abstract[:300]} ...\n"
 
     if len(past_rejected_papers) > 0:
         prompt += f"""
 ## Your Past Rejected Papers
+The following are your past rejected papers. You can use them to learn from your mistakes and improve your next project. Ratings in the conference reviews are from 1 to 5.
 """
     for paper in past_rejected_papers:
-        prompt += f"  - {paper.get('title', 'Untitled')} (Conference: {paper.get('conference', 'Unknown')}), Average Score: {paper.get('average_score', 'N/A')}\n"
+        prompt += f"  - \"{paper.title}\". Average score: {paper.review_history[-1]['score']:.2f}. Abstract: {paper.abstract[:300]} ...\n"
 
     prompt += f"""
 ## Your Funding Situation
 """
-    prompt += f"Funding level: {agent.resources} (Average funding level: {average_funding_level})"
-    
+    if agent.resources > average_funding_level:
+        funding_comparison = "higher than"
+
+    elif agent.resources < average_funding_level:
+        funding_comparison = "lower than"
+
+    else:
+        funding_comparison = "equal to"
+
+    prompt += f"Funding level: {agent.resources} ({funding_comparison} average funding level of {average_funding_level:.2f})"
+
     if agent.funding_success_history:
         funding_history = ""
         for funding_program_id, records in agent.funding_success_history.items():
             for record in records:
-                funding_history += f"  - {funding_program_id}: {record['amount']} units in year {record['year']}\n"
-    
+                funding_history += f"  - You received {record['amount']} units of funding from {funding_program_id} in year {record['year']}\n"
+
     else:
         funding_history = "No funding received yet."
-    
+
     prompt += f"""
 ### Funding history
 {funding_history}
@@ -184,7 +201,7 @@ def assign_directions_individual(
 
     # Add memory context
     if agent.memory_bank:
-        prompt += "## Past Experiences\n\n"
+        prompt += "\n\n## Past Experiences\n\n"
         for memory in agent.memory_bank:
             if "reviews_received" in memory.get('type', ''):
                 prompt += f"""### Year: {memory.get('year', '')} - Event: {memory.get('type')}
@@ -197,20 +214,26 @@ Thought: {memory.get('thought', '')}
             else:
                 raise NotImplementedError(f"Unknown memory type: {memory.get('type')}")
 
+    prompt += f"""
+    
+## Directions You Can Choose From
+
+Below are the candidate directions you can choose from. Please note that projects in all directions are expected to complete in either 1, 2, or 3 years.
+"""
     # List candidate directions
     for i, direction in enumerate(candidate_directions):
         if isinstance(direction, ResearchDirection):
-            prompt += f"""### Direction {i+1}: {direction.topic}
+            prompt += f"""### Direction {i + 1}: {direction.topic}
 - Focus Areas: {', '.join(direction.focus_areas[:3])}
-- Expected Duration: {direction.years} year(s)
+- Expected Project Duration: {direction.years} year(s) (projects in all directions are expected to complete in either 1, 2, or 3 years)
 - Keywords: {', '.join(direction.keywords[:8])}
 
 """
         else:
-            prompt += f"### Direction {i+1}: {direction}\n\n"
+            prompt += f"### Direction {i + 1}: {direction}\n\n"
 
     prompt += f"""## Your Task
-Select the research direction that best aligns with your expertise, current situation, and strategic goals.
+First, select one research direction that best aligns with your expertise, current situation, and long-term goals. Then, give a 1-2 sentence VERY DETAILED description of the research project. Mention the main techniques you will use.
 
 You can choose from the following expertise:
 - Your Core Expertise (most preferred): {', '.join(core_expertise)}
@@ -226,30 +249,47 @@ You can choose from the following expertise:
 ## Sample Response
 ```json
 {
-    "topic": "deep_learning", <- MUST be one of the candidate directions
-    "reason": "This direction aligns with my recent successful publications." <- 1 sentence justification
+    "topic": "natural_language_processing", <- MUST be one of the candidate directions
+    "detailed_focus": "I will develop methods that leverage reinforcement learning from human feedback (RLHF) to align large language models with clinical reasoning, ethical standards, and domain-specific decision-making in healthcare." <- 1-2 sentence detailed description of the research direction. mention the main techniques you will use.
+    "reason": "This direction aligns with my recent publications, such as the paper titled 'Towards LLM Alignment using Reinforcement Learning from Human Feedback'." <- 1 sentence justification
 }
 ```
 """
 
-    selection, message_history = agent.llm.generate(prompt=prompt)
-    assert selection['topic'] in candidate_directions or selection['topic'] in related_expertise
-    
+    for _ in range(agent.max_retries):
+        
+        try:
+            selection, message_history = agent.llm.generate(prompt=prompt)
+            assert all(field in selection for field in {'topic', 'detailed_focus',
+                                                        'reason'}), f"Some fields are missing in the response of research direction selection. Existing fields: {str(list(selection.keys()))}"
+
+            assert selection['topic'] in candidate_directions or selection[
+                'topic'] in related_expertise, f"The selected topic {selection['topic']} is not in the candidate directions or related expertise. Candidate directions: {str(candidate_directions)}. Related expertise: {str(related_expertise)}"
+            
+            break
+            
+        except:
+            traceback.print_exc()
+            if _ >= agent.max_retries - 1:
+                raise Exception("Failed to select research direction after retries")
+            time.sleep(1)
+
     agent.memory_bank.append(
         {
             "type": "select_research_direction",
             "direction": selection['topic'],
+            "detailed_focus": selection['detailed_focus'],
             "thought": selection['reason'],
             "year": year,
             "timestamp": time.time(),
         }
     )
-    
-    
 
-    return DIRECTIONS_DICT[selection['topic']]
-
-    
+    return {
+        "direction": DIRECTIONS_DICT[selection['topic']],
+        "detailed_focus": selection['detailed_focus'],
+        "reason": selection['reason'],
+    }
 
 
 AVAILABLE_DIRECTIONS = [
@@ -298,7 +338,7 @@ AVAILABLE_DIRECTIONS = [
     ResearchDirection(
         topic="complexity_theory",
         focus_areas=["complexity classes", "lower bounds", "circuit complexity"],
-        years=4,
+        years=3,
         keywords=["P versus NP", "hardness of approximation", "derandomization", "proof complexity",
                   "computational hardness", "time complexity", "space complexity", "parameterized complexity",
                   "fine grained complexity", "boolean circuits", "complexity hierarchies", "reduction techniques"],
@@ -312,7 +352,8 @@ AVAILABLE_DIRECTIONS = [
         years=2,
         keywords=["high performance computing", "parallel algorithms", "multiscale modeling", "computational physics",
                   "finite element methods", "computational fluid dynamics", "molecular dynamics", "climate modeling",
-                  "scientific visualization", "solver optimization", "computational chemistry", "engineering simulation"],
+                  "scientific visualization", "solver optimization", "computational chemistry",
+                  "engineering simulation"],
         related_topics=["numerical_analysis", "parallel_computing", "performance_analysis"]
     ),
 
@@ -322,7 +363,8 @@ AVAILABLE_DIRECTIONS = [
         topic="geometric_algorithms",
         focus_areas=["convex hulls", "voronoi diagrams", "mesh generation"],
         years=2,
-        keywords=["computational geometry", "polygon triangulation", "spatial data structures", "geometric optimization",
+        keywords=["computational geometry", "polygon triangulation", "spatial data structures",
+                  "geometric optimization",
                   "proximity problems", "intersection algorithms", "point location", "delaunay triangulation",
                   "geometric search", "arrangement algorithms", "visibility problems", "motion planning"],
         related_topics=["computational_topology", "discrete_mathematics", "computer_graphics"]
@@ -344,7 +386,8 @@ AVAILABLE_DIRECTIONS = [
         years=1,
         keywords=["transformers", "large language models", "neural machine translation", "text generation",
                   "semantic parsing", "information extraction", "named entity recognition", "sentiment analysis",
-                  "text classification", "language understanding", "contextual embeddings", "attention mechanisms", "tokenization"],
+                  "text classification", "language understanding", "contextual embeddings", "attention mechanisms",
+                  "tokenization"],
         related_topics=["dialogue_systems", "deep_learning", "information_retrieval"]
     ),
     ResearchDirection(
@@ -365,7 +408,8 @@ AVAILABLE_DIRECTIONS = [
         years=3,
         keywords=["encryption algorithms", "digital signatures", "key exchange", "lattice cryptography",
                   "homomorphic encryption", "secure multiparty computation", "cryptographic protocols",
-                  "blockchain security", "quantum resistant cryptography", "elliptic curve cryptography", "hash functions"],
+                  "blockchain security", "quantum resistant cryptography", "elliptic curve cryptography",
+                  "hash functions"],
         related_topics=["cybersecurity", "information_theory", "formal_methods"]
     ),
     ResearchDirection(
@@ -374,7 +418,8 @@ AVAILABLE_DIRECTIONS = [
         years=2,
         keywords=["intrusion detection", "malware analysis", "vulnerability assessment", "penetration testing",
                   "security monitoring", "incident response", "access control", "authentication systems",
-                  "data privacy", "secure communication", "firewall systems", "security policies", "threat intelligence"],
+                  "data privacy", "secure communication", "firewall systems", "security policies",
+                  "threat intelligence"],
         related_topics=["cryptography", "computer_networks", "operating_systems"]
     ),
 
@@ -404,7 +449,8 @@ AVAILABLE_DIRECTIONS = [
         years=1,
         keywords=["video analysis", "temporal convolution", "optical flow", "activity recognition",
                   "video generation", "motion detection", "spatiotemporal features", "video summarization",
-                  "event detection", "video segmentation", "frame interpolation", "video prediction", "action localization"],
+                  "event detection", "video segmentation", "frame interpolation", "video prediction",
+                  "action localization"],
         related_topics=["image_recognition", "3d_vision", "multimedia_systems"]
     ),
 
@@ -466,7 +512,8 @@ AVAILABLE_DIRECTIONS = [
         topic="discrete_mathematics",
         focus_areas=["graph theory", "combinatorics", "discrete optimization"],
         years=3,
-        keywords=["graph algorithms", "network flows", "matching theory", "coloring problems", "combinatorial optimization",
+        keywords=["graph algorithms", "network flows", "matching theory", "coloring problems",
+                  "combinatorial optimization",
                   "enumeration", "extremal combinatorics", "ramsey theory", "algebraic graph theory",
                   "matroid theory", "integer programming", "polyhedral combinatorics", "probabilistic methods"],
         related_topics=["algorithms", "complexity_theory", "geometric_algorithms"]
@@ -486,7 +533,8 @@ AVAILABLE_DIRECTIONS = [
         topic="data_structures",
         focus_areas=["advanced data structures", "succinct data structures", "cache efficient structures"],
         years=3,
-        keywords=["tree structures", "hash tables", "priority queues", "spatial data structures", "persistent data structures",
+        keywords=["tree structures", "hash tables", "priority queues", "spatial data structures",
+                  "persistent data structures",
                   "compressed data structures", "memory efficient structures", "I/O efficient algorithms",
                   "external memory algorithms", "dynamic data structures", "range queries", "dictionary structures"],
         related_topics=["algorithms", "database_systems", "computational_topology"]
@@ -496,10 +544,11 @@ AVAILABLE_DIRECTIONS = [
     ResearchDirection(
         topic="quantum_computing",
         focus_areas=["quantum algorithms", "quantum error correction", "quantum simulation"],
-        years=4,
+        years=3,
         keywords=["quantum gates", "quantum circuits", "superconducting qubits", "quantum supremacy",
                   "variational quantum algorithms", "quantum annealing", "topological quantum computing",
-                  "quantum machine learning", "quantum cryptography", "entanglement", "quantum noise", "NISQ algorithms"],
+                  "quantum machine learning", "quantum cryptography", "entanglement", "quantum noise",
+                  "NISQ algorithms"],
         related_topics=["computer_architecture", "complexity_theory", "cryptography"]
     ),
 
@@ -507,7 +556,7 @@ AVAILABLE_DIRECTIONS = [
     ResearchDirection(
         topic="formal_methods",
         focus_areas=["program verification", "model checking", "theorem proving"],
-        years=4,
+        years=3,
         keywords=["formal specification", "software verification", "temporal logic", "automated reasoning",
                   "proof assistants", "bounded model checking", "SAT solvers", "SMT solvers", "invariant generation",
                   "abstract interpretation", "symbolic execution", "program synthesis", "correctness proofs"],
@@ -596,7 +645,8 @@ AVAILABLE_DIRECTIONS = [
         focus_areas=["policy optimization", "multi agent rl", "model based rl"],
         years=1,
         keywords=["Q learning", "policy gradients", "actor critic", "deep RL", "reward shaping",
-                  "exploration strategies", "temporal difference learning", "value functions", "Markov decision processes",
+                  "exploration strategies", "temporal difference learning", "value functions",
+                  "Markov decision processes",
                   "model free RL", "sample efficiency", "off policy learning", "experience replay"],
         related_topics=["deep_learning", "robotics", "planning_and_scheduling"]
     ),
@@ -614,7 +664,8 @@ AVAILABLE_DIRECTIONS = [
         focus_areas=["few-shot learning", "meta-learning", "learning to learn", "task adaptation"],
         years=1,
         keywords=["rapid adaptation", "MAML", "prototypical networks", "metric learning", "transfer learning",
-                  "multi task learning", "continual learning", "neural architecture search", "hyperparameter optimization",
+                  "multi task learning", "continual learning", "neural architecture search",
+                  "hyperparameter optimization",
                   "zero-shot learning", "cross domain learning", "model agnostic methods"],
         related_topics=["deep_learning", "reinforcement_learning", "interpretable_ml"]
     ),
@@ -632,7 +683,7 @@ AVAILABLE_DIRECTIONS = [
     ResearchDirection(
         topic="logic_in_cs",
         focus_areas=["modal logic", "temporal logic", "constraint logic"],
-        years=4,
+        years=3,
         keywords=["propositional logic", "predicate logic", "logical inference", "satisfiability",
                   "proof theory", "model theory", "automated theorem proving", "logic programming",
                   "description logics", "epistemic logic", "deontic logic", "linear temporal logic"],
@@ -668,7 +719,8 @@ AVAILABLE_DIRECTIONS = [
         years=2,
         keywords=["computer algebra systems", "mathematical libraries", "numerical solvers", "symbolic differentiation",
                   "polynomial computation", "algebraic algorithms", "Groebner bases", "mathematical optimization",
-                  "linear algebra packages", "differential equation solvers", "interval arithmetic", "exact arithmetic"],
+                  "linear algebra packages", "differential equation solvers", "interval arithmetic",
+                  "exact arithmetic"],
         related_topics=["symbolic_computation", "numerical_analysis", "computational_science"]
     ),
 
@@ -744,7 +796,8 @@ AVAILABLE_DIRECTIONS = [
         focus_areas=["language design", "compilers", "type systems"],
         years=3,
         keywords=["syntax design", "semantics", "static analysis", "compiler optimization", "code generation",
-                  "type inference", "functional programming", "object oriented programming", "domain specific languages",
+                  "type inference", "functional programming", "object oriented programming",
+                  "domain specific languages",
                   "runtime systems", "garbage collection", "language interoperability", "program transformation"],
         related_topics=["formal_methods", "software_engineering", "symbolic_computation"]
     ),
@@ -811,11 +864,11 @@ AVAILABLE_DIRECTIONS = [
         years=2,
         keywords=["feedback control", "state estimation", "Kalman filtering", "model predictive control",
                   "robust control", "nonlinear control", "stability analysis", "control design",
-                  "embedded systems", "real time control", "sensor networks", "actuator control", "system identification"],
+                  "embedded systems", "real time control", "sensor networks", "actuator control",
+                  "system identification"],
         related_topics=["robotics", "parallel_computing", "computational_science"]
     ),
 ]
-
 
 # Create a dictionary mapping from topic to ResearchDirection for easy lookup
 DIRECTIONS_DICT = {direction.topic: direction for direction in AVAILABLE_DIRECTIONS}
