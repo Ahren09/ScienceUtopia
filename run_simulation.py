@@ -294,14 +294,14 @@ class Simulation:
                           getattr(agent, "resources", None) is not None]
         return np.mean(funding_levels)
 
-    def run_one_round(self, year: int) -> Dict:
-        """Run simulation for one year
+    def _setup_year(self, year: int) -> Dict:
+        """Setup year: log start, reset funding tracker, reset conferences
 
         Args:
             year: Current year number
 
         Returns:
-            Dictionary with year results
+            year_results: Dict initialized with year number
         """
         logger.info(f"\n{'=' * 60}")
         logger.info(f"YEAR {year}")
@@ -314,62 +314,86 @@ class Simulation:
         # Reset conferences for the new year of simulation
         self.conference_system.reset_all_for_new_year(year)
 
+        # Initialize year results dict
+        return {'year': year}
 
-        # Determine assignment mode based on year
-        research_direction_selection_mode = "batch" if year == 1 else "individual"
+    def _run_phase_0_resubmissions(self, year: int, year_results: Dict) -> List[Dict]:
+        """Phase 0: Process resubmissions from previous year (year 2+)
 
-        year_results = {
-            'year': year
-        }
-        # Phase 0: Resubmissions (year 2+)
+        Args:
+            year: Current year number
+            year_results: Year results dict to update
+
+        Returns:
+            resubmissions_list: List of resubmitted papers
+        """
         resubmissions_list = []
         resubmissions_paper_ids = set()
-        if year > 1:
-            logger.info(f"Year {year} Phase 0: Processing resubmissions from year {year - 1}...")
-            for author_id, papers in self.paper_tracker.papers_by_author.items():
-                agent = self.ecosystem.get_agent_by_id(author_id)
 
-                if not agent:
-                    continue
+        if year <= 1:
+            return resubmissions_list
 
-                rejected_papers = {paper.id: paper.to_dict() for paper in papers if paper.status == 'reject'}
-                if not rejected_papers:
-                    continue
+        logger.info(f"Year {year} Preparation: Processing resubmissions from year {year - 1}...")
 
-                resubmissions_of_author = agent.decide_resubmission(rejected_papers, self.conference_system.conferences)
+        for author_id, papers in self.paper_tracker.papers_by_author.items():
+            agent = self.ecosystem.get_agent_by_id(author_id)
 
-                for metadata in resubmissions_of_author:
-                    if not metadata['arxiv_id'] in resubmissions_paper_ids:
-                        paper_dict = rejected_papers[metadata['arxiv_id']].copy()
-                        paper_dict['conference'] = metadata['conference']
-                        paper_dict['year'] = year
-                        paper_dict['type'] = 'resubmission'
-                        # Preserve review_history for accumulation across submissions
-                        review_history_backup = paper_dict.get('review_history', [])
-                        del paper_dict['status']
-                        if 'review_history' in paper_dict:
-                            del paper_dict['review_history']
-                        paper_dict['status'] = 'pending'
-                        paper_dict['review_history'] = review_history_backup  # Will be restored by paper_tracker
+            if not agent:
+                continue
 
-                        resubmissions_list.append(paper_dict)
-                        self.paper_tracker.add_or_update_paper(paper_dict)
-                        resubmission_cost = SIMULATION_CONFIG['conference']['resubmission_cost']
-                        agent.update_resources(-resubmission_cost)
+            rejected_papers = {paper.id: paper.to_dict() for paper in papers if paper.status == 'reject'}
+            if not rejected_papers:
+                continue
 
-                        self.funding_tracker.record_funding_consumption(year, resubmission_cost, agent.get_type())
-                        
-                        resubmissions_paper_ids.add(metadata['arxiv_id'])
-                        
-                    else:
-                        logger.error(f"[Resubmission] Paper {metadata['arxiv_id']} already resubmitted for year {year}")
+            resubmissions_of_author = agent.decide_resubmission(rejected_papers, self.conference_system.conferences)
 
-        # Get academic funding agencies (For now, only NSF and DARPA)
+            for metadata in resubmissions_of_author:
+                if not metadata['arxiv_id'] in resubmissions_paper_ids:
+                    paper_dict = rejected_papers[metadata['arxiv_id']].copy()
+                    paper_dict['conference'] = metadata['conference']
+                    paper_dict['year'] = year
+                    paper_dict['type'] = 'resubmission'
+                    # Preserve review_history for accumulation across submissions
+                    review_history_backup = paper_dict.get('review_history', [])
+                    del paper_dict['status']
+                    if 'review_history' in paper_dict:
+                        del paper_dict['review_history']
+                    paper_dict['status'] = 'pending'
+                    paper_dict['review_history'] = review_history_backup  # Will be restored by paper_tracker
+
+                    resubmissions_list.append(paper_dict)
+                    self.paper_tracker.add_or_update_paper(paper_dict)
+                    resubmission_cost = SIMULATION_CONFIG['conference']['resubmission_cost']
+                    agent.update_resources(-resubmission_cost)
+
+                    self.funding_tracker.record_funding_consumption(year, resubmission_cost, agent.get_type())
+
+                    resubmissions_paper_ids.add(metadata['arxiv_id'])
+
+                else:
+                    logger.error(f"[Resubmission] Paper {metadata['arxiv_id']} already resubmitted for year {year}")
+
+        return resubmissions_list
+
+    def _run_phase_1_assign_directions(self, year: int, year_results: Dict):
+        """Phase 1: Assign research directions to agents
+
+        Args:
+            year: Current year number
+            year_results: Year results dict to update
+
+        Returns:
+            Tuple of (directions, active_authors, average_funding_level)
+        """
+        logger.info(f"Year {year} Phase 1: Assigning research directions...")
+
+        # Get funding agencies and calculate average funding level
         funding_agencies = [
             agent for agent_id, agent in self.ecosystem.agent_population.items()
             if isinstance(agent, FundingAgency)
         ]
         average_funding_level = self.calculate_average_funding_level()
+
         # Reset funding programs for new year
         all_funding_programs_dict = {}
         for funding_agent in funding_agencies:
@@ -377,12 +401,9 @@ class Simulation:
                 program.reset_for_new_cycle()
                 all_funding_programs_dict[program_id] = program
 
-        # Phase 1: Assign research directions
-        logger.info(f"Year {year} Phase 1: Assigning research directions...")
+        # Get authors who need new directions
         authors = self.ecosystem.get_available_authors()
-
-        authors_with_directions_pending = [a for a in authors if a.project_end_year < year and a.is_active]  # Filter by minimum funding and maturity year
-
+        authors_with_directions_pending = [a for a in authors if a.project_end_year < year and a.is_active]
         logger.info(f"[Direction] {len(authors_with_directions_pending)} Authors")
 
         if year == 1:
@@ -390,27 +411,18 @@ class Simulation:
 
             for agent_id, result_dict in directions.items():
                 agent = self.ecosystem.get_agent_by_id(agent_id)
-                agent.project_start_year = year  # The year when the agent's latest research paper will be ready for submission
-                agent.project_end_year = (year - 1) + result_dict[
-                    'direction'].years  # The year when the agent's latest research paper will be ready for submission
+                agent.project_start_year = year
+                agent.project_end_year = (year - 1) + result_dict['direction'].years
 
                 if self.verbose:
                     logger.info(
                         f"[Direction Assignment] Agent {agent.id}, direction {result_dict['direction'].topic} (mature in {result_dict['direction'].years} years (Year {year} -> {agent.project_end_year})")
 
-                agent.newest_direction = result_dict  # Contains all fields like direction, detailed_focus, reason
-                # Charge annual cost for the first year of the project (subsequent years charged at start of each year)
-                
-                # NOTE: Charging of submission in preparation has been moved downwards
-                # agent.update_resources(-SIMULATION_CONFIG['conference']['annual_cost'])
-                # self.funding_tracker.record_funding_consumption(year, SIMULATION_CONFIG['conference']['annual_cost'], agent.get_type())
-
+                agent.newest_direction = result_dict
         else:
-            # Get past papers from paper archive for LLM-based direction selection
-
+            # Individual assignment for year 2+
             directions = {}
             for agent in tqdm(authors_with_directions_pending, desc="Research Directions"):
-                # Use LLM-based individual assignment with past research context
                 direction = assign_directions_individual(
                     agent,
                     year=year,
@@ -419,34 +431,44 @@ class Simulation:
                 )
                 directions[agent.id] = direction
                 agent.project_start_year = year
-                agent.project_end_year = (year - 1) + direction[
-                    'direction'].years  # The year when the research paper will be ready for submission
-                agent.newest_direction = direction  # Contains all fields like direction, detailed_focus, reason
-                # Charge annual cost for the first year of the project (subsequent years charged at start of each year)
-                # agent.update_resources(-SIMULATION_CONFIG['conference']['annual_cost'])
-                # self.funding_tracker.record_funding_consumption(year, SIMULATION_CONFIG['conference']['annual_cost'], agent.get_type())
+                agent.project_end_year = (year - 1) + direction['direction'].years
+                agent.newest_direction = direction
 
+        # For authors not assigned this year, use their existing direction
         for author in authors:
             if author.id not in directions:
                 assert author.newest_direction is not None, f"Author {author.id} has no newest direction"
                 directions[author.id] = author.newest_direction
 
-        active_authors = [a for a in authors if
-                          a.project_end_year <= year and a.is_active]  # Filter by maturity year
-
-        # assert len(active_authors) == len(directions), f"Number of active authors {len(active_authors)} does not match number of directions {len(directions)}"
-
+        # Get active authors (those ready to submit papers)
+        active_authors = [a for a in authors if a.project_end_year <= year and a.is_active]
         logger.info(f"[Select Direction] {len(active_authors)} Active Authors")
 
+        # Update year results
         year_results['research_assignment'] = {
-            'mode': research_direction_selection_mode,
+            'mode': 'batch' if year == 1 else 'individual',
             'num_agents_assigned': len(directions),
             "directions": {
                 agent_id: {"direction": direction['direction'].topic, "detailed_focus": direction['detailed_focus'],
                            "reason": direction['reason']} for agent_id, direction in directions.items()}
         }
 
-        # Phase 2: Generate and submit papers
+        return directions, active_authors, average_funding_level
+
+    def _run_phase_2_submit_papers(self, year: int, directions: Dict, active_authors: List,
+                                    resubmissions_list: List[Dict], year_results: Dict) -> List[Dict]:
+        """Phase 2: Generate and submit papers
+
+        Args:
+            year: Current year number
+            directions: Research directions for each agent
+            active_authors: List of authors ready to submit
+            resubmissions_list: List of papers being resubmitted
+            year_results: Year results dict to update
+
+        Returns:
+            submissions_list: List of newly submitted papers (not resubmissions)
+        """
         logger.info(f"Year {year} Phase 2: Submitting papers...")
 
         paper_submission_prompts: List[str] = []
@@ -539,10 +561,10 @@ class Simulation:
                     assert arxiv_id in [p.metadata['id'] for p in candidate_papers] or arxiv_id == "DO_NOT_SUBMIT"
                     assert submission_metadata[
                                'conference'] in self.conference_system.conference_map or submission_metadata['conference'] == "DO_NOT_SUBMIT", f"Generated invalid conference name: {submission_metadata['conference']}"
-                    
+
                     if arxiv_id == "DO_NOT_SUBMIT":
                         break
-                    
+
                     else:
                         logger.info(
                             f"{agent.id} - {submission_metadata['conference']} - submitted \'{self.rag.id2docs[arxiv_id].metadata['title']}\'")
@@ -570,8 +592,8 @@ class Simulation:
             if arxiv_id == "DO_NOT_SUBMIT":
                 logger.info(f"Agent {agent.id} did not submit any paper due to funding issues")
                 continue
-            
-            
+
+
             else:
                 paper_doc = self.rag.id2docs[arxiv_id]
 
@@ -607,7 +629,7 @@ class Simulation:
         if year >= 2:
 
             retrieval_prompts = []
-            
+
             for submitted_paper in resubmissions_list + submissions_list:
                 retrieval_prompts.append(f"{submitted_paper['title']} \n{submitted_paper['abstract']}")
 
@@ -708,7 +730,7 @@ class Simulation:
                             num_retries += 1
                             if num_retries >= self.max_retries:
                                 raise Exception("Failed to get potential cited papers after 3 retries")
-                
+
                 # Get self-citations
                 logger.info(f"[Self-Citation] Getting self-citations for {agent.id} in year {year}.")
                 own_papers = self.paper_tracker.get_papers_by_author(agent.id)
@@ -759,9 +781,15 @@ class Simulation:
         year_results['paper_submission'] = {
             'num_papers_submitted': sum(len(papers) for author_id, papers in submitted_papers.items()),
         }
-        
-        
-        # Charge annual cost for all active researchers working on projects
+
+        return submissions_list
+
+    def _charge_annual_costs(self, year: int):
+        """Charge annual costs for all active researchers working on projects
+
+        Args:
+            year: Current year number
+        """
         for agent in self.ecosystem.get_available_authors():
             if agent.is_active:
 
@@ -771,9 +799,20 @@ class Simulation:
                     agent.update_resources(-annual_cost)
                     self.funding_tracker.record_funding_consumption(year, annual_cost, agent.get_type())
 
-        # Phase 3: Peer review
+    def _run_phase_3_peer_review(self, year: int, year_results: Dict) -> Dict[str, Dict[str, float]]:
+        """Phase 3: Conduct peer reviews
+
+        Args:
+            year: Current year number
+            year_results: Year results dict to update
+
+        Returns:
+            average_scores: Dict mapping conf_id -> paper_id -> average score
+        """
         logger.info(f"Year {year} Phase 3: Conducting peer reviews...")
+
         self.conference_system.start_all_review_processes()
+
         # Map conference ids to dict of papers
         average_scores = {}
         reviews_by_conference = {}  # {conf_id: {paper_id: [reviews]}}
@@ -801,7 +840,7 @@ class Simulation:
                             review = reviewer.review_paper(paper)
                             conference.add_review(paper['id'], review)
                             reviews_by_reviewer[reviewer.id].append(review['overall_score'])
-                            
+
 
                             break
 
@@ -823,18 +862,19 @@ class Simulation:
                             if num_retries >= self.max_retries:
                                 raise Exception("Failed to review paper after 3 retries")
                             time.sleep(1)
+
                 paper_reviews = conference.reviews[paper['id']]
                 reviews_by_conference[conference.conference_id][paper['id']] = paper_reviews
                 average_scores[conference.conference_id][paper['id']] = sum(
                     r['overall_score'] for r in paper_reviews) / len(paper_reviews)
                 logger.debug(f"[Review] \"{paper['title']}\": Average score {average_scores[conference.conference_id][paper['id']]:.2f}")
+
         # Calculate score metrics
         conference_score_metrics = calculate_conference_score_metrics(reviews_by_conference, dict(reviews_by_reviewer))
 
         year_results['peer_review'] = {
             'reviews_conducted': sum(len(c.reviews) for c in self.conference_system.conferences),
             'score_metrics': conference_score_metrics,
-            # 'average_scores': average_scores
         }
 
         # Process received reviews for authors
@@ -849,7 +889,15 @@ class Simulation:
                     author.process_received_reviews(paper_reviews, paper_id=paper['id'], year=year,
                                                     average_scores_of_venue=average_scores[conference.conference_id])
 
-        # Phase 4: Make acceptance decisions
+        return average_scores
+
+    def _run_phase_4_acceptance_decisions(self, year: int, year_results: Dict):
+        """Phase 4: Make acceptance decisions
+
+        Args:
+            year: Current year number
+            year_results: Year results dict to update
+        """
         logger.info(f"Year {year} Phase 4: Making acceptance decisions...")
 
         self.conference_system.make_all_decisions()
@@ -866,31 +914,33 @@ class Simulation:
             for paper in conf.decisions['reject']:
                 rejected_paper_ids.append(paper['id'])
                 self.paper_tracker.add_or_update_paper(paper)
+
         assert len(
             self.paper_tracker.pending_papers_by_year[year]) == 0, f"There should be NO pending papers for year {year}"
-        # self.paper_tracker.update_paper(submitted_paper['id'], citations=citations_of_paper)
 
         self.rag.mark_papers_as_submitted(accepted_paper_ids, rejected_paper_ids)
-        # Save paper archive to disk
 
         year_results['decisions'] = {
             'total_accepted': total_accepted,
             'total_rejected': total_rejected,
-
         }
 
         logger.info(f"  Accepted: {total_accepted}, Rejected: {total_rejected}")
 
-        # Phase 5: Update funding
+    def _run_phase_5_update_funding(self, year: int, submissions_list: List[Dict], year_results: Dict):
+        """Phase 5: Update funding for all agents
+
+        Args:
+            year: Current year number
+            submissions_list: List of submitted papers from Phase 2
+            year_results: Year results dict to update
+        """
         logger.info(f"Year {year} Phase 5: Updating funding...")
 
         # Calculate replenishment needed to maintain constant total funding
         funding_consumed = self.funding_tracker.get_funding_consumption(year)
         logger.info(
             f"Funding consumed this cycle: University: {funding_consumed['university']:.2f}, Industry: {funding_consumed['industry']:.2f}")
-
-        # Update hot topics from recent papers
-        # self.industry_funding_system.update_hot_topics(self.all_papers_history, year)
 
         # Process university researchers - apply for funding
         university_applications = []
@@ -913,12 +963,18 @@ class Simulation:
         else:
             industry_funding_per_unit = max(self.funding_tracker.get_funding_allocation_amount(year, 'industry') // denominator, 1)
 
+        # Get funding agencies
+        funding_agencies = [
+            agent for agent_id, agent in self.ecosystem.agent_population.items()
+            if isinstance(agent, FundingAgency)
+        ]
+
         # Update funding for industry researchers. Ask university researchers to apply for funding.
         for agent in tqdm(self.ecosystem.get_available_authors(), desc="Updating funding"):
             if isinstance(agent, IndustryResearcher):
                 # Update industry budget based on performance
                 accepted = self.conference_system.authors_to_accepted_papers.get(agent.id, [])
-                
+
                 for paper in accepted:
                     new_budget = self.industry_funding_system.update_budget(
                         funding_per_unit=industry_funding_per_unit,
@@ -929,7 +985,7 @@ class Simulation:
                     if new_budget > 0:
                         agent.update_resources(delta=int(new_budget))
                         self.funding_tracker.record_funding_allocation(year, new_budget, 'industry')
-                    
+
 
                 # Count citations for each accepted paper
                 citation_counts = []
@@ -939,7 +995,7 @@ class Simulation:
             elif isinstance(agent, UniversityResearcher):
                 success_history = agent.funding_success_history
                 selected_program_ids = agent.select_funding_programs(
-                    all_funding_programs_dict,
+                    {pid: program for funding_agent in funding_agencies for pid, program in funding_agent.funding_programs.items()},
                     success_history,
                     num_submitted_proposals=3  # at most 3 programs to apply to
                 )
@@ -954,7 +1010,7 @@ class Simulation:
                                                                                                            []),
                                 past_rejected_papers=self.conference_system.authors_to_rejected_papers.get(agent.id,
                                                                                                            []),
-                                programs=all_funding_programs_dict,
+                                programs={pid: program for funding_agent in funding_agencies for pid, program in funding_agent.funding_programs.items()},
                                 selected_program_ids=selected_program_ids,
                                 success_history=success_history
                             )
@@ -986,6 +1042,7 @@ class Simulation:
         total_weights = []
 
         winners_list = []
+        submitted_papers_dict = {paper['id']: paper for paper in submissions_list}
         for funding_agent in funding_agencies:
             winners_for_program = funding_agent.evaluate_funding_applications(
                 university_applications,
@@ -1000,7 +1057,7 @@ class Simulation:
         active_papers_dataframe = active_papers_dataframe.set_index('author_id')
 
         # Note: One agent can win multiple fundings
-        
+
         if self.weighted_funding_assignment:
             denominator = active_papers_dataframe.loc[winners_list, "maturity"].sum()
 
@@ -1009,7 +1066,6 @@ class Simulation:
 
         academic_funding_per_unit = int(
             self.funding_tracker.get_funding_allocation_amount(year, 'university') / denominator)
-        # active_papers_dataframe = active_papers_dataframe.reset_index()
 
         # Apply funding decisions to university researchers and update success history
         for program_id, winners_for_program in all_funding_winners_dict.items():
@@ -1017,14 +1073,6 @@ class Simulation:
                 program = all_funding_programs_dict[program_id]
                 agent = self.ecosystem.get_agent_by_id(winner['id'])
 
-                # value = active_papers_dataframe.loc[agent.id, 'maturity']
-                # if isinstance(value, pd.Series):
-                #     value = value.iloc[0]
-                # maturity = int(value)
-                
-                # if self.weighted_funding_assignment:
-                #     funding_to_researcher = academic_funding_per_unit * maturity
-                # else:
                 funding_to_researcher = academic_funding_per_unit
 
                 agent.update_resources(delta=funding_to_researcher)
@@ -1064,6 +1112,44 @@ class Simulation:
                 'total_applications': len(university_applications)
             }
         }
+
+        # Get conference statistics
+        year_results['conference_statistics'] = self.conference_system.get_all_statistics()
+
+    def run_one_round(self, year: int) -> Dict:
+        """Run simulation for one year - orchestrates all phases
+
+        Args:
+            year: Current year number
+
+        Returns:
+            Dictionary with year results
+        """
+        # Year setup
+        year_results = self._setup_year(year)
+
+        # Phase 0: Resubmissions (year 2+)
+        resubmissions_list = self._run_phase_0_resubmissions(year, year_results)
+
+        # Phase 1: Assign research directions
+        directions, active_authors, avg_funding = self._run_phase_1_assign_directions(year, year_results)
+
+        # Phase 2: Generate and submit papers
+        submissions_list = self._run_phase_2_submit_papers(
+            year, directions, active_authors, resubmissions_list, year_results
+        )
+
+        # Charge annual costs
+        self._charge_annual_costs(year)
+
+        # Phase 3: Peer review
+        average_scores = self._run_phase_3_peer_review(year, year_results)
+
+        # Phase 4: Make acceptance decisions
+        self._run_phase_4_acceptance_decisions(year, year_results)
+
+        # Phase 5: Update funding
+        self._run_phase_5_update_funding(year, submissions_list, year_results)
 
         # Get conference statistics
         year_results['conference_statistics'] = self.conference_system.get_all_statistics()

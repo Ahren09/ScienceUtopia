@@ -57,6 +57,14 @@ SIMULATION_CONFIG = {
     'simulation': {
         'default_num_years': 5,            # Default simulation duration
         'papers_per_year_per_agent': 1,    # Target papers per agent per year
+    },
+
+    # Exploration vs Exploitation Experiment
+    'exploration_experiment': {
+        'strategies': ['explorer', 'exploiter', 'cautious_explorer'],
+        'embedding_model': 'all-MiniLM-L6-v2',
+        'num_keywords': 10,
+        'min_citations_for_cd': 5,  # Minimum citations to calculate CD index
     }
 }
 
