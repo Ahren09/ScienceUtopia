@@ -65,6 +65,13 @@ SIMULATION_CONFIG = {
         'embedding_model': 'all-MiniLM-L6-v2',
         'num_keywords': 10,
         'min_citations_for_cd': 5,  # Minimum citations to calculate CD index
-    }
+    },
+
+    # Weights & Biases logging
+    'wandb': {
+        'enabled': True,           # Set to True to enable wandb logging
+        'project': 'science-utopia',
+        'run_name': None,           # Auto-generated from experiment_name + model if None
+    },
 }
 

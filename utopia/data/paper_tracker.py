@@ -190,7 +190,7 @@ class PaperTracker:
 
                 self.papers_by_id[archived_paper.id] = archived_paper
 
-                logger.info(f"[Paper Tracker]: Added new submission {paper_dict['id']} ({status}) for Year {paper_dict['year']}")
+                logger.info(f"[Paper Tracker]: Added new submission {paper_dict['id']} (Status: {status}) for Year {paper_dict['year']}")
 
 
             else:
@@ -253,16 +253,10 @@ class PaperTracker:
 
         return archived_paper
 
-    def update_paper(self, paper_id: str, citations: List[str] = None, status: str = None, conference: str = None,
+    def update_paper(self, paper_id: str, status: str = None, conference: str = None,
                      year: int = None, **kwargs):
         """Update a paper's metadata in the paper tracker."""
-        if citations is not None:
-            citation_count = len(self.papers_by_id[paper_id].citations)
-            self.papers_by_id[paper_id].citations = list(set(self.papers_by_id[paper_id].citations + citations))
-            logger.info(
-                f"Updated citations for paper {paper_id} ({citation_count}) -> {len(self.papers_by_id[paper_id].citations)})")
-
-        elif status is not None or conference is not None or year is not None:
+        if status is not None or conference is not None or year is not None:
 
             assert kwargs.get("review_history", None), "Review history must be provided"
             assert paper_id in self.pending_papers_by_year[

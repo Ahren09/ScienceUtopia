@@ -21,3 +21,8 @@ NOTE:
 * This is a VERY rigorous top-tier conference. >60% papers receive a score of 2.0-2.5 or lower. Use this to calibrate your scores. Be careful about giving high scores.
 * Scores in decimals like 1.5 is allowed.
 """
+
+IMPORTANT_NOTES = """
+## Important Notes
+* You MUST keep your thinking concise and to the point. DO NOT generate excessive reasoning.
+"""

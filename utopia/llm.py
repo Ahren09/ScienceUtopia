@@ -8,7 +8,7 @@ import anthropic
 import backoff
 import openai
 from typing import Optional
-from pydantic import BaseModel
+from pydantic import BaseLLM
 
 MAX_NUM_TOKENS = 4096
 

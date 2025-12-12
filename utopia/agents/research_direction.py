@@ -5,13 +5,25 @@ Each agent has inherent expertise (3 research directions sampled at initializati
 When selecting research directions, agents randomly sample from their expertise.
 """
 
+import logging
 import random
 import time
 from dataclasses import dataclass
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 import traceback
 
+from pydantic import BaseModel
+
 from utopia.data.paper_tracker import PaperTracker
+
+logger = logging.getLogger(__name__)
+
+
+class ResearchDirectionSelection(BaseModel):
+    """Pydantic model for structured output of research direction selection"""
+    topic: str
+    detailed_focus: str
+    reason: str
 
 
 @dataclass
@@ -74,62 +86,24 @@ def initialize_agent_expertise(
             agent.expertise_directions = random.sample(directions, min(num_expertise, len(directions)))
 
 
-def assign_directions_batch(
-        agents: List,
-        directions: Optional[List[ResearchDirection]] = None
-) -> Dict[str, ResearchDirection]:
-    """Assign research directions to all agents simultaneously
-
-    Each agent randomly selects from their inherent expertise (expertise_directions).
-    All agents receive directions at the same time, simulating a synchronized
-    research cycle (e.g., all labs starting projects after a funding cycle).
-
-    Args:
-        agents: List of agent objects to assign directions to
-        directions: Available research directions (only used if agents don't have expertise initialized)
-
-    Returns:
-        Dictionary mapping agent_id to assigned ResearchDirection
-    """
-    if directions is None:
-        directions = AVAILABLE_DIRECTIONS
-
-    assignments = {}
-    for agent in agents:
-        # Randomly select from agent's expertise
-        assignments[agent.id] = {
-            "direction": random.choice(agent.expertise),
-            "detailed_focus": None,
-            "reason": None,
-        }
-
-    return assignments
-
-
-def assign_directions_individual(
+def build_direction_prompt(
         agent,  # SimulationAgent
         year: int,
         paper_tracker: PaperTracker,
         candidate_directions: List[ResearchDirection] = None,
         average_funding_level: float = None
-) -> Dict[str, ResearchDirection]:
-    """Assign research directions one agent at a time using LLM-based selection
-
-    Each agent uses LLM to select from their inherent expertise based on:
-    - Past publication record (accepted/rejected papers)
-    - Current funding situation
-    - Recent review experiences
-    - Strategic career considerations
+) -> Tuple[str, Dict, List[str], List[str]]:
+    """Build prompt for research direction selection (without calling LLM)
 
     Args:
-        agents: List of agent objects to assign directions to
+        agent: Agent to build prompt for
         year: Current simulation year
-        past_papers_by_agent: Dict mapping agent_id to dict with 'accepted' and 'rejected' paper lists
-        directions: Available research directions (only used if agents don't have expertise initialized)
+        paper_tracker: PaperTracker for retrieving past papers
+        candidate_directions: Optional list of candidate directions
         average_funding_level: Average funding level of all agents
 
     Returns:
-        Dictionary mapping agent_id to assigned ResearchDirection
+        Tuple of (prompt, response_format, core_expertise, related_expertise)
     """
     if not candidate_directions:
         candidate_directions = agent.expertise
@@ -145,20 +119,20 @@ def assign_directions_individual(
     candidate_directions = core_expertise + related_expertise
 
     past_accepted_papers, past_rejected_papers = paper_tracker.get_papers_by_decision(agent.id)
-    
-    if len(past_accepted_papers) > 0 or len(past_rejected_papers) > 0:
-        print()
 
-    institution_name = agent.university_name if hasattr(agent, 'university_name') else agent.company_name
+    prompt = f"""
+{agent._get_personality_prompt(include_exploration_strategy=True)}
 
-    prompt = f"""You are a researcher at {institution_name} trying to decide the research direction of your next project. 
-
+Now, you are trying to decide the research direction of your next project.
 """
 
     if len(past_accepted_papers) > 0:
 
         prompt += f"""## Your Past Publications (Accepted Papers)
-The following are your past accepted papers. You can use them to inspire your next project. Ratings in the conference reviews are from 1 to 5.
+The following are your past accepted papers.
+You can use them to inspire your next project, such as deciding on research directions or topics.
+You may also use the reviews to decide how you conduct future peer reviews (e.g. giving higher or lower scores).
+Ratings in the reviews are from 1 to 5.
 """
         for paper in past_accepted_papers:
             prompt += f"  - \"{paper.title}\" (Conference: {paper.conference}). Average score: {paper.review_history[-1]['score']:.2f}. Abstract: {paper.abstract[:300]} ...\n"
@@ -166,7 +140,10 @@ The following are your past accepted papers. You can use them to inspire your ne
     if len(past_rejected_papers) > 0:
         prompt += f"""
 ## Your Past Rejected Papers
-The following are your past rejected papers. You can use them to learn from your mistakes and improve your next project. Ratings in the conference reviews are from 1 to 5.
+The following are your past rejected papers.
+You can use them to learn from your mistakes and improve your next project, such as deciding on research directions or topics.
+You may also use the reviews to decide how you conduct future peer reviews (e.g. giving higher or lower scores).
+Ratings in the reviews are from 1 to 5.
 """
     for paper in past_rejected_papers:
         prompt += f"  - \"{paper.title}\". Average score: {paper.review_history[-1]['score']:.2f}. Abstract: {paper.abstract[:300]} ...\n"
@@ -215,7 +192,7 @@ Thought: {memory.get('thought', '')}
                 raise NotImplementedError(f"Unknown memory type: {memory.get('type')}")
 
     prompt += f"""
-    
+
 ## Directions You Can Choose From
 
 Below are the candidate directions you can choose from. Please note that projects in all directions are expected to complete in either 1, 2, or 3 years.
@@ -230,12 +207,12 @@ Below are the candidate directions you can choose from. Please note that project
 
 """
         else:
-            prompt += f"### Direction {i + 1}: {direction}\n\n"
+            prompt += f"* Direction {i + 1}: {direction}\n\n"
 
     prompt += f"""## Your Task
-First, select one research direction that best aligns with your expertise, current situation, and long-term goals. Then, give a 1-2 sentence VERY DETAILED description of the research project. Mention the main techniques you will use.
+First, select one research direction that best aligns with your expertise, current situation, and long-term goals. Then, give a 4-5 sentence VERY DETAILED description of the research project. Mention the main techniques you will use.
 
-You can choose from the following expertise:
+Propose the directions based on your expertise:
 - Your Core Expertise (most preferred): {', '.join(core_expertise)}
 - Your Relevant Expertise (less preferred but still doable): {', '.join(related_expertise)}
 
@@ -256,18 +233,178 @@ You can choose from the following expertise:
 ```
 """
 
-    for _ in range(agent.max_retries):
-        
+    response_format = {
+        'type': 'json_schema',
+        'json_object': {
+            'name': 'research_direction_selection',
+            'strict': True,
+            'schema': ResearchDirectionSelection.model_json_schema()
+        },
+    }
+
+    return prompt, response_format, core_expertise, related_expertise
+
+
+def assign_directions_batch(
+        agents: List,  # List of SimulationAgent
+        year: int,
+        paper_tracker: PaperTracker,
+        llm,  # LLM instance with generate_batch method
+        average_funding_level: float = None
+) -> Dict[str, Dict]:
+    """Assign research directions for all agents at once using batched LLM calls
+
+    This function builds all prompts first, then makes a single batched call
+    to the LLM for maximum efficiency.
+
+    Args:
+        agents: List of agent objects to assign directions to
+        year: Current simulation year
+        paper_tracker: PaperTracker for retrieving past papers
+        llm: LLM instance (must have generate_batch method)
+        average_funding_level: Average funding level of all agents
+
+    Returns:
+        Dictionary mapping agent_id to direction dict with 'direction', 'detailed_focus', 'reason'
+    """
+    if not agents:
+        return {}
+
+    # Step 1: Build all prompts (NO LLM calls yet)
+    batch_prompts = []
+    batch_metadata = []
+    direction_response_format = None
+
+    for agent in agents:
+        prompt, response_format, core_expertise, related_expertise = build_direction_prompt(
+            agent=agent,
+            year=year,
+            paper_tracker=paper_tracker,
+            average_funding_level=average_funding_level
+        )
+        batch_prompts.append(prompt)
+        batch_metadata.append({
+            'agent': agent,
+            'core_expertise': core_expertise,
+            'related_expertise': related_expertise,
+            'candidate_directions': core_expertise + related_expertise,
+        })
+
+        if direction_response_format is None:
+            direction_response_format = response_format
+
+    # Step 2: Single batch call for ALL prompts
+    logger.info(f"[Direction] Generating {len(batch_prompts)} research directions in batch...")
+    batch_results = llm.generate_batch(
+        batch_prompts,
+        temperature=0.7,
+        response_format=direction_response_format,
+        desc=f"{len(batch_prompts)} research directions"
+    )
+
+    # Step 3: Process results
+    directions = {}
+    for i, (selection, message_history) in enumerate(batch_results):
+        meta = batch_metadata[i]
+        agent = meta['agent']
+        candidate_directions = meta['candidate_directions']
+        related_expertise = meta['related_expertise']
+
+        # Handle failed JSON parse
+        if selection is None:
+            logger.warning(f"Failed to parse direction response for {agent.id}, using fallback")
+            # Use first core expertise as fallback
+            fallback_topic = meta['core_expertise'][0] if meta['core_expertise'] else 'artificial_intelligence'
+            selection = {
+                'topic': fallback_topic,
+                'detailed_focus': f"Research in {fallback_topic}",
+                'reason': "Fallback due to parsing error"
+            }
+
+        # Validate response
         try:
-            selection, message_history = agent.llm.generate(prompt=prompt)
+            assert all(field in selection for field in {'topic', 'detailed_focus', 'reason'}), \
+                f"Missing fields in response for {agent.id}: {list(selection.keys())}"
+
+            assert selection['topic'] in candidate_directions or selection['topic'] in related_expertise, \
+                f"Invalid topic {selection['topic']} for {agent.id}"
+
+        except AssertionError as e:
+            logger.warning(f"Invalid direction from {agent.id}: {e}, using fallback")
+            fallback_topic = meta['core_expertise'][0] if meta['core_expertise'] else 'artificial_intelligence'
+            selection = {
+                'topic': fallback_topic,
+                'detailed_focus': f"Research in {fallback_topic}",
+                'reason': "Fallback due to validation error"
+            }
+
+        # Update agent memory
+        agent.memory_bank.append({
+            "type": "select_research_direction",
+            "direction": selection['topic'],
+            "detailed_focus": selection['detailed_focus'],
+            "thought": selection['reason'],
+            "year": year,
+            "timestamp": time.time(),
+        })
+
+        directions[agent.id] = {
+            "direction": DIRECTIONS_DICT[selection['topic']],
+            "detailed_focus": selection['detailed_focus'],
+            "reason": selection['reason'],
+        }
+
+    logger.info(f"[Direction] Batch assignment complete: {len(directions)} directions assigned")
+    return directions
+
+
+def assign_directions_individual(
+        agent,  # SimulationAgent
+        year: int,
+        paper_tracker: PaperTracker,
+        candidate_directions: List[ResearchDirection] = None,
+        average_funding_level: float = None
+) -> Dict[str, ResearchDirection]:
+    """Assign research directions one agent at a time using LLM-based selection
+
+    Each agent uses LLM to select from their inherent expertise based on:
+    - Past publication record (accepted/rejected papers)
+    - Current funding situation
+    - Recent review experiences
+    - Strategic career considerations
+
+    Args:
+        agent: Agent object to assign direction to
+        year: Current simulation year
+        paper_tracker: PaperTracker for retrieving past papers
+        candidate_directions: Optional list of candidate directions
+        average_funding_level: Average funding level of all agents
+
+    Returns:
+        Dictionary with 'direction', 'detailed_focus', 'reason'
+    """
+    prompt, response_format, core_expertise, related_expertise = build_direction_prompt(
+        agent=agent,
+        year=year,
+        paper_tracker=paper_tracker,
+        candidate_directions=candidate_directions,
+        average_funding_level=average_funding_level
+    )
+
+    candidate_directions_list = core_expertise + related_expertise
+
+    for _ in range(agent.max_retries):
+
+        try:
+            selection, message_history = agent.llm.generate(prompt=prompt, response_format=response_format)
             assert all(field in selection for field in {'topic', 'detailed_focus',
                                                         'reason'}), f"Some fields are missing in the response of research direction selection. Existing fields: {str(list(selection.keys()))}"
 
-            assert selection['topic'] in candidate_directions or selection[
-                'topic'] in related_expertise, f"The selected topic {selection['topic']} is not in the candidate directions or related expertise. Candidate directions: {str(candidate_directions)}. Related expertise: {str(related_expertise)}"
-            
+            assert selection['topic'] in candidate_directions_list or selection[
+                'topic'] in related_expertise, f"The selected topic {selection['topic']} is not in the candidate directions or related expertise. Candidate directions: {str(candidate_directions_list)}. Related expertise: {str(related_expertise)}"
+
             break
-            
+
         except:
             traceback.print_exc()
             if _ >= agent.max_retries - 1:

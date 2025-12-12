@@ -1,19 +1,24 @@
 import base64
 import json
+import logging
 import math
 import os
+import re
 import sys
-import traceback
 from io import BytesIO
 from typing import List, Optional, Union, Dict, Tuple
-
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
 import google.generativeai as genai
 import numpy as np
 from PIL import Image
-from openai import AzureOpenAI, OpenAI, BadRequestError
+from openai import AzureOpenAI, OpenAI
+from const import IMPORTANT_NOTES
+
+logger = logging.getLogger(__name__)
 
 
-class LLM:
+class BaseLLM:
     def __init__(self, model_name):
         self.model_name = model_name
 
@@ -21,7 +26,7 @@ class LLM:
         raise NotImplementedError("Subclasses must implement this method")
 
 
-class GPT(LLM):
+class GPT(BaseLLM):
 
     def __init__(self, model_name):
         super().__init__(model_name)
@@ -46,84 +51,78 @@ class GPT(LLM):
                  response_format=None, message_history: Optional[List[Dict]] = []) -> Tuple[Dict, List[Dict]]:
         # System instructions for the GPT model
 
-        try:
-            # Handle string prompt with image formatting similar to process_sample_proprietary_models
-            content = [
-                {
-                    "type": "text",
-                    "text": prompt,
-                }
+        # Handle string prompt with image formatting similar to process_sample_proprietary_models
+        content = [
+            {
+                "type": "text",
+                "text": prompt,
+            }
+        ]
+
+        # Add images if provided
+        if image is not None:
+            if isinstance(image, Image.Image):
+                image = [image]
+
+            if isinstance(image, list):
+                for img in image:
+                    if isinstance(img, str):
+                        encoded_image = load_base64_image(img)
+                    else:
+                        # Convert PIL Image to base64
+                        img_buffer = BytesIO()
+
+                        if img.mode != 'RGB':
+                            img = img.convert('RGB')
+                        img.save(img_buffer, format='JPEG')
+                        encoded_image = base64.b64encode(img_buffer.getvalue()).decode('utf-8')
+
+                    content.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{encoded_image}"}
+                    })
+
+        messages = []
+        if message_history != []:
+            new_message = [{
+                "role": "user",
+                "content": content
+            }]
+            messages = message_history + new_message
+
+        else:
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": content}
             ]
 
-            # Add images if provided
-            if image is not None:
-                if isinstance(image, Image.Image):
-                    image = [image]
+        assert len(messages) > 0, "Message history is empty"
 
-                if isinstance(image, list):
-                    for img in image:
-                        if isinstance(img, str):
-                            encoded_image = load_base64_image(img)
-                        else:
-                            # Convert PIL Image to base64
-                            img_buffer = BytesIO()
+        response = self.client.chat.completions.create(
+            model=self.model_name,
+            messages=messages,
+            temperature=temperature,
+            response_format={"type": "json_object"}  # response_format
+        )
 
-                            if img.mode != 'RGB':
-                                img = img.convert('RGB')
-                            img.save(img_buffer, format='JPEG')
-                            encoded_image = base64.b64encode(img_buffer.getvalue()).decode('utf-8')
+        response_content = response.choices[0].message.content
 
-                        content.append({
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{encoded_image}"}
-                        })
+        if response_content is None:
+            raise ValueError("Empty response from model")
 
-            messages = []
-            if message_history != []:
-                new_message = [{
-                    "role": "user",
-                    "content": content
-                }]
-                messages = message_history + new_message
+        response_json = json.loads(response_content.strip())
+        messages.append({
+            "role": "assistant",
+            "content": [{
+                "type": "text",
+                "text": response_content
+            }]
+        })
 
-            else:
-                messages = [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": content}
-                ]
-
-            assert len(messages) > 0, "Message history is empty"
-
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=messages,
-                temperature=temperature,
-                response_format={"type": "json_object"}  # response_format
-            )
-
-            response_content = response.choices[0].message.content
-
-            if response_content is None:
-                raise ValueError("Empty response from model")
-
-            response_json = json.loads(response_content.strip())
-            messages.append({
-                "role": "assistant",
-                "content": [{
-                    "type": "text",
-                    "text": response_content
-                }]
-            })
-
-            return response_json, messages
-
-        except BadRequestError as e:
-            print(f"Error generating content with GPT-4o")
-            traceback.print_exc()
-            return None
+        return response_json, messages
 
 
-class Gemini(LLM):
+class Gemini(BaseLLM):
     def __init__(self, model_name, **kwargs):
         super().__init__(model_name)
         self.model_name = model_name
@@ -172,13 +171,9 @@ class Gemini(LLM):
         if prompt:
             content_parts.append(prompt)
 
-        try:
-            response = self.client.generate_content(content_parts, generation_config=self.config)
-            response.resolve()
-            return response.text.strip()
-        except Exception as e:
-            print(f"Error generating content with Gemini: {e}")
-            return f"Error: {str(e)}"
+        response = self.client.generate_content(content_parts, generation_config=self.config)
+        response.resolve()
+        return response.text.strip()
 
     def complete(self, prompt: str):
         """
@@ -206,6 +201,478 @@ class Gemini(LLM):
         # For now, return a placeholder embedding since Gemini doesn't have a direct embedding API
         # This will cause the similarity computation to return random results
         return np.zeros(768)  # Return a zero vector as placeholder
+
+
+def parse_json_response(text: str) -> Dict:
+    """Parse JSON from model response text
+
+    Attempts multiple parsing strategies:
+    1. Direct json.loads()
+    2. Extract from ```json ... ``` blocks
+    3. Regex match for {...} object
+
+    Also strips Qwen3 </think> content if present.
+
+    Args:
+        text: Raw model response text
+
+    Returns:
+        Parsed JSON dictionary
+
+    Raises:
+        ValueError: If JSON parsing fails
+    """
+    text = text.strip()
+
+    # For Qwen3 thinking mode, extract content after </think> tag
+    if "</think>" in text:
+        text = text.split("</think>")[-1].strip()
+
+    # Strategy 1: Direct parse
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Strategy 2: Extract from markdown code blocks
+    json_block_pattern = r"```(?:json)?\s*([\s\S]*?)\s*```"
+    matches = re.findall(json_block_pattern, text)
+    for match in matches:
+        try:
+            return json.loads(match.strip())
+        except json.JSONDecodeError:
+            continue
+
+    # Strategy 3: Find JSON object with regex
+    json_obj_pattern = r"\{[\s\S]*\}"
+    match = re.search(json_obj_pattern, text)
+    if match:
+        try:
+            return json.loads(match.group())
+        except json.JSONDecodeError:
+            pass
+
+    raise ValueError(f"Failed to parse JSON from response: {text[:500]}...")
+
+
+class VLLMModel(BaseLLM):
+    """vLLM-accelerated model wrapper with same interface as GPT class
+
+    This class wraps vLLM for efficient batched inference while maintaining
+    the same generate() interface as the GPT class for compatibility.
+    """
+    
+    
+    def __init__(
+        self,
+        model_name: str = "Qwen/Qwen3-8B",
+        tensor_parallel_size: int = 1,
+        gpu_memory_utilization: float = 0.8,
+        max_model_len: int = None,
+        enable_thinking: bool = False,
+        distributed_executor_backend: str = "mp",
+        **kwargs
+    ):
+        """Initialize vLLM model
+
+        Args:
+            model_name: HuggingFace model name (e.g., "Qwen/Qwen3-8B")
+            tensor_parallel_size: Number of GPUs for tensor parallelism
+            gpu_memory_utilization: Fraction of GPU memory to use
+            max_model_len: Maximum sequence length (optional, vLLM auto-detects if None)
+            enable_thinking: Whether to enable thinking mode for Qwen3
+            distributed_executor_backend: Backend for multi-GPU ("mp" for single, "nccl" for multi)
+        """
+        from vllm import LLM as vLLMLLM
+
+        super().__init__(model_name)
+        self.tensor_parallel_size = tensor_parallel_size
+        self.gpu_memory_utilization = gpu_memory_utilization
+        self.max_model_len = max_model_len
+        self.enable_thinking = enable_thinking
+
+        # Ensure vLLM uses 'spawn' method for CUDA compatibility
+        os.environ.setdefault('VLLM_WORKER_MULTIPROC_METHOD', 'spawn')
+
+        # Build LLM initialization arguments
+        llm_kwargs = {
+            'model': model_name,
+            'tensor_parallel_size': tensor_parallel_size,
+            'gpu_memory_utilization': gpu_memory_utilization,
+            'trust_remote_code': True,
+        }
+
+        # Only add max_model_len if explicitly specified
+        if max_model_len is not None:
+            llm_kwargs['max_model_len'] = max_model_len
+
+        # Only add distributed backend for multi-GPU
+        if tensor_parallel_size > 1:
+            llm_kwargs['distributed_executor_backend'] = distributed_executor_backend
+
+        # Initialize vLLM engine
+        logger.info(f"Initializing vLLM with model {model_name}")
+        self.model = vLLMLLM(**llm_kwargs)
+
+        # Get tokenizer from model (preferred method)
+        self.tokenizer = self.model.get_tokenizer()
+
+        logger.info(f"vLLM model {model_name} loaded successfully")
+
+    def _format_messages(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        message_history: Optional[List[Dict]] = None
+    ) -> str:
+        """Format messages using the model's chat template
+
+        Args:
+            prompt: User prompt
+            system_prompt: Optional system prompt
+            message_history: Optional message history
+
+        Returns:
+            Formatted input text for the model
+        """
+        messages = []
+
+        if message_history:
+            messages = message_history.copy()
+            messages.append({"role": "user", "content": prompt})
+        else:
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+            messages.append({"role": "user", "content": prompt})
+
+        # Apply chat template
+        formatted = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=self.enable_thinking
+        )
+
+        return formatted
+
+    def _parse_json_response(self, response_text: str) -> Dict:
+        """Parse JSON from model response text (delegates to module-level function)"""
+        return parse_json_response(response_text)
+
+    def generate(
+        self,
+        prompt: Optional[str] = None,
+        image: Optional[List[Union[str, Image.Image]]] = None,
+        temperature: float = 0.7,
+        system_prompt: Optional[str] = "This is a simulation of an academic ecosystem, where researchers choose research directions and submit papers, reviewers conduct peer reviews of papers, and funding agencies allocate fundings.",
+        response_format=None,
+        message_history: Optional[List[Dict]] = None,
+        max_tokens: int = 2048
+    ) -> Tuple[Dict, List[Dict]]:
+        """Generate response for a single prompt
+
+        Args:
+            prompt: User prompt
+            image: Not supported for vLLM text models (ignored)
+            temperature: Sampling temperature
+            system_prompt: System prompt for context
+            response_format: Ignored (JSON parsing is handled internally)
+            message_history: Optional message history
+            max_tokens: Maximum tokens to generate
+
+        Returns:
+            Tuple of (parsed_json_dict, message_history)
+        """
+        if image is not None:
+            logger.warning("VLLMModel does not support images, ignoring image parameter")
+
+        # Format input
+        formatted_input = self._format_messages(prompt, system_prompt, message_history)
+
+        # Set sampling parameters
+        from vllm import SamplingParams
+        sampling_params = SamplingParams(
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stop=["```\n\n", "\n\n\n"],  # Stop at end of JSON block
+        )
+
+        # Generate
+        outputs = self.model.generate([formatted_input], sampling_params)
+        response_text = outputs[0].outputs[0].text.strip()
+
+        # Parse JSON
+        response_json = self._parse_json_response(response_text)
+
+        # Build message history
+        if message_history:
+            messages = message_history.copy()
+        else:
+            messages = []
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+
+        messages.append({"role": "user", "content": prompt})
+        messages.append({
+            "role": "assistant",
+            "content": [{"type": "text", "text": response_text}]
+        })
+
+        return response_json, messages
+
+    def generate_batch(
+        self,
+        prompts: List[str],
+        response_format: Optional[Dict] = None,
+        temperature: float = 0.7,
+        system_prompt: Optional[str] = "This is a simulation of an academic ecosystem, where researchers choose research directions and submit papers, reviewers conduct peer reviews of papers, and funding agencies allocate fundings.",
+        max_tokens: int = 2048,
+        desc: Optional[str] = None
+    ) -> List[Tuple[Dict, List[Dict]]]:
+        """Process ALL prompts in a single vLLM call - no for-loop over prompts
+
+        This is the key batching method that processes all prompts at once
+        using vLLM's internal batching capabilities for maximum efficiency.
+
+        Args:
+            prompts: List of user prompts to process
+            response_format: Optional dict with 'json_schema' containing the schema for guided decoding
+            temperature: Sampling temperature
+            system_prompt: System prompt for all requests
+            max_tokens: Maximum tokens per response
+
+        Returns:
+            List of (parsed_json_dict, message_history) tuples, one per prompt
+        """
+        from vllm import SamplingParams
+        from vllm.sampling_params import StructuredOutputsParams
+
+        if not prompts:
+            return []
+
+        # Step 1: Format all prompts with chat template
+        formatted_inputs = [
+            self._format_messages(prompt, system_prompt, None)
+            for prompt in prompts
+        ]
+
+        # Step 2: Extract JSON schema for structured outputs if provided
+        structured_outputs = None
+        if response_format:
+            # Extract schema from response_format dict
+            # Expected format: {'type': 'json_schema', 'json_object': {'schema': {...}}}
+            if response_format.get('type') == 'json_schema':
+                json_object = response_format.get('json_object', {})
+                json_schema = json_object.get('schema')
+                if json_schema:
+                    structured_outputs = StructuredOutputsParams(json=json_schema)
+
+        # Step 3: SINGLE vLLM call for all prompts at once
+        sampling_params_kwargs = {
+            'temperature': temperature,
+            'max_tokens': max_tokens,
+        }
+        # Only add stop sequences if not using structured outputs (they can conflict)
+        if structured_outputs is None:
+            sampling_params_kwargs['stop'] = ["```\n\n", "\n\n\n"]
+        else:
+            sampling_params_kwargs['structured_outputs'] = structured_outputs
+
+        sampling_params = SamplingParams(**sampling_params_kwargs)
+
+        label = desc or f"batch of {len(prompts)} prompts"
+        logger.info(f"[vLLM] Generating {label} ...")
+        outputs = self.model.generate(formatted_inputs, sampling_params=sampling_params)
+
+        # Step 3: Parse JSON from each response
+        results = []
+        for i, output in enumerate(outputs):
+            response_text = output.outputs[0].text.strip()
+
+            response_json = self._parse_json_response(response_text)
+
+            # Build message history for this prompt
+            messages = []
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+            messages.append({"role": "user", "content": prompts[i]})
+            messages.append({
+                "role": "assistant",
+                "content": [{"type": "text", "text": response_text}]
+            })
+
+            results.append((response_json, messages))
+
+        logger.info(f"Batch generation complete: {len(results)} responses")
+        return results
+
+
+class VLLMServerModel(BaseLLM):
+    """Connects to an external vLLM server via OpenAI-compatible API.
+
+    This avoids in-process model loading (30-300s) by connecting to a
+    persistent vLLM server started separately (e.g., `vllm serve Qwen/Qwen3-0.6B`).
+    """
+
+    def __init__(
+        self,
+        model_name: str,
+        base_url: str = "http://localhost:8000/v1",
+        max_concurrent_requests: int = 32,
+        enable_thinking: bool = False,
+    ):
+        super().__init__(model_name)
+        self.base_url = base_url
+        self.max_concurrent_requests = max_concurrent_requests
+        self.enable_thinking = enable_thinking
+
+        # vLLM server doesn't need a real API key
+        self.client = OpenAI(base_url=base_url, api_key="EMPTY")
+
+        # Test connection (warning only, not fatal)
+        self.client.models.list()
+        logger.info(f"Connected to vLLM server at {base_url} (model: {model_name})")
+        
+    def _build_extra_body(self, response_format: Optional[Dict] = None) -> dict:
+        """Translate response_format to vLLM guided decoding extra_body"""
+        extra_body = {}
+        if response_format and response_format.get('type') == 'json_schema':
+            json_object = response_format.get('json_object', {})
+            schema = json_object.get('schema')
+            if schema:
+                extra_body['guided_json'] = schema
+        return extra_body
+
+    def generate(
+        self,
+        prompt: Optional[str] = None,
+        image: Optional[List[Union[str, Image.Image]]] = None,
+        temperature: float = 0.7,
+        system_prompt: Optional[str] = "This is a simulation of an academic ecosystem, where researchers choose research directions and submit papers, reviewers conduct peer reviews of papers, and funding agencies allocate fundings.",
+        response_format=None,
+        message_history: Optional[List[Dict]] = None,
+        max_tokens: int = 2048,
+    ) -> Tuple[Dict, List[Dict]]:
+        """Generate response via the external vLLM server.
+
+        Returns:
+            Tuple of (parsed_json_dict, message_history)
+        """
+        if image is not None:
+            logger.warning("VLLMServerModel does not support images, ignoring image parameter")
+
+        # Build messages (server applies chat template)
+        if message_history:
+            messages = message_history.copy()
+            messages.append({"role": "user", "content": prompt})
+        else:
+            messages = []
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+            messages.append({"role": "user", "content": prompt})
+
+        extra_body = self._build_extra_body(response_format)
+        if self.enable_thinking:
+            extra_body['chat_template_kwargs'] = {"enable_thinking": True}
+
+        response = self.client.chat.completions.create(
+            model=self.model_name,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            extra_body=extra_body if extra_body else None,
+        )
+
+        response_text = response.choices[0].message.content.strip()
+
+        response_json = parse_json_response(response_text)
+
+        messages.append({
+            "role": "assistant",
+            "content": [{"type": "text", "text": response_text}]
+        })
+
+        return response_json, messages
+
+    def generate_batch(
+        self,
+        prompts: List[str],
+        response_format: Optional[Dict] = None,
+        temperature: float = 0.7,
+        system_prompt: Optional[str] = "This is a simulation of an academic ecosystem, where researchers choose research directions and submit papers, reviewers conduct peer reviews of papers, and funding agencies allocate fundings.",
+        max_tokens: int = 2048,
+        desc: Optional[str] = None,
+    ) -> List[Tuple[Dict, List[Dict]]]:
+        """Process prompts concurrently via the external vLLM server.
+
+        Uses ThreadPoolExecutor — the vLLM server handles continuous batching internally.
+
+        Returns:
+            List of (parsed_json_dict, message_history) tuples, one per prompt.
+        """
+
+        if not prompts:
+            return []
+
+        extra_body = self._build_extra_body(response_format)
+        if self.enable_thinking:
+            extra_body['chat_template_kwargs'] = {"enable_thinking": True}
+
+        max_retries = 3
+
+        def _call_single(idx_prompt):
+            idx, prompt = idx_prompt
+            prompt_with_notes = f"{prompt}\n{IMPORTANT_NOTES}"
+            msgs = []
+            if system_prompt:
+                msgs.append({"role": "system", "content": system_prompt})
+            msgs.append({"role": "user", "content": prompt_with_notes})
+
+            success = False
+            response_text = ""
+            response_json = None
+            for attempt in range(max_retries):
+                try:
+                    resp = self.client.chat.completions.create(
+                        model=self.model_name,
+                        messages=msgs,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        extra_body=extra_body if extra_body else None,
+                    )
+                    response_text = resp.choices[0].message.content.strip()
+                    response_json = parse_json_response(response_text)
+                    if response_json is None and response_format is not None:
+                        raise ValueError("Parsed JSON is None but structured output was expected")
+                    success = True
+                    break
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"Prompt {idx} attempt {attempt + 1}/{max_retries} failed: {e}. Retrying...")
+                    else:
+                        logger.error(f"Prompt {idx} failed after {max_retries} attempts: {e}")
+
+            if not success:
+                return idx, (None, msgs)
+
+            msgs.append({
+                "role": "assistant",
+                "content": [{"type": "text", "text": response_text}]
+            })
+            return idx, (response_json, msgs)
+
+        label = desc or f"batch of {len(prompts)} prompts"
+        logger.info(f"[vLLM Server] Generating {label} ...")
+
+        results = [None] * len(prompts)
+        with ThreadPoolExecutor(max_workers=self.max_concurrent_requests) as executor:
+            futures = {executor.submit(_call_single, (i, p)): i for i, p in enumerate(prompts)}
+            for future in tqdm(as_completed(futures), total=len(prompts), desc=label):
+                idx, result = future.result()
+                results[idx] = result
+
+        logger.info(f"Batch generation complete: {len(results)} responses")
+        return results
 
 
 def load_base64_image(image_input: Union[str, Image.Image], format: str = "JPEG") -> str:

@@ -56,23 +56,17 @@ This system creates a multi-agent simulation where different types of academic e
 - [ ] Paper archive and citation graph management
 - [ ] Metrics calculation (novelty, bias, convergence)
 
-## 🧪 Testing
-
-### Run All Tests
-```bash
-# Phase 1: Agent Framework Tests
-python tests/agents/test_runner.py
-
-# Review System Tests  
-python tests/agents/test_review_system.py
-```
-
-### VS Code Debug Configurations
-- **[Test] Phase 1: Agent Framework** - Core agent functionality
-- **[Test] Review System** - Internal review pipeline
-- **[Test] Phase 1: Integration Tests** - Cross-component integration
-
 ## 🚀 Usage Examples
+
+### Running the code
+
+```bash
+python -m vllm.entrypoints.openai.api_server --model Qwen/Qwen3-0.6B --gpu-memory-utilization 0.9 --max-model-len 8192
+
+CUDA_VISIBLE_DEVICES=5 python -m vllm.entrypoints.openai.api_server --model Qwen/Qwen3-0.6B --gpu-memory-utilization 0.95 --max-model-len 16384
+
+CUDA_VISIBLE_DEVICES=2,3,4,5 python -m vllm.entrypoints.openai.api_server --model Qwen/Qwen3-8B --gpu-memory-utilization 0.95 --max-model-len 32768
+```
 
 ### Basic Agent Creation
 ```python
@@ -127,39 +121,3 @@ This framework enables investigation of:
 5. **Innovation vs. Incrementalism**: How do different reward structures affect the balance between novel and incremental research?
 
 ## 📁 Project Structure
-
-```
-ai_scientist/
-├── agents/                    # Multi-agent system
-│   ├── base_agent.py         # Core SimulationAgent and MultiAgentEcosystem
-│   └── researcher_agents.py # UniversityResearcher, IndustryResearcher, etc.
-├── review/                   # Internal review system
-│   ├── __init__.py
-│   ├── prompts.py           # Personality-specific review prompts
-│   └── review_pipeline.py   # AgentReviewPipeline implementation
-tests/agents/                 # Comprehensive test suite
-├── test_runner.py           # Phase 1 framework tests
-└── test_review_system.py    # Review system tests
-const.py                     # Cost constants (RESEARCH_COST, PAPER_SUBMISSION_COST)
-```
-
-## 🎯 Next Steps
-
-1. **Phase 2 Implementation**: Simulation engine with temporal rounds
-2. **Metrics Dashboard**: Real-time visualization of ecosystem health  
-3. **Intervention System**: Policy controls for bias mitigation
-4. **Human Evaluation**: Validate AI vs human preference patterns
-5. **Publication Pipeline**: Generate results for academic publication
-
-## 📚 Research Context
-
-This project extends the **AI-Scientist-v2** framework to study emergent behaviors in AI-mediated scientific ecosystems. Unlike previous work that focuses on single-paper generation or review, we create a complete closed-loop system where agents both author and review papers, enabling study of complex interaction dynamics.
-
-**Potential Publications:**
-- "Emergent Behaviors in AI-Mediated Scientific Ecosystems" 
-- "Do Large Language Models Prefer AI-Written Papers? A Multi-Agent Study"
-- "The Impact of Funding Policies on AI-Driven Research Diversity"
-
----
-
-This framework provides a comprehensive platform for understanding how AI might reshape scientific discovery and academic institutions in the coming decades.

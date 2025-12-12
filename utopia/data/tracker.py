@@ -14,8 +14,9 @@ class FundingTracker:
     def __init__(self):
         self.funding_allocation_per_cycle: Dict[int, Dict[str, float]] = {}  # year -> total funding
         self.consumption_per_cycle: Dict[int, Dict[str, float]] = {}     # year -> total consumed
-        
+
         self.growth_rate = 0.1 # 10% growth rate for the fundings
+        self.funding_allocation_mode = 'consumption_based'  # set externally after init
 
     def start_cycle(self, year: int, agents: Dict[str, Any]) -> float:
         """Record total funding at start of cycle.
@@ -97,8 +98,9 @@ class FundingTracker:
         self.funding_allocation_per_cycle[year][agent_type] += amount
         
         logger.debug(f"[Funding Allocation] {agent_type} - {original_amount} -> {self.funding_allocation_per_cycle[year][agent_type]} (Target: {target_total})")
-        
-        assert self.funding_allocation_per_cycle[year][agent_type] <= target_total, f"Funding allocation for {agent_type} in year {year} is greater than the target total {target_total}. Current: {self.funding_allocation_per_cycle[year][agent_type]}, Target: {target_total}."
+
+        if self.funding_allocation_mode != 'fixed':
+            assert self.funding_allocation_per_cycle[year][agent_type] <= target_total, f"Funding allocation for {agent_type} in year {year} is greater than the target total {target_total}. Current: {self.funding_allocation_per_cycle[year][agent_type]}, Target: {target_total}."
         
         
     def get_funding_consumption(self, year: int):
@@ -207,18 +209,40 @@ class CitationTracker:
 
     def __init__(self):
         self.citations: Dict[str, Set[str]] = {}  # cited_paper_id -> [citing_paper_ids]
+        self.references: Dict[str, Set[str]] = {}  # citing_paper_id -> [cited_paper_ids]
 
     def add_citations(self, citing_paper_id: str, cited_paper_ids: Union[str,List[str], Set[str]], year: int):
         """Add citations from a paper to its references."""
+        if isinstance(cited_paper_ids, str):
+            cited_paper_ids = [cited_paper_ids]
+
+        # Store forward citations (cited -> citers)
         for cited_id in cited_paper_ids:
             if cited_id not in self.citations:
                 self.citations[cited_id] = set()
             if citing_paper_id not in self.citations[cited_id]:
                 self.citations[cited_id].add(citing_paper_id)
 
+        # Store reverse citations (citer -> cited)
+        if citing_paper_id not in self.references:
+            self.references[citing_paper_id] = set()
+        self.references[citing_paper_id].update(cited_paper_ids)
+
     def get_citations(self, paper_id: str) -> List[str]:
         """Get papers that cite this paper."""
-        return self.citations.get(paper_id, [])
+        return list(self.citations.get(paper_id, []))
+
+    def get_citations_to_paper(self, paper_id: str) -> List[str]:
+        """Alias for get_citations - get papers that cite this paper."""
+        return self.get_citations(paper_id)
+
+    def get_papers_citing(self, paper_id: str) -> List[str]:
+        """Alias for get_citations - get papers that cite this paper."""
+        return self.get_citations(paper_id)
+
+    def get_citations_from_paper(self, paper_id: str) -> List[str]:
+        """Get papers cited by this paper (its references)."""
+        return list(self.references.get(paper_id, []))
 
     def get_citation_count(self, paper_id: str) -> int:
         """Get number of citations for a paper."""
@@ -226,11 +250,15 @@ class CitationTracker:
 
     def to_dict(self) -> Dict:
         """Serialize to dict."""
-        return {"citations": {k: list(v) for k, v in self.citations.items()}}
+        return {
+            "citations": {k: list(v) for k, v in self.citations.items()},
+            "references": {k: list(v) for k, v in self.references.items()}
+        }
 
     @classmethod
     def from_dict(cls, data: Dict) -> "CitationTracker":
         """Deserialize from dict."""
         tracker = cls()
-        tracker.citations = {k: set(v) for k, v in data["citations"].items()}
+        tracker.citations = {k: set(v) for k, v in data.get("citations", {}).items()}
+        tracker.references = {k: set(v) for k, v in data.get("references", {}).items()}
         return tracker

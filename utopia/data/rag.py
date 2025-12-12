@@ -12,28 +12,26 @@ References:
 
 import asyncio
 import json
-import matplotlib.pyplot as plt
 import numpy as np
 import os
 import re
 import datetime
 import pickle
-import pacmap
+from collections import Counter
 import torch
 import torch.nn.functional as F
 from dataclasses import dataclass
-from datasets import load_dataset
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
 # LangChain imports
 from langchain_core.documents import Document
 from pathlib import Path
-from sentence_transformers import SentenceTransformer
 # Scientific computing
-from sklearn.preprocessing import normalize
 from time import time
 from tqdm import trange, tqdm
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, TYPE_CHECKING
+
+from datasets import load_dataset
+
+from langchain_community.vectorstores import FAISS
 
 from utopia.utils.data_utils import read_json
 
@@ -50,7 +48,8 @@ class RAGConfig:
     num_docs_final: int = 5
     normalize_embeddings: bool = True
     use_langchain: bool = False
-    device: str = "mps:0" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
+    device: str = "cuda:0" if torch.cuda.is_available() else "cpu"
+    n_workers: int = 32  # Number of workers for parallel dataset processing (1 = sequential)
 
 
 class RAG:
@@ -59,18 +58,22 @@ class RAG:
     def __init__(self, config: RAGConfig = None, use_langchain: bool = False, debug: bool = False, **kwargs):
         self.config = config
         self.embeddings = None
-        self.knowledge_index: Optional[FAISS] = None
+        self.knowledge_index: Optional["FAISS"] = None
         self.debug = debug
         self.device = config.device
         self.use_langchain: bool = use_langchain
+
+        # Year-based data partitioning
+        self.start_real_year: int = kwargs.get('start_real_year', 2016)
+        self.current_sim_year: int = 0
 
         # All documents and their mappings
         self.documents: List[Document] = []  # All documents
         self.document_embeddings: Optional[torch.Tensor] = None
         self.id2docs: Dict[str, Document] = {}
 
-        
-        self.document_status = pd.DataFrame(columns=['id', 'status'])
+
+        self.document_status = pd.DataFrame(columns=['id', 'status', 'publication_year'])
         
         
         
@@ -81,12 +84,16 @@ class RAG:
             pass
 
         else:
-            assert kwargs.get('model') is not None, "Model must be provided if use_langchain is False"
-            self.sentence_transformer_model = kwargs.get('model')
+            self.sentence_transformer_model = kwargs.get('model')  # Lazy-loaded later via _ensure_sentence_transformer()
         
-    def load_documents(self, data_path: str = None) -> List[Document]:
-        """Load documents from JSON file"""
-        
+    def load_documents(self, data_path: str = None, num_years: int = 10) -> List[Document]:
+        """Load documents from JSON file
+
+        Args:
+            data_path: Path to local JSON data file (used in debug mode)
+            num_years: Number of simulation years
+        """
+
         def _normalize_whitespace(text: str) -> str:
             return re.sub(r'\s+', ' ', (text or '').replace('\n', ' ')).strip()
 
@@ -96,93 +103,184 @@ class RAG:
                 return pd.NaT
             if isinstance(ts, (pd.Timestamp, datetime.datetime)):
                 return pd.Timestamp(ts)
-            
+
             return pd.to_datetime(ts)
-        
+
+        self.num_years = num_years
+        end_real_year = self.start_real_year + self.num_years - 1
+        valid_years = set(range(self.start_real_year, end_real_year + 1))
+
         self.id2docs = {}
         if self.debug:
             dataset = read_json("data/additional_data_2024_7.json")
-            
-            
+
+            nat_count = 0
             for item in dataset[:256]:
 
                 title = re.sub(r'\s+', ' ', item.get('title', '').replace('\n', ' ')).strip()
                 abstract = re.sub(r'\s+', ' ', item.get('summary', '').replace('\n', ' ')).strip()
-                
+
+                published = _as_datetime(item.get('published', ''))
+                if pd.isna(published):
+                    nat_count += 1
+                    continue
+
+                pub_year = published.year
+                if pub_year not in valid_years:
+                    continue
+
                 metadata = {
                     'id': item.get('id', ''),
                     'title': title,
-                    # 'tags': ', '.join(item.get('tags', [])),
-                    'published': _as_datetime(item.get('published', '')),
+                    'published': published,
+                    'publication_year': pub_year,
                 }
 
-                # Create document with summary as content
                 doc = Document(
                     page_content=abstract,
                     metadata=metadata
                 )
                 self.id2docs[item['id']] = doc
-                
+
+            if nat_count > 0:
+                print(f"[RAG] Skipped {nat_count} papers with missing publication dates")
 
             docs = list(self.id2docs.values())
             self.documents = docs
-            
 
         else:
-            cache_path = "outputs/cache_scievo.pkl"
+            cache_path = f"outputs/cache_scievo_{self.start_real_year}-{end_real_year}.pkl"
             if os.path.exists(cache_path):
+                print(f"[Cache HIT] Loading documents from {cache_path}")
                 with open(cache_path, 'rb') as f:
                     cache_data = pickle.load(f)
                 self.documents = cache_data['documents']
-                
-                
+
             else:
                 dataset = load_dataset("Ahren09/SciEvo", "arxiv", split="train")
-                
+
                 self.id2docs = {}
-                
-                for item in tqdm(dataset.select(range(len(dataset) - 100000, len(dataset))), desc="Processing dataset"):
-                    title = _normalize_whitespace(item.get('title', ''))
-                    abstract = _normalize_whitespace(item.get('summary', ''))
 
-                    # tags_list = _as_tag_list(item)
-                    published = _as_datetime(item.get('published', ''))
+                n_workers = self.config.n_workers
+                num_proc = n_workers if n_workers > 1 else None
 
-                    metadata = {
-                        'id': item.get('id', '').replace('http://', 'https://'),
-                        'title': title,
-                        # 'tags': ', '.join(tags_list),
-                        'published': published,
-                    }
+                if num_proc:
+                    # Parallel path: use HF datasets built-in multiprocessing
+                    print(f"[RAG] Processing dataset with {n_workers} workers...")
 
-                    doc = Document(page_content=abstract, metadata=metadata)
-                    
-                    self.id2docs[metadata['id']] = doc
+                    def _parse_pub_year(item):
+                        ts = item.get('published', '')
+                        if ts is None or ts == '':
+                            return {'_pub_year': -1}
+                        try:
+                            dt = pd.to_datetime(ts)
+                            return {'_pub_year': dt.year if not pd.isna(dt) else -1}
+                        except Exception:
+                            return {'_pub_year': -1}
+
+                    dataset = dataset.map(_parse_pub_year, num_proc=num_proc, desc="Parsing dates")
+
+                    nat_count = sum(1 for y in dataset['_pub_year'] if y == -1)
+
+                    valid_years_list = sorted(valid_years)
+                    valid_years_set_for_filter = set(valid_years_list)
+                    dataset = dataset.filter(
+                        lambda x: x['_pub_year'] in valid_years_set_for_filter,
+                        num_proc=num_proc,
+                        desc="Filtering by year",
+                    )
+
+                    df = dataset.to_pandas()
+
+                    # Vectorized operations — no per-item Python calls
+                    df['_published'] = pd.to_datetime(df['published'])
+                    df['_id'] = df['id'].str.replace('http://', 'https://', regex=False)
+
+                    # Build Document list via zip over numpy arrays (no for-loop)
+                    self.documents = [
+                        Document(
+                            page_content=abstract,
+                            metadata={'id': id_, 'title': title, 'published': pub, 'publication_year': year}
+                        )
+                        for abstract, id_, title, pub, year in zip(
+                            df['summary'].values, df['_id'].values, df['title'].values,
+                            df['_published'].values, df['_pub_year'].values,
+                        )
+                    ]
+                    self.id2docs = dict(zip(df['_id'].values, self.documents))
+
+                else:
+                    # Sequential path (original)
+                    nat_count = 0
+                    for item in tqdm(dataset, desc="Processing dataset"):
+                        title = _normalize_whitespace(item.get('title', ''))
+                        abstract = _normalize_whitespace(item.get('summary', ''))
+
+                        published = _as_datetime(item.get('published', ''))
+                        if pd.isna(published):
+                            nat_count += 1
+                            continue
+
+                        pub_year = published.year
+                        if pub_year not in valid_years:
+                            continue
+
+                        metadata = {
+                            'id': item.get('id', '').replace('http://', 'https://'),
+                            'title': title,
+                            'published': published,
+                            'publication_year': pub_year,
+                        }
+
+                        doc = Document(page_content=abstract, metadata=metadata)
+                        self.id2docs[metadata['id']] = doc
+
+                if nat_count > 0:
+                    print(f"[RAG] Skipped {nat_count} papers with missing publication dates")
 
                 docs = list(self.id2docs.values())
                 self.documents = docs
                 cache_data = {
                     'documents': self.documents,
                 }
+                os.makedirs(os.path.dirname(cache_path) or '.', exist_ok=True)
                 with open(cache_path, 'wb') as f:
                     pickle.dump(cache_data, f)
-            
+
             self.id2docs = {doc.metadata['id']: doc for doc in self.documents}
-        
-        self.document_status = pd.DataFrame(columns=['id', 'status'], data=[{'id': doc.metadata['id'], 'status': 'unsubmitted'} for doc in self.documents])
+
+        # Log year distribution
+        year_counts = Counter(doc.metadata['publication_year'] for doc in self.documents)
+        print(f"[RAG] Loaded {len(self.documents)} papers for years {self.start_real_year}-{end_real_year}:")
+        for yr in sorted(year_counts):
+            print(f"  {yr}: {year_counts[yr]} papers")
+
+        self.document_status = pd.DataFrame(
+            data=[{'id': doc.metadata['id'], 'status': 'unsubmitted', 'publication_year': doc.metadata['publication_year']} for doc in self.documents],
+            columns=['id', 'status', 'publication_year']
+        )
             
         
-    def mark_papers_as_submitted(self, paper_ids: List[str]):
-        """Mark papers as submitted"""
-        self.document_status.loc[self.document_status['id'].isin(paper_ids), 'status'] = 'submitted'
-        
+    def set_current_year(self, sim_year: int):
+        """Set the current simulation year for year-based data partitioning"""
+        self.current_sim_year = sim_year
+        real_year = self.start_real_year + sim_year - 1
+        available = (self.document_status['publication_year'] == real_year).sum()
+        unsubmitted = ((self.document_status['publication_year'] == real_year) & (self.document_status['status'] == 'unsubmitted')).sum()
+        print(f"[RAG] Sim year {sim_year} (real: {real_year}): {available} total papers, {unsubmitted} available for submission")
 
-    def initialize_sentence_transformer(self, model):
-        """Initialize SentenceTransformer embeddings"""
-        assert isinstance(model, SentenceTransformer), "Model must be a SentenceTransformer instance"
-        self.sentence_transformer_model = model
+    def _ensure_sentence_transformer(self):
+        """Lazily load SentenceTransformer on first use"""
+        if getattr(self, 'sentence_transformer_model', None) is None:
+            from sentence_transformers import SentenceTransformer
+            print(f"[Lazy Load] Loading SentenceTransformer({self.config.embedding_model}) on {self.device}...")
+            t0 = time()
+            self.sentence_transformer_model = SentenceTransformer(
+                self.config.embedding_model, device=self.device
+            )
+            print(f"[Lazy Load] SentenceTransformer loaded in {time() - t0:.1f}s")
 
-    def build_knowledge_index(self) -> FAISS:
+    def build_knowledge_index(self) -> "FAISS":
         """Build FAISS index with normalized embeddings using PyTorch tensors
 
         Builds TWO separate indices:
@@ -201,6 +299,8 @@ class RAG:
         if self.use_langchain:
             raise NotImplementedError("LangChain is not supported yet")
             # Branch 1: LangChain + FAISS
+            from langchain_community.embeddings import HuggingFaceEmbeddings
+            from langchain_community.vectorstores import FAISS
             print("[LangChain] Using HuggingFaceEmbeddings + FAISS")
             # Initialize embeddings
             self.embeddings = HuggingFaceEmbeddings(
@@ -246,29 +346,40 @@ class RAG:
             # Branch 2: Pure SentenceTransformer
             print("[SentenceTransformer] Encoding documents using SentenceTransformer")
 
-            # Initialize SentenceTransformer if not already done
-            if not hasattr(self, 'sentence_transformer_model') or self.sentence_transformer_model is None:
-                self.sentence_transformer_model = SentenceTransformer(
-                    self.config.embedding_model,
-                    device=self.device
-                )
+            # Lazy-load model on first use
+            self._ensure_sentence_transformer()
 
             # Encode all documents at once
             doc_texts = [doc.page_content for doc in self.documents]
             print(f"Encoding {len(doc_texts)} documents...")
-            
+
             # https://arxiv.org/pdf/1234.12345.pdf -> 0
             self.id2document_indices = {doc.metadata['id']: i for i, doc in enumerate(self.documents)}
 
-            self.document_embeddings = self.sentence_transformer_model.encode(
-                doc_texts,
-                convert_to_tensor=True,
-                normalize_embeddings=self.config.normalize_embeddings,
-                show_progress_bar=True,
-                batch_size=64,
-                device=self.device
-            )  # (D, dim)
-            
+            # Embedding disk cache: keyed by model name + doc count + year range
+            model_tag = self.config.embedding_model.replace("/", "_")
+            cache_file = f"outputs/cache_embeddings_{model_tag}_{len(doc_texts)}_y{self.start_real_year}.pt"
+
+            if os.path.exists(cache_file):
+                print(f"[Cache HIT] Loading embeddings from {cache_file}")
+                tc = time()
+                self.document_embeddings = torch.load(cache_file, map_location=self.device, weights_only=True)
+                print(f"[Cache HIT] Loaded in {time() - tc:.1f}s")
+            else:
+                print(f"[Cache MISS] Encoding {len(doc_texts)} documents...")
+                self.document_embeddings = self.sentence_transformer_model.encode(
+                    doc_texts,
+                    convert_to_tensor=True,
+                    normalize_embeddings=self.config.normalize_embeddings,
+                    show_progress_bar=True,
+                    batch_size=64,
+                    device=self.device
+                )  # (D, dim)
+
+                # Save to disk for next run
+                os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+                torch.save(self.document_embeddings, cache_file)
+                print(f"[Cache SAVE] Saved embeddings to {cache_file}")
 
             print(f"[SentenceTransformer] Encode documents: {time() - t0:.2f} seconds")
 
@@ -293,15 +404,21 @@ class RAG:
         """
         
         assert retrieval_type in ["submission", "accepted_papers", "accepted_or_rejected_papers"], "Invalid retrieval_type"
-        
+
         # Select the appropriate index
         if retrieval_type == "submission":
-            indices = (self.document_status[self.document_status['status'] == "unsubmitted"]).index.values
-            assert len(indices) > 0, "No candidate papers found!"
-            
-            print(f"[SUBMISSION INDEX] Retrieving papers for {len(queries)} queries from {len(indices)} papers ...")
-            
+            # Year-specific: only unsubmitted papers from current real-world year
+            real_year = self.start_real_year + self.current_sim_year - 1
+            indices = self.document_status[
+                (self.document_status['status'] == "unsubmitted") &
+                (self.document_status['publication_year'] == real_year)
+            ].index.values
+            assert len(indices) > 0, f"No candidate papers found for year {real_year}!"
+
+            print(f"[SUBMISSION INDEX] Retrieving papers for {len(queries)} queries from {len(indices)} papers (year={real_year})")
+
         elif retrieval_type in ["accepted_papers", "accepted_or_rejected_papers"]:
+            # Cumulative: all accepted/rejected papers from any prior year
             if retrieval_type == "accepted_papers":
                 indices = (self.document_status[self.document_status['status'] == "accept"]).index.values
             else:
@@ -335,6 +452,7 @@ class RAG:
         else:
             # Branch 2: SentenceTransformer - Simple Q x D similarity matrix
             print("[SentenceTransformer Branch] Computing Q x D similarity matrix...")
+            self._ensure_sentence_transformer()
 
             # Encode queries: shape (Q, embedding_dim)
             query_embeddings = self.sentence_transformer_model.encode(
@@ -413,8 +531,12 @@ class RAG:
             save_path: Path to save the plot
             show_plot: Whether to display the plot
         """
-        if not PACMAP_AVAILABLE:
-            print("PaCMAP not available. Skipping visualization.")
+        try:
+            import pacmap
+            import matplotlib.pyplot as plt
+            from sklearn.preprocessing import normalize
+        except ImportError:
+            print("PaCMAP/matplotlib not available. Skipping visualization.")
             return
 
         if self.document_embeddings is None:
@@ -549,14 +671,21 @@ class RAG:
     def to_dict(self) -> Dict:
         """Serialize RAG state (document status only, embeddings rebuilt on load)"""
         return {
-            'document_status': self.document_status.to_dict('records')
+            'document_status': self.document_status.to_dict('records'),
+            'start_real_year': self.start_real_year,
+            'current_sim_year': self.current_sim_year,
         }
 
     @classmethod
-    def from_dict(cls, data: Dict, config: RAGConfig, model=None, debug: bool = False) -> 'RAG':
+    def from_dict(cls, data: Dict, config: RAGConfig, model=None, debug: bool = False, **kwargs) -> 'RAG':
         """Reconstruct RAG from saved state"""
-        rag = cls(config=config, model=model, debug=debug)
+        start_real_year = data.get('start_real_year', kwargs.get('start_real_year', 2016))
+        rag = cls(config=config, model=model, debug=debug, start_real_year=start_real_year)
         rag.document_status = pd.DataFrame(data['document_status'])
+        # Backward compatibility: add publication_year column if missing
+        if 'publication_year' not in rag.document_status.columns:
+            rag.document_status['publication_year'] = 0
+        rag.current_sim_year = data.get('current_sim_year', 0)
         return rag
 
     def add_documents_to_corpus(self, new_documents: List[Document]):
@@ -617,6 +746,7 @@ class RAG:
         else:
             # SentenceTransformer branch
             print("[SentenceTransformer] Encoding new documents...")
+            self._ensure_sentence_transformer()
             new_embeddings = self.sentence_transformer_model.encode(
                 new_doc_texts,
                 convert_to_tensor=True,

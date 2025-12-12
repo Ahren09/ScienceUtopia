@@ -1,12 +1,11 @@
 """Funding agents and systems for academic and industry funding"""
 import logging
 import random
-import traceback
 from collections import Counter
 from typing import Dict, Set, List
 
 from utopia.config import SIMULATION_CONFIG
-from utopia.models.models import LLM
+from utopia.models.models import BaseLLM
 from .base_agent import SimulationAgent
 from .research_direction import ResearchDirection
 
@@ -122,7 +121,7 @@ class FundingProgram:
 class FundingAgency(SimulationAgent):
     """Funding agents primarily review and allocate resources"""
 
-    def __init__(self, agency_name: str, funding_level: int = 100, llm: LLM = None, default_funding_rate: float = None, max_retries: int = 10):
+    def __init__(self, agency_name: str, funding_level: int = 100, llm: BaseLLM = None, default_funding_rate: float = None, max_retries: int = 10):
         super().__init__(
             reputation=8,
             agent_id=agency_name,
@@ -399,7 +398,10 @@ Based on the following criteria, provide a complete ranking of all applications:
                 try:
                     result, message_history = self.llm.generate(prompt=prompt)
 
-                    ranked_apps = result.get('ranked_applications', [])
+                    if isinstance(result, list):
+                        ranked_apps = result
+                    else:
+                        ranked_apps = result.get('ranked_applications', [])
 
                     # Validate count
                     if len(ranked_apps) < len(apps) // 2:
@@ -437,10 +439,7 @@ Based on the following criteria, provide a complete ranking of all applications:
 
                 except Exception as e:
                     if retry == max_retries - 1:
-                        logger.error(f"Error evaluating funding applications for {program_id} after {max_retries} attempts: {e}")
-                        traceback.print_exc()
-                        # Fallback: select first N applications
-                        winners_all_programs[program_id] = []
+                        raise RuntimeError(f"Error evaluating funding applications for {program_id} after {max_retries} attempts") from e
                     else:
                         logger.warning(f"Error on attempt {retry + 1}/{max_retries}: {e}")
                         continue

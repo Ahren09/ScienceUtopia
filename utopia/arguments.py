@@ -1,5 +1,6 @@
 import argparse
 import os
+import sys
 
 
 def parse_arguments():
@@ -9,8 +10,15 @@ def parse_arguments():
     parser.add_argument(
         '--num_years',
         type=int,
-        default=4,
-        help='Number of years to simulate (default: 5)'
+        default=10,
+        help='Number of years to simulate (default: 10)'
+    )
+    parser.add_argument(
+        '--start_real_year',
+        type=int,
+        default=2016,
+        help='Starting real-world year for data partitioning (default: 2016). '
+             'Each simulation year maps to a real-world year: Year 1 -> start_real_year, Year 2 -> start_real_year+1, etc.'
     )
     parser.add_argument(
         '--output-dir',
@@ -45,7 +53,55 @@ def parse_arguments():
         '--model',
         type=str,
         default='gpt-4o',
-        help='Model to use for LLM (default: gpt-4o)'
+        help='Model to use for LLM. OpenAI models (gpt-4o, gpt-4o-mini, etc.) use OpenAI API. '
+             'Other models (e.g., Qwen/Qwen3-8B) use vLLM. (default: gpt-4o)'
+    )
+
+    # vLLM-specific arguments
+    parser.add_argument(
+        '--tensor_parallel_size',
+        type=int,
+        default=1,
+        help='Number of GPUs for tensor parallelism when using vLLM (default: 1)'
+    )
+    parser.add_argument(
+        '--gpu_memory_utilization',
+        type=float,
+        default=0.8,
+        help='Fraction of GPU memory to use for vLLM (default: 0.8)'
+    )
+    parser.add_argument(
+        '--max_model_len',
+        type=int,
+        default=8192,
+        help='Maximum sequence length for vLLM models (default: 8192)'
+    )
+    parser.add_argument(
+        '--enable_thinking',
+        action='store_true',
+        default=False,
+        help='Enable thinking mode for Qwen3 models (default: False)'
+    )
+    parser.add_argument(
+        '--batch_size',
+        type=int,
+        default=64,
+        help='Maximum batch size for vLLM batch generation (default: 64)'
+    )
+    parser.add_argument(
+        '--vllm_url',
+        type=str,
+        default=None,
+        help='URL of external vLLM server (e.g., http://localhost:8000/v1). '
+             'Start server with: vllm serve <model> --gpu-memory-utilization 0.8'
+    )
+
+    parser.add_argument(
+        '--rag_device',
+        type=str,
+        default='cuda:0',
+        help='Device for RAG embedding model (e.g., "cuda:0", "cpu"). '
+             'Use a different GPU than vLLM to avoid memory contention (default: cuda:0)'
     )
 
     parser.add_argument(
@@ -54,6 +110,14 @@ def parse_arguments():
         default='performance',
         choices=['performance', 'consistent'],
         help='Funding mode for industry researchers: "performance" (based on papers) or "consistent" (fixed allocation) (default: performance)'
+    )
+
+    parser.add_argument(
+        '--funding_allocation_mode',
+        type=str,
+        default='consumption_based',
+        choices=['fixed', 'consumption_based'],
+        help='Funding allocation mode: "fixed" (config base budget per winner) or "consumption_based" (derived from consumption history) (default: consumption_based)'
     )
 
     parser.add_argument(
@@ -80,7 +144,7 @@ def parse_arguments():
         '--experiment_name',
         type=str,
         default='default',
-        help='Name of the experiment (default: default)'
+        help='Name of the experiment'
     )
     parser.add_argument(
         '--weighted_funding_assignment',
@@ -89,9 +153,16 @@ def parse_arguments():
     )
 
     args = parser.parse_args()
-   
+
+    # Debug mode defaults: fewer years, more recent data
     if args.debug:
-        args.output_dir = os.path.join(args.output_dir, 'debug')
+        if '--num_years' not in sys.argv:
+            args.num_years = 4
+        if '--start_real_year' not in sys.argv:
+            args.start_real_year = 2022
+
+    if args.debug:
+        args.output_dir = os.path.join(args.output_dir, 'debug', args.experiment_name)
         
     elif args.experiment_name:
         args.output_dir = os.path.join(args.output_dir, args.experiment_name)

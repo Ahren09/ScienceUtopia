@@ -9,21 +9,34 @@ import hashlib
 import logging
 import subprocess
 import time
-from typing import List, Dict, Set, Union
-
+from typing import List, Dict, Set, Union, Tuple
+from pydantic import BaseModel
 import networkx as nx
 from langchain_core.documents import Document
-
-from const import REVIEW_CRITERIA
+from enum import Enum
+from const import REVIEW_CRITERIA, IMPORTANT_NOTES
 from utopia.agents.conference import Conference
 from utopia.agents.research_direction import ResearchDirection
 from utopia.config import SIMULATION_CONFIG
 from utopia.data.paper_tracker import PaperTracker
-from utopia.models.models import LLM
+from utopia.models.models import BaseLLM
 from utopia.utils.data_utils import top_percentile
 
 logger = logging.getLogger(__name__)
 
+
+class RoundIntention(BaseModel):
+    intention: str
+
+class PaperReview(BaseModel):
+    overall_score: float
+    justification: str
+
+class CitationResponse(BaseModel):
+    citations: List[str]
+
+class SelfCitationResponse(BaseModel):
+    self_citations: List[str]
 
 class MultiAgentEcosystem:
     """
@@ -152,7 +165,7 @@ class MultiAgentEcosystem:
         }
 
     @classmethod
-    def from_dict(cls, data: Dict, llm: LLM) -> 'MultiAgentEcosystem':
+    def from_dict(cls, data: Dict, llm: BaseLLM) -> 'MultiAgentEcosystem':
         """Reconstruct ecosystem from dictionary
 
         Args:
@@ -296,7 +309,7 @@ class SimulationAgent:
     """Base class for simulation agents"""
 
     def __init__(self, reputation: int,
-                 agent_id: str = None, llm: LLM = None, max_retries: int = 10):
+                 agent_id: str = None, llm: BaseLLM = None, max_retries: int = 10):
         self.id = agent_id or f"agent_{int(time.time() * 1000)}"
         self.reputation = reputation  # 1-10 scale
         self.memory_bank = []  # Store experiences and thoughts from interactions
@@ -333,29 +346,89 @@ class SimulationAgent:
         """Get memory context for this agent"""
         result = ""
         for memory in self.memory_bank:
-            result += f"""- Event: {memory['type']} (Year: {memory['year']}) - Thought: {memory['thought']}
+            result += f"""- {memory['type']} (Year: {memory['year']}). Thought: {memory['thought']}
 """
         return result
 
-    def review_paper(self, paper: Dict) -> Dict:
-        """Generate review for a paper using LLM
+    def get_round_intention_prompt(self, direction: Dict, year: int, paper_tracker: 'PaperTracker') -> Tuple[str, Dict]:
+        """Build a prompt asking the agent to describe their research intention for this round.
+
+        Args:
+            direction: Direction dict with 'direction' (ResearchDirection) and 'detailed_focus' (str or None)
+            year: Current simulation year
+            paper_tracker: PaperTracker instance for retrieving past papers
+
+        Returns:
+            Tuple of (prompt string, response_format dict) for generating round intention
+        """
+        prompt = self._get_personality_prompt(include_exploration_strategy=True, include_funding_situation=True)
+
+        prompt += f"""
+## Your Research Direction
+Topic: {direction['direction'].topic}
+Keywords: {', '.join(direction['direction'].keywords)}
+"""
+
+        if direction.get('detailed_focus'):
+            prompt += f"""Detailed Focus: {direction['detailed_focus']}
+"""
+
+        # Show past papers (up to 5, sorted by recency)
+        past_papers = paper_tracker.get_papers_by_author(self.id)
+        if past_papers:
+            past_papers.sort(key=lambda x: x.year, reverse=True)
+            prompt += """
+## Your Past Papers
+"""
+            for i, paper in enumerate(past_papers[:5], 1):
+                latest_score = paper.review_history[-1]['score'] if paper.review_history else 0.0
+                prompt += f"{i}. \"{paper.title}\" (Year {paper.year}, {paper.conference}, {paper.status}, score {latest_score:.2f})\n"
+
+        # Show memory context
+        memory_context = self.get_memory_context()
+        if memory_context:
+            prompt += f"""
+## Your Recent Experiences
+{memory_context}
+"""
+
+        prompt += """
+## Task
+Based on your research direction, expertise, past work, and experiences, describe in 4-5 sentences what specific research you intend to pursue this round. Be concrete about the problem, method, or contribution you want to explore.
+
+{IMPORTANT_NOTES}
+
+Respond in JSON format:
+```json
+{"intention": "Your 2-3 sentence research intention here."}
+```
+"""
+        response_format = {
+            'type': 'json_schema',
+            'json_object': {
+                'name': 'round_intention',
+                'strict': True,
+                'schema': RoundIntention.model_json_schema()
+            },
+        }
+        return prompt, response_format
+    
+    def get_review_prompt(self, paper: Dict) -> Tuple[str, Dict]:
+        """Build review prompt for a paper (without calling LLM)
 
         Args:
             paper: Paper dictionary with 'title', 'content', 'topics', etc.
 
         Returns:
-            Review dictionary with 'overall_score', 'strengths', 'weaknesses', 'summary'
+            Prompt string for review generation, response format
         """
         expertise = [e.topic if hasattr(e, 'topic') else str(e) for e in getattr(self, 'expertise', [])]
         memory_context = self.get_memory_context()
 
-        # TODO: Generate topics for the papers
-
         if memory_context:
-            memory_context = f"""## Your Recent Experiences 
+            memory_context = f"""## Your Recent Experiences
 {memory_context}
 """
-
         else:
             memory_context = ""
 
@@ -378,7 +451,7 @@ Paper Topics: {', '.join(paper.get('topics', []))}
 Provide a comprehensive review with:
 1. Overall Score (1-5 scale):
 {REVIEW_CRITERIA}
-   
+
 2. A succinct, 1-sentence justification for the score.
 """
 
@@ -391,6 +464,27 @@ Provide a comprehensive review with:
 }
 ```
 """
+        response_format = {
+            'type': 'json_schema',
+            'json_object': {
+                'name': 'paper_submission',
+                'strict': True,
+                'schema': PaperReview.model_json_schema()
+            },
+        }
+
+        return prompt, response_format
+
+    def review_paper(self, paper: Dict) -> Dict:
+        """Generate review for a paper using LLM
+
+        Args:
+            paper: Paper dictionary with 'title', 'content', 'topics', etc.
+
+        Returns:
+            Review dictionary with 'overall_score', 'strengths', 'weaknesses', 'summary'
+        """
+        prompt = self.get_review_prompt(paper)
 
         review_json, message_history = self.llm.generate(prompt=prompt)
         assert all(field in review_json for field in ['overall_score', "justification"])
@@ -455,16 +549,13 @@ Provide a comprehensive review with:
             'year': year,
         })
 
-    def decide_resubmission(self, rejected_papers: Dict[str, Dict], conferences: List[Conference],
-                            resubmission_cost: int = SIMULATION_CONFIG['conference']['resubmission_cost']) -> List[str]:
-        """Decide which rejected papers to resubmit (costs 5 each)
+    def get_resubmission_prompt(self, rejected_papers: Dict[str, Dict], conferences: List[Conference],
+                                resubmission_cost: int = SIMULATION_CONFIG['conference']['resubmission_cost']) -> Tuple[str, Dict]:
+        """Build prompt for resubmission decision WITHOUT calling LLM.
 
         Returns:
-            List of paper IDs to resubmit
+            Tuple of (prompt_str, response_format)
         """
-        if self.resources < 5 or not rejected_papers:
-            return []
-
         papers_info = []
         for idx, (arxiv_id, p) in enumerate(rejected_papers.items()):
             paper_info = f"""### Paper {idx}
@@ -498,7 +589,7 @@ Below are the candidate conferences you can resubmit to. For each paper, you MUS
         prompt += """
 ## Your Task
 Please respond with a list of papers you want to RESUBMIT (the FULL URL) and its conference abbreviation (e.g. "NeurIPS" or "AAAI"). For each paper, if you decide to resubmit, you must choose exactly 1 conference that best suits the paper.
-        
+
 ## Sample Response
 If you choose to resubmit, respond with the following JSON format:
 ```json
@@ -521,7 +612,41 @@ If you choose not to resubmit, respond with a json file that contains an empty l
 ```
 """
 
-        result, _ = self.llm.generate(prompt=prompt, response_format="json_object")
+        # Generate Conference enum dynamically from available conferences
+        ConferenceEnum = Enum('Conference', {cid: cid for cid in candidate_conference_ids}, type=str)
+
+        class ResubmissionEntry(BaseModel):
+            arxiv_id: str
+            conference: ConferenceEnum
+
+        class ResubmissionResponse(BaseModel):
+            resubmitted_papers: List[ResubmissionEntry]
+
+        response_format = {
+            'type': 'json_schema',
+            'json_object': {
+                'name': 'resubmission_decision',
+                'strict': True,
+                'schema': ResubmissionResponse.model_json_schema()
+            },
+        }
+
+        return prompt, response_format
+
+    def decide_resubmission(self, rejected_papers: Dict[str, Dict], conferences: List[Conference],
+                            resubmission_cost: int = SIMULATION_CONFIG['conference']['resubmission_cost']) -> List[str]:
+        """Decide which rejected papers to resubmit (costs 5 each)
+
+        Returns:
+            List of paper IDs to resubmit
+        """
+        if self.resources < 5 or not rejected_papers:
+            return []
+
+        prompt, response_format = self.get_resubmission_prompt(rejected_papers, conferences, resubmission_cost)
+        candidate_conference_ids = set([conference.conference_id for conference in conferences])
+
+        result, _ = self.llm.generate(prompt=prompt, response_format=response_format)
         assert 'resubmitted_papers' in result
         result = result['resubmitted_papers']
         resubmitted_paper_ids = [p['arxiv_id'] for p in result]
@@ -529,6 +654,12 @@ If you choose not to resubmit, respond with a json file that contains an empty l
         conferences = [p['conference'] for p in result]
         assert set(conferences) <= candidate_conference_ids
         return result
+    
+    def _get_bio(self) -> str:
+        """Get bio prompt for this agent"""
+        expertise = [research_direction.topic for research_direction in self.expertise]
+        prompt = f"You are a researcher specializing in {', '.join(expertise)}. \n"
+        return prompt
 
     # Helper methods (private)
 
@@ -626,18 +757,14 @@ If you choose not to resubmit, respond with a json file that contains an empty l
 
     def _get_personality_prompt(self) -> str:
         """Get personality prompt for this agent - override in subclasses"""
-        return f"You are a researcher specializing in {', '.join(self.specializations)}."
+        raise NotImplementedError("Subclasses must implement this method")
 
     def _had_recent_negative_experience(self) -> bool:
         """Check if agent had recent negative review experiences"""
         recent = [e for e in self.review_experiences if time.time() - e['timestamp'] < 86400 * 7]
         return any(e.get('emotional_response') == 'negative' for e in recent)
 
-    def get_bio(self) -> str:
-        """Get bio prompt for this agent"""
-        expertise = [research_direction.topic for research_direction in self.expertise]
-        prompt = f"You are a researcher specializing in {', '.join(expertise)}. Your current funding level is {self.resources}.\n"
-        return prompt
+    
 
     def get_paper_submission_prompt(self, candidate_papers: List[Document], year: int, conferences: List[Conference],
                                     direction: ResearchDirection, paper_tracker: PaperTracker, max_papers: int = 10,
@@ -651,12 +778,13 @@ If you choose not to resubmit, respond with a json file that contains an empty l
             max_papers: Maximum number of candidate papers to show
             previous_papers: Optional list of preview strings for previously accepted papers
         """
-        prompt = self.get_bio() + f"""
+        prompt = self._get_personality_prompt(include_exploration_strategy=True, include_funding_situation=True) + f"""
         
 ## Your Research Direction in This Round
 Detailed Focus: {direction['detailed_focus']}
 Keywords: {', '.join(direction['direction'].keywords)}
 
+## Your Task
 You plan to do a research project and submit a paper to a conference.
 From the following candidate papers, please give me a paper ID that you want to submit. Then, give a conference name that you want to submit to.
 """
@@ -733,27 +861,33 @@ If you choose not to submit (only due to funding issues), explain using factors 
 ```
 """
 
+        # Generate Conference enum dynamically from available conferences
+        Conference = Enum('Conference', {cid: cid for cid in candidate_conference_ids}, type=str)
+
+        class PaperSubmission(BaseModel):
+            id: int
+            arxiv_id: str
+            conference: Conference
+            reason: str
+
+
         # Note: as of 2025-10-20, gpt-4o dose not support the response_format parameter. "gpt-4o-2024-08-06" does.
         response_format = {
             'type': 'json_schema',
             'json_object': {
                 'name': 'paper_submission',
                 'strict': True,
-                'schema': {
-                    'type': 'object',
-                    'properties': {'arxiv_id': {'type': 'string'}, 'id': {'type': 'number'}},
-                    'required': ['id', 'arxiv_id'],
-                }
+                'schema': PaperSubmission.model_json_schema()
             },
         }
         return prompt, response_format
 
-    def get_potential_cited_papers_prompt(self, paper: Dict, direction: ResearchDirection, candidate_papers: List[Dict], max_papers: int = 10) -> str:
+    def get_potential_cited_papers_prompt(self, paper: Dict, direction: ResearchDirection, candidate_papers: List[Dict], max_papers: int = 10) -> Tuple[str, Dict]:
         """
         Get potential cited papers prompt for this agent
         """
 
-        prompt = self.get_bio() + f"""
+        prompt = self._get_bio() + f"""
 You did a research project and submitted the following paper to a conference. Please give me a list of potential cited papers that you want to cite. NOTE: It is fine if you do not cite any papers due to topic mismatch.
 
 ## Your Research Direction in This Round
@@ -784,17 +918,25 @@ Abstract: {cited_paper['abstract'][:300]}...
 ```json
 {
     "citations": [ FULL URL of the candidate papers you want to cite, including the "https://" prefix
-        "https://arxiv.org/abs/2407.00005v1",
-        "https://arxiv.org/abs/2407.00006v1",
-        "https://arxiv.org/abs/2407.00007v1"
+        "https://arxiv.org/abs/2301.12345v1", <- first paper you want to cite
+        "https://arxiv.org/abs/2407.06789v1", <- second paper you want to cite
+        ...
     ]
 }
 ```
 """
 
-        return prompt
+        response_format = {
+            'type': 'json_schema',
+            'json_object': {
+                'name': 'citation_response',
+                'strict': True,
+                'schema': CitationResponse.model_json_schema()
+            },
+        }
+        return prompt, response_format
 
-    def get_self_citation_prompt(self, paper: Dict, direction: ResearchDirection, own_papers: List) -> str:
+    def get_self_citation_prompt(self, paper: Dict, direction: ResearchDirection, own_papers: List) -> Union[Tuple[str, Dict], None]:
         """
         Get self-citation prompt for this agent
 
@@ -809,7 +951,7 @@ Abstract: {cited_paper['abstract'][:300]}...
         if not own_papers:
             return None
 
-        prompt = self.get_bio() + f"""
+        prompt = self._get_bio() + f"""
 You submitted a paper to a conference. Please decide if you want to cite any of your own previous work.
 
 ## Your Current Paper
@@ -850,4 +992,41 @@ If you do not want to cite any of your own previous work, respond with an empty 
     "self_citations": []
 }
 """
+
+        response_format = {
+            'type': 'json_schema',
+            'json_object': {
+                'name': 'self_citation_response',
+                'strict': True,
+                'schema': SelfCitationResponse.model_json_schema()
+            },
+        }
+        return prompt, response_format
+
+
+    def _get_exploration_strategy_prompt(self) -> str:
+        # Add exploration strategy guidance if applicable
+        prompt = ""
+        if hasattr(self, 'exploration_strategy') and self.exploration_strategy != 'balanced':
+            prompt += "\n## Your Research Strategy\n"
+
+            if self.exploration_strategy == 'explorer':
+                prompt += """You are an EXPLORER. Your strategy is to venture into new research territories:
+- Aim for topics DISTANT from your past work to discover breakthrough opportunities
+- Prioritize novel directions that expand your research portfolio, compared with your past work
+- Be willing to take risks on unfamiliar but promising areas
+"""
+            elif self.exploration_strategy == 'exploiter':
+                prompt += """You are an EXPLOITER. Your strategy is to build on proven success:
+- Choose topics CLOSELY RELATED to your successful past work
+- Maximize impact by deepening expertise in familiar areas compared with your past work
+- Prioritize incremental advances in established directions
+"""
+            elif self.exploration_strategy == 'cautious_explorer':
+                prompt += """You are a CAUTIOUS EXPLORER. Your strategy balances novelty with safety:
+- Choose topics at MODERATE DISTANCE from your past work
+- Blend familiar techniques with new application areas
+- Take measured risks while maintaining connection to expertise
+"""
+
         return prompt
