@@ -65,7 +65,7 @@ python -m vllm.entrypoints.openai.api_server --model Qwen/Qwen3-0.6B --gpu-memor
 
 CUDA_VISIBLE_DEVICES=5 python -m vllm.entrypoints.openai.api_server --model Qwen/Qwen3-0.6B --gpu-memory-utilization 0.95 --max-model-len 16384
 
-CUDA_VISIBLE_DEVICES=2,3,4,5 python -m vllm.entrypoints.openai.api_server --model Qwen/Qwen3-8B --gpu-memory-utilization 0.95 --max-model-len 32768
+CUDA_VISIBLE_DEVICES=2,3,4,5 python -m vllm.entrypoints.openai.api_server --model Qwen/Qwen3-8B --gpu-memory-utilization 0.95 --max-model-len 16384 --tensor-parallel-size 4
 ```
 
 ### Basic Agent Creation

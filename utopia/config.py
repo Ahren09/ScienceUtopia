@@ -29,8 +29,8 @@ SIMULATION_CONFIG = {
         'default_funding_rate': 0.3,     # 25% funding rate if not specified
         'nsf_funding_rate': 0.3,         # NSF: more generous (foundational research)
         'darpa_funding_rate': 0.20,       # DARPA: more selective (applied research)
-        'academic_base_budget': 50, 
-        'industry_base_budget': 50, 
+        'academic_base_budget': 20, 
+        'industry_base_budget': 20, 
         'funding_growth_rate': 0.1,
     },
     

@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=5 python -m vllm.entrypoints.openai.api_server --model Qwen/Qwen3-0.6B --gpu-memory-utilization 0.95 --max-model-len 16384

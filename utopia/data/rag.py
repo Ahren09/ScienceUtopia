@@ -43,12 +43,12 @@ class RAGConfig:
     """Configuration for RAG system"""
     batch_size: int = 64
     chunk_size: int = 512
-    embedding_model: str = "thenlper/gte-small"  # 384-dimensional embeddings
+    embedding_model: str = "thenlper/gte-small" 
     num_retrieved_docs: int = 1000
     num_docs_final: int = 5
     normalize_embeddings: bool = True
     use_langchain: bool = False
-    device: str = "cuda:0" if torch.cuda.is_available() else "cpu"
+    device: str = "cuda:0" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
     n_workers: int = 32  # Number of workers for parallel dataset processing (1 = sequential)
 
 
@@ -64,7 +64,7 @@ class RAG:
         self.use_langchain: bool = use_langchain
 
         # Year-based data partitioning
-        self.start_real_year: int = kwargs.get('start_real_year', 2016)
+        self.start_year: int = kwargs.get('start_year', 2016)
         self.current_sim_year: int = 0
 
         # All documents and their mappings
@@ -107,8 +107,8 @@ class RAG:
             return pd.to_datetime(ts)
 
         self.num_years = num_years
-        end_real_year = self.start_real_year + self.num_years - 1
-        valid_years = set(range(self.start_real_year, end_real_year + 1))
+        end_real_year = self.start_year + self.num_years - 1
+        valid_years = set(range(self.start_year, end_real_year + 1))
 
         self.id2docs = {}
         if self.debug:
@@ -149,7 +149,7 @@ class RAG:
             self.documents = docs
 
         else:
-            cache_path = f"outputs/cache_scievo_{self.start_real_year}-{end_real_year}.pkl"
+            cache_path = f"outputs/cache_scievo_{self.start_year}-{end_real_year}.pkl"
             if os.path.exists(cache_path):
                 print(f"[Cache HIT] Loading documents from {cache_path}")
                 with open(cache_path, 'rb') as f:
@@ -240,6 +240,7 @@ class RAG:
 
                 docs = list(self.id2docs.values())
                 self.documents = docs
+                self.documents.sort(key=lambda doc: doc.metadata['publication_year'])
                 cache_data = {
                     'documents': self.documents,
                 }
@@ -251,7 +252,7 @@ class RAG:
 
         # Log year distribution
         year_counts = Counter(doc.metadata['publication_year'] for doc in self.documents)
-        print(f"[RAG] Loaded {len(self.documents)} papers for years {self.start_real_year}-{end_real_year}:")
+        print(f"[RAG] Loaded {len(self.documents)} papers for years {self.start_year}-{end_real_year}:")
         for yr in sorted(year_counts):
             print(f"  {yr}: {year_counts[yr]} papers")
 
@@ -264,21 +265,11 @@ class RAG:
     def set_current_year(self, sim_year: int):
         """Set the current simulation year for year-based data partitioning"""
         self.current_sim_year = sim_year
-        real_year = self.start_real_year + sim_year - 1
+        real_year = self.start_year + sim_year - 1
         available = (self.document_status['publication_year'] == real_year).sum()
         unsubmitted = ((self.document_status['publication_year'] == real_year) & (self.document_status['status'] == 'unsubmitted')).sum()
         print(f"[RAG] Sim year {sim_year} (real: {real_year}): {available} total papers, {unsubmitted} available for submission")
 
-    def _ensure_sentence_transformer(self):
-        """Lazily load SentenceTransformer on first use"""
-        if getattr(self, 'sentence_transformer_model', None) is None:
-            from sentence_transformers import SentenceTransformer
-            print(f"[Lazy Load] Loading SentenceTransformer({self.config.embedding_model}) on {self.device}...")
-            t0 = time()
-            self.sentence_transformer_model = SentenceTransformer(
-                self.config.embedding_model, device=self.device
-            )
-            print(f"[Lazy Load] SentenceTransformer loaded in {time() - t0:.1f}s")
 
     def build_knowledge_index(self) -> "FAISS":
         """Build FAISS index with normalized embeddings using PyTorch tensors
@@ -296,92 +287,84 @@ class RAG:
         self.original_doc_count = len(self.documents)
         t0 = time()
 
-        if self.use_langchain:
-            raise NotImplementedError("LangChain is not supported yet")
-            # Branch 1: LangChain + FAISS
-            from langchain_community.embeddings import HuggingFaceEmbeddings
-            from langchain_community.vectorstores import FAISS
-            print("[LangChain] Using HuggingFaceEmbeddings + FAISS")
-            # Initialize embeddings
-            self.embeddings = HuggingFaceEmbeddings(
-                model_name=self.config.embedding_model,
-                model_kwargs={'device': self.device},
-                encode_kwargs={'normalize_embeddings': self.config.normalize_embeddings},
-                show_progress=True
+        print("[SentenceTransformer] Encoding documents using SentenceTransformer")
+
+        # Lazy-load model on first use
+        if getattr(self, 'sentence_transformer_model', None) is None:
+            from sentence_transformers import SentenceTransformer
+            self.sentence_transformer_model = SentenceTransformer(
+                self.config.embedding_model, device="cuda:0", model_kwargs={"torch_dtype": torch.float16}
             )
 
-            # Build FAISS index (legacy - kept for compatibility)
-            self.knowledge_index = FAISS.from_documents(
-                self.documents,
-                self.embeddings
-            )
+        doc_texts = [doc.page_content for doc in self.documents]
+        print(f"Encoding {len(doc_texts)} documents...")
 
-            # Store document embeddings for batch retrieval
-            doc_texts = [doc.page_content for doc in self.documents]
-            print(f"Embedding {len(doc_texts)} documents for both indices...")
+        # https://arxiv.org/pdf/1234.12345.pdf -> 0
+        self.id2document_indices = {doc.metadata['id']: i for i, doc in enumerate(self.documents)}
 
-            batch_size = 1024
-            all_embeddings = []
+        # --- Per-year embedding caching ---
+        # Documents are sorted by year, so find contiguous year ranges
+        model_tag = self.config.embedding_model.replace("/", "_")
+        os.makedirs(f"outputs/{model_tag}", exist_ok=True)
 
-            for i in range(0, len(doc_texts), batch_size):
-                batch_texts = doc_texts[i:i + batch_size]
-                print(
-                    f"  Batch {i // batch_size + 1}/{(len(doc_texts) + batch_size - 1) // batch_size} ({len(batch_texts)} docs)")
-                batch_embeddings = self.embeddings.embed_documents(batch_texts)
-                all_embeddings.extend(batch_embeddings)
+        year_ranges = {}  # year -> (start_idx, end_idx)
+        for i, doc in enumerate(self.documents):
+            yr = doc.metadata['publication_year']
+            if yr not in year_ranges:
+                year_ranges[yr] = [i, i + 1]
+            else:
+                year_ranges[yr][1] = i + 1
 
-            doc_embeddings_np = np.array(all_embeddings)
-            embeddings_tensor = torch.from_numpy(doc_embeddings_np).float().to(self.device)
+        # Pass 1: Load cached embeddings, collect uncached years
+        sorted_years = sorted(year_ranges)
+        per_year_embeddings = [None] * len(sorted_years)
+        uncached = []  # list of (index_in_sorted, year, start_idx, end_idx)
 
-            if self.config.normalize_embeddings:
-                embeddings_tensor = F.normalize(embeddings_tensor, p=2, dim=1)
-
-            # Both indices start with same embeddings
-            self.submission_embeddings = embeddings_tensor.clone()
-            self.citation_embeddings = embeddings_tensor.clone()
-
-            print(f"[LangChain] Build indices: {time() - t0:.2f} seconds")
-
-        else:
-            # Branch 2: Pure SentenceTransformer
-            print("[SentenceTransformer] Encoding documents using SentenceTransformer")
-
-            # Lazy-load model on first use
-            self._ensure_sentence_transformer()
-
-            # Encode all documents at once
-            doc_texts = [doc.page_content for doc in self.documents]
-            print(f"Encoding {len(doc_texts)} documents...")
-
-            # https://arxiv.org/pdf/1234.12345.pdf -> 0
-            self.id2document_indices = {doc.metadata['id']: i for i, doc in enumerate(self.documents)}
-
-            # Embedding disk cache: keyed by model name + doc count + year range
-            model_tag = self.config.embedding_model.replace("/", "_")
-            cache_file = f"outputs/cache_embeddings_{model_tag}_{len(doc_texts)}_y{self.start_real_year}.pt"
+        for i, yr in enumerate(sorted_years):
+            start_idx, end_idx = year_ranges[yr]
+            cache_file = f"outputs/{model_tag}/cache_embeddings_{yr}.pt"
 
             if os.path.exists(cache_file):
-                print(f"[Cache HIT] Loading embeddings from {cache_file}")
+                print(f"[Cache HIT] Year {yr}: loading embeddings from {cache_file}")
                 tc = time()
-                self.document_embeddings = torch.load(cache_file, map_location=self.device, weights_only=True)
-                print(f"[Cache HIT] Loaded in {time() - tc:.1f}s")
+                per_year_embeddings[i] = torch.load(cache_file, map_location=self.device, weights_only=True)
+                print(f"[Cache HIT] Year {yr}: {per_year_embeddings[i].shape[0]} docs loaded in {time() - tc:.1f}s")
             else:
-                print(f"[Cache MISS] Encoding {len(doc_texts)} documents...")
-                self.document_embeddings = self.sentence_transformer_model.encode(
-                    doc_texts,
+                uncached.append((i, yr, start_idx, end_idx))
+
+        # Pass 2: Encode all uncached years in one multi-GPU batch
+        if uncached:
+            all_uncached_texts = []
+            year_boundaries = []  # (index_in_sorted, year, slice_start, slice_end)
+            for idx_in_sorted, yr, start_idx, end_idx in uncached:
+                slice_start = len(all_uncached_texts)
+                all_uncached_texts.extend(doc_texts[start_idx:end_idx])
+                slice_end = len(all_uncached_texts)
+                year_boundaries.append((idx_in_sorted, yr, slice_start, slice_end))
+
+            print(f"Encoding {len(all_uncached_texts)} documents from {len(uncached)} uncached years...")
+            
+
+            for idx_in_sorted, yr, slice_start, slice_end in year_boundaries:
+                texts = all_uncached_texts[slice_start:slice_end]
+                emb = self.sentence_transformer_model.encode(
+                    texts,
                     convert_to_tensor=True,
                     normalize_embeddings=self.config.normalize_embeddings,
+                    batch_size=512,
                     show_progress_bar=True,
-                    batch_size=64,
-                    device=self.device
-                )  # (D, dim)
+                    device=self.device,
+                )
+                cache_file = f"outputs/{model_tag}/cache_embeddings_{yr}.pt"
+                torch.save(emb, cache_file)
+                print(f"[Cache SAVE] Year {yr}: saved {emb.shape[0]} embeddings to {cache_file}")
+                per_year_embeddings[idx_in_sorted] = emb
+           
 
-                # Save to disk for next run
-                os.makedirs(os.path.dirname(cache_file), exist_ok=True)
-                torch.save(self.document_embeddings, cache_file)
-                print(f"[Cache SAVE] Saved embeddings to {cache_file}")
+        self.document_embeddings = torch.cat(per_year_embeddings, dim=0)  # (D, dim)
+        del per_year_embeddings
 
-            print(f"[SentenceTransformer] Encode documents: {time() - t0:.2f} seconds")
+        print(f"[SentenceTransformer] Encode documents: {time() - t0:.2f} seconds")
 
         return self.knowledge_index
 
@@ -408,7 +391,7 @@ class RAG:
         # Select the appropriate index
         if retrieval_type == "submission":
             # Year-specific: only unsubmitted papers from current real-world year
-            real_year = self.start_real_year + self.current_sim_year - 1
+            real_year = self.start_year + self.current_sim_year - 1
             indices = self.document_status[
                 (self.document_status['status'] == "unsubmitted") &
                 (self.document_status['publication_year'] == real_year)
@@ -452,7 +435,11 @@ class RAG:
         else:
             # Branch 2: SentenceTransformer - Simple Q x D similarity matrix
             print("[SentenceTransformer Branch] Computing Q x D similarity matrix...")
-            self._ensure_sentence_transformer()
+            if getattr(self, 'sentence_transformer_model', None) is None:
+                from sentence_transformers import SentenceTransformer
+                self.sentence_transformer_model = SentenceTransformer(
+                    self.config.embedding_model, device=self.device
+                )
 
             # Encode queries: shape (Q, embedding_dim)
             query_embeddings = self.sentence_transformer_model.encode(
@@ -672,15 +659,15 @@ class RAG:
         """Serialize RAG state (document status only, embeddings rebuilt on load)"""
         return {
             'document_status': self.document_status.to_dict('records'),
-            'start_real_year': self.start_real_year,
+            'start_year': self.start_year,
             'current_sim_year': self.current_sim_year,
         }
 
     @classmethod
     def from_dict(cls, data: Dict, config: RAGConfig, model=None, debug: bool = False, **kwargs) -> 'RAG':
         """Reconstruct RAG from saved state"""
-        start_real_year = data.get('start_real_year', kwargs.get('start_real_year', 2016))
-        rag = cls(config=config, model=model, debug=debug, start_real_year=start_real_year)
+        start_year = data.get('start_year', kwargs.get('start_year', 2016))
+        rag = cls(config=config, model=model, debug=debug, start_year=start_year)
         rag.document_status = pd.DataFrame(data['document_status'])
         # Backward compatibility: add publication_year column if missing
         if 'publication_year' not in rag.document_status.columns:

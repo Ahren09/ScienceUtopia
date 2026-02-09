@@ -926,8 +926,8 @@ TOPIC_TO_CATEGORY_MAPPING = {
 
 def select_conferences_for_simulation(
         agents: List,
-        num_conferences: int = 5,
-        min_submissions_per_conf: int = 3
+        num_conferences: int = 3,
+        min_submissions_per_conf: int = 10
 ) -> List[Conference]:
     """Select conferences ensuring each gets sufficient submissions
 

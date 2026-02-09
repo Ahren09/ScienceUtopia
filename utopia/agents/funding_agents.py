@@ -2,12 +2,25 @@
 import logging
 import random
 from collections import Counter
-from typing import Dict, Set, List
+from typing import Dict, Set, List, Tuple
+
+from pydantic import BaseModel
 
 from utopia.config import SIMULATION_CONFIG
 from utopia.models.models import BaseLLM
 from .base_agent import SimulationAgent
 from .research_direction import ResearchDirection
+
+
+class RankedApplication(BaseModel):
+    id: str
+    applicant_id: str
+    rank: int
+    reason: str
+
+
+class FundingEvaluationResponse(BaseModel):
+    ranked_applications: List[RankedApplication]
 
 logger = logging.getLogger(__name__)
 
@@ -259,31 +272,22 @@ class FundingAgency(SimulationAgent):
                 )
             }
 
-    def evaluate_funding_applications(
+    def get_funding_evaluation_prompts(
             self,
             applications: List[Dict],
             submitted_papers_dict: Dict[str, Dict]
-    ) -> List[Dict]:
-        """Evaluate funding applications using simplified funding modes
-
-        Args:
-            applications: List of funding application dicts with keys:
-                - applicant_id: Agent ID
-                - research_proposal: Research description
-                - expertise: List of research areas
-                - past_performance: Previous year's accepted papers count
+    ) -> Tuple[List[str], Dict, List[Dict]]:
+        """Build evaluation prompts for all programs belonging to this agency.
 
         Returns:
-            List of funding decisions
+            Tuple of (prompts, response_format, metadata_list) where metadata_list
+            is parallel to prompts: [{'program_id': ..., 'apps': ...}, ...]
         """
 
         # Group applications by program
         program_to_applications = {}
 
-        # Populate program_to_applications from the applications format
         for apps in applications:
-
-            # Each author_applications dict contains program_id -> application_data
             for program_id, application_data in apps.items():
 
                 if not application_data['submit']:
@@ -294,20 +298,20 @@ class FundingAgency(SimulationAgent):
                 if program_id not in program_to_applications:
                     program_to_applications[program_id] = []
 
-                # Add author info to the application
                 application_data['applicant_id'] = author.id
                 program_to_applications[program_id].append(application_data)
 
-        winners_all_programs = {}
-        # Process each program's applications using LLM to decide winners
-        for program_id, apps in program_to_applications.items():
-            if not program_id in self.funding_programs:
-                continue
-            # Find the corresponding program object
-            program = self.funding_programs[program_id]
-            logger.info(f"Eval funding apps for {program_id}")
+        batch_prompts = []
+        metadata_list = []
 
-            # Prepare applications for LLM evaluation
+        for program_id, apps in program_to_applications.items():
+            if program_id not in self.funding_programs:
+                continue
+
+            program = self.funding_programs[program_id]
+            logger.info(f"Preparing funding eval prompt for {program_id}")
+
+            # Build applications text
             applications_text = ""
             for i, app in enumerate(apps):
                 author = app.get('author')
@@ -316,22 +320,24 @@ class FundingAgency(SimulationAgent):
 
                 accepted_papers = [paper for paper in app['relevant_projects'] if paper['status'] == 'accept']
                 rejected_papers = [paper for paper in app['relevant_projects'] if paper['status'] == 'reject']
-                
+
                 if len(accepted_papers) == 0 and len(rejected_papers) == 0:
                     past_performance = "The agent has no research projects completed yet."
-                past_performance = f"""The agent has completed {len(accepted_papers) + len(rejected_papers)} research projects, with {len(accepted_papers)} accepted papers and {len(rejected_papers)} rejected papers.
-                
+                else:
+                    past_performance = f"""The agent has completed {len(accepted_papers) + len(rejected_papers)} research projects, with {len(accepted_papers)} accepted papers and {len(rejected_papers)} rejected papers.
+
 """
 
-                if len(accepted_papers) > 0:
-                    past_performance += "### Recent accepted papers:\n"
-                    for paper in accepted_papers:
-                        past_performance += f" - {submitted_papers_dict[paper['arxiv_id']]['title']}\n"
+                    if len(accepted_papers) > 0:
+                        past_performance += "### Recent accepted papers:\n"
+                        for paper in accepted_papers:
+                            past_performance += f" - {submitted_papers_dict[paper['arxiv_id']]['title']}\n"
 
-                if len(rejected_papers) > 0:
-                    past_performance += "### Recent rejected papers:\n"
-                    for paper in rejected_papers:
-                        past_performance += f" - {submitted_papers_dict[paper['arxiv_id']]['title']}\n"
+                    if len(rejected_papers) > 0:
+                        past_performance += "### Recent rejected papers:\n"
+                        for paper in rejected_papers:
+                            past_performance += f" - {submitted_papers_dict[paper['arxiv_id']]['title']}\n"
+
                 applications_text += f"""### Application {i + 1}
 Applicant ID: {app['applicant_id']}
 Research Proposal: {app.get('research_proposal', 'No proposal provided')}
@@ -342,36 +348,8 @@ Past Performance:
 
 """
 
-            # Create LLM prompt for funding decisions
             focus_topics = [rd.topic for rd in program.research_directions]
 
-            # Extract all valid applicant IDs
-            valid_ids = [app['applicant_id'] for app in apps]
-            valid_ids_text = '\n'.join([f"  - {aid}" for aid in valid_ids])
-
-            sample_response = """
-```json
-{
-    "ranked_applications": [{  <- Must be a ranked list according to preferences.
-        "id": "University_Researcher_888", <- Must be EXACTLY the same as the applicant_id in the application
-        "rank": 1, <- Must be 1.
-        "reason": "Reason for this ranking" <- a 1-sentence brief explanation for the ranking
-    },
-    {
-        "id": "University_Researcher_404",
-        "rank": 2, <- Must be 2
-        "reason": "Reason for this ranking"
-    },
-    ...
-    {
-        "id": "Industry_Researcher_325",
-        "rank": N, <- Must be N
-        "reason": "Reason for this ranking"
-    },
-    ]
-}
-```
-"""
             prompt = f"""You are a funding agency evaluating applications for {program.name}.
 
 ## Program Details
@@ -388,60 +366,95 @@ Based on the following criteria, provide a complete ranking of all applications:
 
 ## Applications to Evaluate
 {applications_text}
-
-## Sample Response
-{sample_response}
 """
-            ranked_apps = None
-            max_retries = self.max_retries
-            for retry in range(self.max_retries):
-                try:
-                    result, message_history = self.llm.generate(prompt=prompt)
 
-                    if isinstance(result, list):
-                        ranked_apps = result
-                    else:
-                        ranked_apps = result.get('ranked_applications', [])
+            prompt += """
+## Response Format
+Respond in JSON format with all applications ranked from most preferred (rank 1) to least preferred. An example response is shown below (DO NOT directly copy the exact response:
+```json
+{
+    "ranked_applications": [
+        {
+            "id": 12, <- MUST BE an integer
+            "applicant_id": "Applicant_ID_1", <- MUST BE a string that is the same as the "Applicant ID" field
+            "rank": 1, <- MUST BE 1 because this is the most preferred application
+            "reason": "BRIEF REASON"
+        },
+        {
+            "id": 9,
+            "applicant_id": "Applicant_ID_2", <- MUST BE a string that is the same as the "Applicant ID" field
+            "rank": 2, <- MUST BE 2 because this is the second most preferred application
+            "reason": "BRIEF REASON"
+        },
+        ...
+    ]
+}
+```
+"""
 
-                    # Validate count
-                    if len(ranked_apps) < len(apps) // 2:
-                        if retry < self.max_retries - 1:
-                            logger.error(f"Expected {len(apps)} ranked applications, got {len(ranked_apps)}. Retrying... (attempt {retry + 1}/{max_retries})")
-                            continue
-                        else:
-                            raise AssertionError(f"Expected {len(apps)} ranked applications, got {len(ranked_apps)}")
+            batch_prompts.append(prompt)
+            metadata_list.append({'program_id': program_id, 'apps': apps})
 
-                    # Validate all application IDs are present
-                    ranked_ids = {app['id'] for app in ranked_apps}
-                    expected_ids = {app['applicant_id'] for app in apps}
-                    
-                    
+        response_format = {
+            'type': 'json_schema',
+            'json_object': {
+                'name': 'FundingEvaluationResponse',
+                'strict': True,
+                'schema': FundingEvaluationResponse.model_json_schema()
+            }
+        }
 
-                    if ranked_ids != expected_ids:
-                        
-                        logger.debug(f"Ranked IDs (length: {len(ranked_ids)}): {ranked_ids}")
-                        logger.debug(f"Expected IDs (length: {len(expected_ids)}): {expected_ids}")
-                        ranked_apps = [app for app in ranked_apps if app['id'] in expected_ids & ranked_ids]
-                        
-                        for id in expected_ids - ranked_ids:
-                            ranked_apps.append({
-                                'id': id,
-                                'rank': len(ranked_apps) + 1,
-                                'reason': ""
-                            })
-                    # Sort by rank to ensure proper ordering (rank 1 is most =
-                    ranked_apps_sorted = sorted(ranked_apps, key=lambda x: x.get('rank', float('inf')))
-                    num_winners = max(1, int(len(ranked_apps_sorted) * program.funding_rate))
+        return batch_prompts, response_format, metadata_list
 
-                    ranked_apps_sorted = ranked_apps_sorted[:num_winners]
-                    winners_all_programs[program_id] = ranked_apps_sorted
-                    break  # Success, exit retry loop
+    @staticmethod
+    def process_funding_evaluation_results(
+            batch_results: List[Tuple[Dict, List[Dict]]],
+            metadata_list: List[Dict],
+            funding_programs: Dict[str, 'FundingProgram']
+    ) -> Dict[str, List[Dict]]:
+        """Process batch LLM results into winners per program.
 
-                except Exception as e:
-                    if retry == max_retries - 1:
-                        raise RuntimeError(f"Error evaluating funding applications for {program_id} after {max_retries} attempts") from e
-                    else:
-                        logger.warning(f"Error on attempt {retry + 1}/{max_retries}: {e}")
-                        continue
+        Args:
+            batch_results: List of (result_dict, message_history) from generate_batch / generate.
+            metadata_list: Parallel list of {'program_id', 'apps'} dicts.
+            funding_programs: Combined dict of all funding programs across agencies.
+
+        Returns:
+            Dict[program_id, List[Dict]] — ranked winner lists per program.
+        """
+        winners_all_programs = {}
+        for idx, (result, _message_history) in enumerate(batch_results):
+            program_id = metadata_list[idx]['program_id']
+            apps = metadata_list[idx]['apps']
+            program = funding_programs[program_id]
             
+            if result is None:
+                logger.warning(f"No response from LLM for program {program_id}")
+                continue
+            elif isinstance(result, list):
+                ranked_apps = result
+            else:
+                ranked_apps = result.get('ranked_applications', [])
+
+            # Validate all application IDs are present
+            ranked_ids = {app['id'] for app in ranked_apps}
+            expected_ids = {app['applicant_id'] for app in apps}
+
+            if ranked_ids != expected_ids:
+                logger.debug(f"Ranked IDs (length: {len(ranked_ids)}): {ranked_ids}")
+                logger.debug(f"Expected IDs (length: {len(expected_ids)}): {expected_ids}")
+                ranked_apps = [app for app in ranked_apps if app['id'] in expected_ids & ranked_ids]
+
+                for missing_id in expected_ids - ranked_ids:
+                    ranked_apps.append({
+                        'id': missing_id,
+                        'rank': len(ranked_apps) + 1,
+                        'reason': ""
+                    })
+
+            # Sort by rank (rank 1 = most preferred)
+            ranked_apps_sorted = sorted(ranked_apps, key=lambda x: x.get('rank', float('inf')))
+            num_winners = max(1, int(len(ranked_apps_sorted) * program.funding_rate))
+            winners_all_programs[program_id] = ranked_apps_sorted[:num_winners]
+
         return winners_all_programs

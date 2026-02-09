@@ -210,7 +210,7 @@ Below are the candidate directions you can choose from. Please note that project
             prompt += f"* Direction {i + 1}: {direction}\n\n"
 
     prompt += f"""## Your Task
-First, select one research direction that best aligns with your expertise, current situation, and long-term goals. Then, give a 4-5 sentence VERY DETAILED description of the research project. Mention the main techniques you will use.
+First, select one research direction that best aligns with your expertise, current situation, and long-term goals. Then, give a VERY DETAILED description of the research project using around 5 sentences. Mention the main techniques you will use.
 
 Propose the directions based on your expertise:
 - Your Core Expertise (most preferred): {', '.join(core_expertise)}

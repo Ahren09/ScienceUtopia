@@ -14,11 +14,11 @@ def parse_arguments():
         help='Number of years to simulate (default: 10)'
     )
     parser.add_argument(
-        '--start_real_year',
+        '--start_year',
         type=int,
         default=2016,
         help='Starting real-world year for data partitioning (default: 2016). '
-             'Each simulation year maps to a real-world year: Year 1 -> start_real_year, Year 2 -> start_real_year+1, etc.'
+             'Each simulation year maps to a real-world year: Year 1 -> start_year, Year 2 -> start_year+1, etc.'
     )
     parser.add_argument(
         '--output-dir',
@@ -97,14 +97,6 @@ def parse_arguments():
     )
 
     parser.add_argument(
-        '--rag_device',
-        type=str,
-        default='cuda:0',
-        help='Device for RAG embedding model (e.g., "cuda:0", "cpu"). '
-             'Use a different GPU than vLLM to avoid memory contention (default: cuda:0)'
-    )
-
-    parser.add_argument(
         '--industry_funding_mode',
         type=str,
         default='performance',
@@ -115,7 +107,7 @@ def parse_arguments():
     parser.add_argument(
         '--funding_allocation_mode',
         type=str,
-        default='consumption_based',
+        default='fixed',
         choices=['fixed', 'consumption_based'],
         help='Funding allocation mode: "fixed" (config base budget per winner) or "consumption_based" (derived from consumption history) (default: consumption_based)'
     )
@@ -154,12 +146,17 @@ def parse_arguments():
 
     args = parser.parse_args()
 
+    # Set default experiment name based on model name
+    if args.experiment_name == 'default':
+        model_short = args.model.split('/')[-1]
+        args.experiment_name = f'default_{model_short}'
+
     # Debug mode defaults: fewer years, more recent data
     if args.debug:
         if '--num_years' not in sys.argv:
             args.num_years = 4
-        if '--start_real_year' not in sys.argv:
-            args.start_real_year = 2022
+        if '--start_year' not in sys.argv:
+            args.start_year = 2022
 
     if args.debug:
         args.output_dir = os.path.join(args.output_dir, 'debug', args.experiment_name)

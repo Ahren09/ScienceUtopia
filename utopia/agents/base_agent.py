@@ -33,7 +33,7 @@ class PaperReview(BaseModel):
     justification: str
 
 class CitationResponse(BaseModel):
-    citations: List[str]
+    citations: List[int]
 
 class SelfCitationResponse(BaseModel):
     self_citations: List[str]
@@ -392,17 +392,24 @@ Keywords: {', '.join(direction['direction'].keywords)}
 {memory_context}
 """
 
-        prompt += """
+        prompt += f"""
 ## Task
 Based on your research direction, expertise, past work, and experiences, describe in 4-5 sentences what specific research you intend to pursue this round. Be concrete about the problem, method, or contribution you want to explore.
 
 {IMPORTANT_NOTES}
-
-Respond in JSON format:
-```json
-{"intention": "Your 2-3 sentence research intention here."}
 ```
 """
+
+        prompt += """
+## Response Format
+Respond in JSON format:
+```json
+{
+    "intention": "Your 2-3 sentence research intention here."
+}
+```
+"""
+
         response_format = {
             'type': 'json_schema',
             'json_object': {
@@ -905,24 +912,23 @@ Topics: {', '.join(paper['topics'])}
 
 """
         for i, cited_paper in enumerate(candidate_papers[:max_papers]):
-            prompt += f"""### Paper {i + 1}
-ID: {i + 1}
-arXiv ID: {cited_paper['id']}
-Title: {cited_paper['title']}
-Abstract: {cited_paper['abstract'][:300]}...
+            prompt += f"""Paper {i + 1}
+- arXiv ID: {cited_paper['id']}
+- Title: {cited_paper['title']}
+- Abstract: {cited_paper['abstract'][:300]}...
 
 """
 
-        prompt += """
+        prompt += f"""
 ## Sample Response
+Respond in JSON format with the numeric ids (integers) of the candidate papers you want to cite:
 ```json
-{
-    "citations": [ FULL URL of the candidate papers you want to cite, including the "https://" prefix
-        "https://arxiv.org/abs/2301.12345v1", <- first paper you want to cite
-        "https://arxiv.org/abs/2407.06789v1", <- second paper you want to cite
-        ...
+{{
+    "citations": [
+        9,
+        13
     ]
-}
+}}
 ```
 """
 

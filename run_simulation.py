@@ -133,10 +133,9 @@ class Simulation:
         self.submitted_paper_ids: Set[str] = set()  # Track all submitted papers across years
 
         t0 = time.time()
-        rag_device = getattr(self.args, 'rag_device', None)
-        rag_config = RAGConfig(use_langchain=self.use_langchain, **({'device': rag_device} if rag_device else {}))
-        self.start_real_year = kwargs.get('start_real_year', 2016)
-        self.rag: RAG = RAG(config=rag_config, debug=self.debug, model=None, start_real_year=self.start_real_year)
+        rag_config = RAGConfig(use_langchain=self.use_langchain)
+        self.start_year = kwargs.get('start_year', 2016)
+        self.rag: RAG = RAG(config=rag_config, debug=self.debug, model=None, start_year=self.start_year)
         logger.info(f"RAG initialized in {time.time() - t0:.1f}s (device={rag_config.device})")
 
         self.wandb_logger = WandbLogger(SIMULATION_CONFIG, self.args)
@@ -1198,7 +1197,7 @@ class Simulation:
 
             if supports_batching:
                 # ==================== BATCHED PATH (vLLM) ====================
-                MAX_CITATION_RETRIES = 4
+                MAX_CITATION_RETRIES = 8
 
                 # --- Batch 1: Regular Citations (accepted papers only) ---
                 batch_prompts = []
@@ -1252,12 +1251,22 @@ class Simulation:
                             continue
 
                         citations = result['citations']
-                        if not set(citations) <= meta['candidate_paper_ids']:
+                        resolved = []
+                        valid = True
+                        for c in citations:
+                            c_idx = int(c)
+                            if 1 <= c_idx <= len(meta['candidate_papers']):
+                                resolved.append(meta['candidate_papers'][c_idx - 1]['id'])
+                            else:
+                                valid = False
+                                break
+
+                        if not valid:
                             logger.warning(f"Invalid citations for paper {meta['paper']['id']}, retrying")
                             items_needing_retry.append(meta)
                             continue
 
-                        regular_citations[idx] = citations
+                        regular_citations[idx] = resolved
 
                     if not items_needing_retry:
                         break
@@ -1327,12 +1336,22 @@ class Simulation:
                             continue
 
                         citations = result['citations']
-                        if not set(citations) <= meta['candidate_paper_ids']:
+                        resolved = []
+                        valid = True
+                        for c in citations:
+                            c_idx = int(c)
+                            if 1 <= c_idx <= len(meta['candidate_papers']):
+                                resolved.append(meta['candidate_papers'][c_idx - 1]['id'])
+                            else:
+                                valid = False
+                                break
+
+                        if not valid:
                             logger.warning(f"Invalid extended citations for paper {meta['paper']['id']}, retrying")
                             items_needing_retry.append(meta)
                             continue
 
-                        extended_citations[idx] = citations
+                        extended_citations[idx] = resolved
 
                     if not items_needing_retry:
                         break
@@ -1448,10 +1467,14 @@ class Simulation:
                             llm_response, message_history = self.llm.generate(prompt=prompt, response_format=response_format)
 
                             assert llm_response.get('citations') is not None
-                            citations_of_paper = llm_response.get('citations')
+                            raw_citations = llm_response.get('citations')
 
-                            assert set(citations_of_paper) <= set(
-                                [candidate_paper['id'] for candidate_paper in candidate_papers])
+                            resolved = []
+                            for c in raw_citations:
+                                c_idx = int(c)
+                                assert 1 <= c_idx <= len(candidate_papers)
+                                resolved.append(candidate_papers[c_idx - 1]['id'])
+                            citations_of_paper = resolved
 
                             break
 
@@ -1488,9 +1511,14 @@ class Simulation:
 
                                 llm_response, message_history = self.llm.generate(prompt=prompt, response_format=response_format)
                                 assert llm_response.get('citations') is not None
-                                citations_of_paper = llm_response.get('citations')
-                                assert set(citations_of_paper) <= set(
-                                    [candidate_paper['id'] for candidate_paper in candidate_papers])
+                                raw_citations = llm_response.get('citations')
+
+                                resolved = []
+                                for c in raw_citations:
+                                    c_idx = int(c)
+                                    assert 1 <= c_idx <= len(candidate_papers)
+                                    resolved.append(candidate_papers[c_idx - 1]['id'])
+                                citations_of_paper = resolved
                                 break
 
                             except Exception as e:
@@ -1816,10 +1844,10 @@ class Simulation:
                 'maturity'
             ].sum()
 
-        if denominator == 0:
-            industry_funding_per_unit = 0
-        elif self.funding_allocation_mode == 'fixed':
+        if self.funding_allocation_mode == 'fixed':
             industry_funding_per_unit = SIMULATION_CONFIG['funding']['industry_base_budget']
+        elif denominator == 0:
+            industry_funding_per_unit = 0
         else:
             industry_funding_per_unit = max(self.funding_tracker.get_funding_allocation_amount(year, 'industry') // denominator, 1)
 
@@ -1952,7 +1980,7 @@ class Simulation:
                                 raise Exception("Failed to prepare funding application after retries")
                             time.sleep(1)
 
-        # Evaluate applications across all funding agencies
+        # Evaluate applications across all funding agencies (one batch call)
         all_funding_winners_dict, all_funding_programs_dict = {}, {}
 
         logger.debug(f"Calculating weights for funding applications in year {year}...")
@@ -1961,16 +1989,42 @@ class Simulation:
 
         winners_list = []
         submitted_papers_dict = {pid: paper.to_dict() for pid, paper in self.paper_tracker.papers_by_id.items()}
-        for funding_agent in funding_agencies:
-            winners_for_program = funding_agent.evaluate_funding_applications(
-                university_applications,
-                submitted_papers_dict=submitted_papers_dict
-            )
-            all_funding_winners_dict.update(winners_for_program)
-            all_funding_programs_dict.update(funding_agent.funding_programs)
 
-            for program_id, winners in winners_for_program.items():
-                winners_list.extend([agent['id'] for agent in winners])
+        # Collect prompts from all agencies
+        all_eval_prompts = []
+        all_eval_metadata = []
+        eval_response_format = None
+
+        for funding_agent in funding_agencies:
+            prompts, response_format, metadata_list = funding_agent.get_funding_evaluation_prompts(
+                university_applications, submitted_papers_dict
+            )
+            all_eval_prompts.extend(prompts)
+            all_eval_metadata.extend(metadata_list)
+            all_funding_programs_dict.update(funding_agent.funding_programs)
+            if eval_response_format is None and response_format is not None:
+                eval_response_format = response_format
+
+        # One batch LLM call for all agencies
+        if all_eval_prompts:
+            if hasattr(self.llm, 'generate_batch'):
+                eval_batch_results = self.llm.generate_batch(
+                    all_eval_prompts,
+                    response_format=eval_response_format,
+                    desc=f"{len(all_eval_prompts)} funding evaluations"
+                )
+            else:
+                eval_batch_results = [
+                    self.llm.generate(prompt=p, response_format=eval_response_format)
+                    for p in all_eval_prompts
+                ]
+
+            all_funding_winners_dict = FundingAgency.process_funding_evaluation_results(
+                eval_batch_results, all_eval_metadata, all_funding_programs_dict
+            )
+
+        for program_id, winners in all_funding_winners_dict.items():
+            winners_list.extend([agent['id'] for agent in winners])
 
         active_papers_dataframe = active_papers_dataframe.set_index('author_id')
 
@@ -2269,7 +2323,7 @@ class Simulation:
             rag_device = getattr(self.args, 'rag_device', None)
             rag_config = RAGConfig(use_langchain=self.use_langchain, **({'device': rag_device} if rag_device else {}))
             self.rag = RAG.from_dict(checkpoint_data['rag'], config=rag_config, model=None,
-                                     debug=self.debug, start_real_year=self.start_real_year)
+                                     debug=self.debug, start_year=self.start_year)
             logger.info(f"  Loaded RAG with {len(self.rag.document_status)} document statuses")
 
         # Reconstruct exploration experiment trackers if enabled
@@ -2357,7 +2411,7 @@ def main():
         weighted_funding_assignment=args.weighted_funding_assignment,
         funding_allocation_mode=args.funding_allocation_mode,
         experiment_name=args.experiment_name,
-        start_real_year=args.start_real_year,
+        start_year=args.start_year,
         args=args
     )
 

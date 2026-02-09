@@ -210,18 +210,21 @@ The research proposal should be:
 
 """
 
-            prompt += "## Past Accepted Papers"
-            for paper in past_accepted_papers:
-                prompt += f"""Title: {paper['title']}
+            if len(past_accepted_papers) > 0:
+                prompt += "\n\n## Past Accepted Paper\n"
+                for paper in past_accepted_papers:
+                    prompt += f"""
+Title: {paper['title']}
 Arxiv ID: {paper['id']}
 Abstract: {paper['abstract']}
 Status: {paper['status']}
 
 """
 
-            prompt += "## Past Rejected Papers"
-            for paper in past_rejected_papers:
-                prompt += f"""Title: {paper['title']}
+            if len(past_rejected_papers) > 0:
+                prompt += "\n\n## Past Rejected Papers\n"
+                for paper in past_rejected_papers:
+                    prompt += f"""Title: {paper['title']}
 Arxiv ID: \"{paper['id']}\"
 Abstract: {paper['abstract']}
 Status: {paper['status']}
@@ -229,27 +232,22 @@ Status: {paper['status']}
 """
 
             ## Past Accepted Papers
-            prompt += """## Sample Response
+            prompt += """## Response Format
+Respond in JSON format. Each key is a program_id. Set "submit" to true with a proposal and relevant projects to apply, or false with null proposal and empty list to skip:
 ```json
 {
-    "DARPA_AUTONOMOUS": {  // <- this is the program_id
-        "research_proposal": "...",  // <- If you decide not to submit, set to your research proposal
-        "submit": true,  // <- If you decide to submit, set to true
-        "relevant_projects": [  //<- If you decide to submit, set to a list of your past accepted papers
-            {
-                "arxiv_id": "https://arxiv.org/abs/2406.12708v2", <- must be a full URL
-                "status": "accept"
-            },
-            {
-                "arxiv_id": "https://arxiv.org/abs/2406.00001v1",
-                "status": "reject"
-            },
-        ],
+    "DARPA_AUTONOMOUS": {
+        "research_proposal": "Your 100-word proposal here.",
+        "submit": true,
+        "relevant_projects": [
+            {"arxiv_id": "https://arxiv.org/abs/2406.12708v2", "status": "accept"},
+            {"arxiv_id": "https://arxiv.org/abs/2406.00001v1", "status": "reject"}
+        ]
     },
     "DARPA_AI_APPS": {
-        "research_proposal": null, <- If you decide not to submit, set to null
-        "submit": false, // <- If you decide not to submit, set to false
-        "relevant_projects": [] <- If you decide not to submit, set to an empty list
+        "research_proposal": null,
+        "submit": false,
+        "relevant_projects": []
     }
 }
 ```
@@ -341,27 +339,24 @@ Status: {paper['status']}
 
 """
 
-        prompt += """## Sample Response
+        prompt += """## Response Format
+Respond in JSON format. Each key is a program_id. Set "submit" to true with a proposal and relevant projects to apply, or false with null proposal and empty list to skip
+
+An example response is shown below (DO NOT directly copy the exact response:
 ```json
 {
-    "DARPA_AUTONOMOUS": {  // <- this is the program_id
-        "research_proposal": "...",  // <- If you decide not to submit, set to your research proposal
-        "submit": true,  // <- If you decide to submit, set to true
-        "relevant_projects": [  //<- If you decide to submit, set to a list of your past accepted papers
-            {
-                "arxiv_id": "https://arxiv.org/abs/2406.12708v2", <- must be a full URL
-                "status": "accept"
-            },
-            {
-                "arxiv_id": "https://arxiv.org/abs/2406.00001v1",
-                "status": "reject"
-            },
-        ],
+    "DARPA_AUTONOMOUS": {  
+        "submit": true, <- If you chose to apply to this program, set to true.
+        "research_proposal": "Your 100-word proposal here.",
+        "relevant_projects": [
+            {"arxiv_id": "https://arxiv.org/abs/2406.12708v2", "status": "accept"},
+            {"arxiv_id": "https://arxiv.org/abs/2406.00001v1", "status": "reject"}
+        ]
     },
     "DARPA_AI_APPS": {
-        "research_proposal": null, <- If you decide not to submit, set to null
-        "submit": false, // <- If you decide not to submit, set to false
-        "relevant_projects": [] <- If you decide not to submit, set to an empty list
+        "submit": false, <- If you chose to NOT apply to this program, set to false.
+        "research_proposal": null, <- If you chose to NOT apply to this program, set to null.
+        "relevant_projects": []
     }
 }
 ```

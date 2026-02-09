@@ -252,6 +252,17 @@ def parse_json_response(text: str) -> Dict:
         except json.JSONDecodeError:
             pass
 
+    # Strategy 4: Try fixing missing closing brace
+    candidate = text
+    json_match = re.search(r"\{[\s\S]*", text)
+    if json_match:
+        candidate = json_match.group()
+    if candidate.count("{") - candidate.count("}") == 1:
+        try:
+            return json.loads(candidate + "}")
+        except json.JSONDecodeError:
+            pass
+
     raise ValueError(f"Failed to parse JSON from response: {text[:500]}...")
 
 
