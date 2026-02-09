@@ -77,12 +77,6 @@ def parse_arguments():
         help='Maximum sequence length for vLLM models (default: 8192)'
     )
     parser.add_argument(
-        '--enable_thinking',
-        action='store_true',
-        default=False,
-        help='Enable thinking mode for Qwen3 models (default: False)'
-    )
-    parser.add_argument(
         '--batch_size',
         type=int,
         default=64,

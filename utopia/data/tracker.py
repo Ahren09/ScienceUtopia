@@ -200,7 +200,7 @@ class AgentTracker:
         tracker = cls()
         tracker.resources = data.get("resources", {})
         if not tracker.resources:
-            print_colored("AgentTracker: No resources found in checkpoint data", "red")
+            raise ValueError("AgentTracker: No resources found in checkpoint data")
         return tracker
 
 

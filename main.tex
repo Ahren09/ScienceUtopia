@@ -1,0 +1,212 @@
+\documentclass{article}
+\usepackage{graphicx} % Required for inserting images
+
+\input{src/preamble}
+
+
+\title{Science Utopia}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\section{Introduction}
+
+Modern LLMs can autonomously generate ideas, simulate experiments, review papers, and even write papers. 
+% complete a full scientific workflow at a cost of approximately \$15 per paper~\cite{lu2024ai,yamada2025ai}.
+
+A significant gap remains: there is no end-to-end, closed-loop system that fully replicates these cycles of scientific knowledge creation.
+
+% ------------------------------
+\paragraph{This Work} 
+% ------------------------------
+We propose a framework for studying the s
+
+We conducted a large-scale simulation, based on \textcolor{blue}{X} research papers, \textcolor{blue}{Y} funding applications using 300 agents over 10 years.
+
+\section{Method}
+
+
+Academic science reserves its greatest rewards for discoveries and the
+development of theories that explain the world. Industrial research, by
+contrast, receives compensation through markets for technologies that
+provide consumers with control over the world~\cite{fleming2001technology, evans2010industry}. Institutions differ significantly in the motivation of creating academic knowledge
+
+We create several types of agents according to the dimension listed in Table~\ref{tab:personality}.
+
+\subsection{Agent Population}
+
+The framework instantiates multiple researcher agents mapped to institutions, with each agent possessing three inherent expertise directions sampled from available research topics. We implement two primary agent types:
+
+\noindent \textbf{University Researchers}  represent academic institutions prioritizing theoretical contributions and fundamental knowledge advancement. These agents maintain baseline funding levels (70/100) and must apply for grants through competitive processes with funding agencies. Their review behavior emphasizes reproducibility and theoretical rigor.
+
+\noindent \textbf{Industry Researchers} represent commercial research labs focusing on practical applications. These agents start with higher baseline funding and have consistent funding allocation. 
+However, good performance such as publication success or real-world profits can lead to increased funding.
+
+\noindent \textbf{Funding Agencies} manage diverse competitive grant programs. NSF emphasizes foundational research, while DARPA prioritizes application-driven projects.
+
+
+\subsection{Conference System}
+
+The simulation maintains a number of conferences selected proportionally to agent expertise distribution. Each conference targets specific research topics from the arXiv taxonomy. We enforce a 30\% acceptance rate for each conference. 
+
+
+\subsection{Simulation Pipeline}
+
+\paragraph{Phase 1: Research Direction}
+Each agent has an innate set of expertise. 
+
+At the beginning of each year, if an agent does not run out of funding or is not occupied with an ongoing project, they select one research direction they want to focus on based on expertise, funding availabilities, and maturity. Research directions must require specialized expertise. For example, a researcher in database are more possible to take up directions like data mining instead of numeric analysis. 
+
+Some research directions (e.g. database and systems) require longer time period, whereas others require shorter time. We assume that cost-per-unit-time remains constant across different research topics. 
+Subsequent years employ individual selection where agents choose directions based on their expertise and prior experiences. Only agents with sufficient resources ($\geq 20$) participate.
+
+
+\paragraph{Phase 2: Paper Submission}
+
+Each agent can choose one paper from the database as their submission. They can submit at most 1 paper, respecting the fact that submission takes their bandwidth. 
+
+If they submit, their funding will decrease by a variable amount, depending on the research topic. 
+
+
+Submission to a conference with mismatched topics can lower the probability of acceptance. 
+
+Conferences operate independently with topic-matching submission filters, ensuring papers align with conference focus areas.
+
+This design simulates authorship behavior while maintaining computational efficiency by leveraging existing scientific literature.
+
+
+Active researchers submit papers through a RAG-based retrieval pipeline. For each agent's research direction keywords, the system:
+
+Batch retrieves $k=50$ candidate papers from a scientific corpus using semantic similarity. Agents is prompted to select one candidate paper matching their research direction as their submission. 
+
+Agents submit selected papers to compatible conferences based on topic alignment
+
+
+\paragraph{Phase 3: Paper Review}
+
+Each paper is submitted to a venue. Each paper randomly draws 3 reviewers (without conflict of interests) that also submit to the conference. 
+
+The review pipeline is similar to AgentReview~\citep{jin2024agentreview}. We follow review guidelines of the ACL Review Form\footnote{\url{https://aclrollingreview.org/reviewform}}. 
+
+\paragraph{Phase 4: Paper Decisions}
+
+Conferences aggregate review scores and accept the top 30\% of submissions according to the average score. Authors who receive reviews and process feedback and update their internal memory banks. For example, a harsh review may lead to harsher judgment, and good reviews and decisions lead to better evaluation scores.
+
+
+
+\paragraph{Phase 5: Research Fund Allocation}
+
+We design the funding mechanism so that the total funding in the system only changes by a small amount (increase of 10\%). This is similar to real world scenarios.
+
+Researchers write funding applications to secure fundings for the next phase. 
+
+
+University researchers prepare funding applications based on past performance (accepted papers) and current research directions. Funding agencies evaluate applications using LLM-based judgment incorporating.
+
+
+Industry researchers receive funding updates according to their allocation mode (performance-based or consistent). 
+
+Agents with depleted resources are eliminated from the ecosystem.
+
+
+% We define the allocation formula for institution $i$ based on the number of accepted papers in previous years, applying an exponential decay to the contributions of older papers. Let the decay factor be $\lambda$, where $0 < \lambda < 1$ (e.g., $\lambda = 0.5$).
+
+% \subsection{Funding Allocation}
+
+% \paragraph{Score Calculation for Each institution}
+% For institution $i$, let $P_{ij}$ be the set of papers accepted in year $j \in [1, T]$. The contribution of each paper is weighted exponentially:
+
+% $$
+% \text{Score}(i, j) = \sum_{j=1}^{n_i} |P_{ij}| \cdot \lambda^{j-1}
+% $$
+
+% where $\lambda$ is the decay factor that emphasizes recent papers and penalizes papers in previous years. We set $\lambda = 0.5$ in our experiment.
+
+
+\section{Evaluation}
+
+
+Simulating these dynamics offers valuable insights into competitive and collaborative academic research, strategic grant management, and research sustainability.
+
+
+
+\subsection{Experimental Setup}
+
+\paragraph{Implementation Details}
+
+
+To simulate the paper submission process, we use keywords to retrieve from SciEvo~\cite{jin2024scievo}, which contains all arXiv papers starting from the establishment of arXiv. For all conferences, we use a fixed acceptance rate of 30\%. 
+
+
+\paragraph{Metrics} 
+To measure academic impact, we use the number of citations and the numbers of accepted papers in each conference. 
+
+To measure survival metrics, we use the funding availability and 
+We mainly use
+
+\subsection{Results}
+
+\subsection{Cascading Resubmissions Create System-Level Review Crisis}
+
+To investigate how rejection-resubmission cycles affect the peer review system, we modeled submission dynamics. 
+Here, the authors can decide to submit rejected papers to other venues with a fixed cost of 5. Low-funded agents submitted \textcolor{red}{SUB\_LOW} papers per round, while well-funded agents submitted \textcolor{red}{SUB\_HIGH} papers. 
+On average, each reviewer handled  around 5 papers per round. We tracked system evolution over \textcolor{red}{ROUNDS} rounds, measuring submission inflation, cascade depth, time-to-publication, and rejection recycling rates.
+
+The simulation revealed explosive growth in submission volumes driven by resubmission cascades. Total submissions per round increased by \textcolor{red}{INFLATION\_RATE}\% annually, with cumulative growth of \textcolor{red}{TOTAL\_GROWTH}\% over the \textcolor{red}{SIM\_PERIOD}-year simulation period. Rejected papers underwent mean \textcolor{red}{CASCADE\_DEPTH} venue attempts before acceptance or abandonment (95\% CI: [\textcolor{red}{CASCADE\_CI\_LOW}, \textcolor{red}{CASCADE\_CI\_HIGH}]). The rejection recycling rate reached \textcolor{red}{RECYCLE\_RATE}\%, meaning most rejected papers re-entered the review system rather than being withdrawn.
+
+System saturation occurred at round \textcolor{red}{SATURATION\_ROUND}, when aggregate submissions exceeded available reviewer capacity by \textcolor{red}{EXCESS\_PERCENT}\%. This triggered degradation in review quality: acceptance rates increased by \textcolor{red}{ACCEPTANCE\_INCREASE}\% across all venue tiers ($p < \textcolor{red}{P\_VAL\_SATURATION}$, logistic regression), suggesting reviewer fatigue effects. Time-to-publication increased from mean \textcolor{red}{TIME\_INITIAL} rounds (early simulation) to \textcolor{red}{TIME\_SATURATED} rounds post-saturation ($p < \textcolor{red}{P\_VAL\_TIME}$, Wilcoxon rank-sum test).
+
+Venue tier stratification showed asymmetric burden distribution. Lower-tier conferences experienced \textcolor{red}{LOWER\_TIER\_INCREASE}\% submission growth compared to \textcolor{red}{TOP\_TIER\_INCREASE}\% for top-tier venues, as cascade resubmissions concentrated at lower prestige levels. This created quality heterogeneity: papers eventually published at lower-tier venues had undergone mean \textcolor{red}{ATTEMPTS\_LOWER} prior rejections versus \textcolor{red}{ATTEMPTS\_TOP} for top-tier publications ($p < \textcolor{red}{P\_VAL\_TIER}$).
+
+The review burden distributed highly unevenly. Researchers with high visibility (top \textcolor{red}{REVIEWER\_PERCENT}\% by publication count) received \textcolor{red}{BURDEN\_RATIO}$\times$ more review requests than average, creating unsustainable workload concentration. When simulating bounded reviewer capacity (maximum \textcolor{red}{MAX\_REVIEWS} reviews per person per round), \textcolor{red}{UNREVIEWED\_PERCENT}\% of submissions went unreviewed by round \textcolor{red}{CRISIS\_ROUND}.
+
+These findings demonstrate that the current peer review model exhibits intrinsic instability: resubmission cascades create exponential growth in review burden that inevitably exceeds system capacity, degrading review quality and creating unsustainable workload for researchers. Without structural intervention, the system faces imminent crisis as submission volumes compound faster than reviewer availability grows.
+
+
+\section{Related Work}
+
+Social Simulation using LLM~\cite{anthis2025llm}.
+
+LLM-driven scientific workflows is reshaping how research is conducted.
+
+AI in academia can assist in writing, designing experiments, analyzing data, and drafting peer reviews.
+
+adversarial dynamics among LLM agents~\cite{jiang2025badscientist}. Specifically, purely LLM-based review systems face critical security concerns in that fabricated papers
+achieve acceptance rates up to 82.0\%. Integrity checking systematically fails, exposing fundamental limitations in current AI-driven review systems and under-scoring the urgent need for defense-in-depth
+safeguards in scientific publishing.
+
+
+
+
+\section{Limitations}
+
+LLMs can reproduce and sometimes amplify biases entrenched in their training corpora~\cite{}. Reviewers relying on LLM-generated content may inadvertently become complicit in reinforcing mainstream paradigms, undermining equitable idea generation and evaluation~\citep{zhang2025evolving}
+
+
+We did not ask agents to write papers, as agents still fail short in autonomously conducting research. The quality of generated paper is thus still low. 
+
+\paragraph{Measuring Academic Impact}
+
+We assume that all papers can be cited. Agents will first consider citing accepted papers, thus a higher probability. If no fits found, agents can choose to cite other submitted papers. This corresponds to real-world scenarios where papers can be available in preprint formats.
+
+We assume that academic impacts are measured by the number of citations and the number of paper accepted. 
+
+\section{Future Work}
+All conferences use an acceptance rate of 30\% to ensure fairness and avoid introducing unexpected biases in comparative studies. Consider real acceptance rates of conferences to enable more realistic simulations.
+
+
+Investigate collaboration dynamics. 
+
+% \bibliographystyle{plainnat}
+
+\bibliography{references}
+\bibliographystyle{unsrt}
+
+\appendix
+
+\input{tables/tab-personality}
+
+\end{document}

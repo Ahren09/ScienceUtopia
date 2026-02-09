@@ -53,6 +53,12 @@ SIMULATION_CONFIG = {
         'initial_success_rate': 0.5,       # Initial assumed success rate
     },
 
+    # LLM generation settings
+    'llm': {
+        'max_tokens': 2048,            # Default max tokens for generate_batch()
+        'enable_thinking': True,      # Enable thinking mode for Qwen3 models
+    },
+
     # Simulation settings
     'simulation': {
         'default_num_years': 5,            # Default simulation duration

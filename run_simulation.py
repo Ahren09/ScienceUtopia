@@ -48,7 +48,7 @@ from utopia.agents.funding_agents import (
 )
 from utopia.agents.research_direction import (
     assign_directions_individual,
-    assign_directions_batch,
+    create_research_directions_batch,
     AVAILABLE_DIRECTIONS
 )
 from utopia.agents.researcher_agents import (
@@ -109,7 +109,8 @@ class Simulation:
         self.weighted_funding_assignment = kwargs.get('weighted_funding_assignment', False)
         self.funding_allocation_mode = kwargs.get('funding_allocation_mode', 'consumption_based')
         self.experiment_name = kwargs.get('experiment_name', 'default')
-        self.exploration_experiment = (self.experiment_name == 'exploration_vs_exploitation')
+        
+        assert self.experiment_name in ['default', 'exploration_vs_exploitation'], f"Invalid experiment name: {self.experiment_name}"
 
         # Store args for backward compatibility with existing code
         if args is None:
@@ -133,7 +134,8 @@ class Simulation:
         self.submitted_paper_ids: Set[str] = set()  # Track all submitted papers across years
 
         t0 = time.time()
-        rag_config = RAGConfig(use_langchain=self.use_langchain)
+        rag_device = getattr(self.args, 'rag_device', None)
+        rag_config = RAGConfig(use_langchain=self.use_langchain, **({'device': rag_device} if rag_device else {}))
         self.start_year = kwargs.get('start_year', 2016)
         self.rag: RAG = RAG(config=rag_config, debug=self.debug, model=None, start_year=self.start_year)
         logger.info(f"RAG initialized in {time.time() - t0:.1f}s (device={rag_config.device})")
@@ -141,7 +143,7 @@ class Simulation:
         self.wandb_logger = WandbLogger(SIMULATION_CONFIG, self.args)
 
         # NEW: Initialize exploration experiment trackers (opt-in via flag)
-        if self.exploration_experiment:
+        if self.experiment_name == 'exploration_vs_exploitation':
             logger.info("Initializing Exploration vs Exploitation experiment...")
             # Will be lazily imported to avoid dependencies when experiment is disabled
             self.embedding_tracker = None  # Will initialize after first use
@@ -207,7 +209,7 @@ class Simulation:
                 funding_level = 160 if university in rich_universities else 80
 
                 # Assign exploration strategy if experiment is enabled
-                if self.exploration_experiment:
+                if self.experiment_name == 'exploration_vs_exploitation':
                     # 50% explorer, 50% exploiter
                     exploration_strategy = "explorer" if counter % 2 == 0 else "exploiter"
                 else:
@@ -341,7 +343,7 @@ class Simulation:
 
     def _initialize_experiment_trackers(self):
         """Lazy initialization of exploration experiment trackers"""
-        if not self.exploration_experiment:
+        if self.experiment_name != 'exploration_vs_exploitation':
             return
 
         if self.embedding_tracker is None:
@@ -385,7 +387,7 @@ class Simulation:
             author_id: Author ID
             year: Current year
         """
-        if not self.exploration_experiment:
+        if self.experiment_name != 'exploration_vs_exploitation':
             return
 
         # Lazy initialize trackers on first use
@@ -418,7 +420,7 @@ class Simulation:
         Args:
             year: Current year number
         """
-        if not self.exploration_experiment:
+        if self.experiment_name != 'exploration_vs_exploitation':
             return
 
         self._initialize_experiment_trackers()
@@ -681,7 +683,7 @@ class Simulation:
 
         return resubmissions_list
 
-    def _run_phase_1_assign_directions(self, year: int, year_results: Dict):
+    def _run_phase_1_research_directions(self, year: int, year_results: Dict):
         """Phase 1: Assign research directions to agents
 
         Args:
@@ -717,7 +719,7 @@ class Simulation:
 
         if supports_batching and authors_with_directions_pending:
             
-            directions = assign_directions_batch(
+            directions = create_research_directions_batch(
                 agents=authors_with_directions_pending,
                 year=year,
                 paper_tracker=self.paper_tracker,
@@ -815,7 +817,7 @@ class Simulation:
 
         if supports_batching:
             intention_results = self.llm.generate_batch(
-                intention_prompts, max_tokens=256,
+                intention_prompts, max_tokens=512,
                 response_format=intention_response_format,
                 desc=f"{len(intention_prompts)} round intentions"
             )
@@ -1197,7 +1199,7 @@ class Simulation:
 
             if supports_batching:
                 # ==================== BATCHED PATH (vLLM) ====================
-                MAX_CITATION_RETRIES = 8
+                MAX_CITATION_RETRIES = 4
 
                 # --- Batch 1: Regular Citations (accepted papers only) ---
                 batch_prompts = []
@@ -1251,22 +1253,12 @@ class Simulation:
                             continue
 
                         citations = result['citations']
-                        resolved = []
-                        valid = True
-                        for c in citations:
-                            c_idx = int(c)
-                            if 1 <= c_idx <= len(meta['candidate_papers']):
-                                resolved.append(meta['candidate_papers'][c_idx - 1]['id'])
-                            else:
-                                valid = False
-                                break
-
-                        if not valid:
+                        if not set(citations) <= meta['candidate_paper_ids']:
                             logger.warning(f"Invalid citations for paper {meta['paper']['id']}, retrying")
                             items_needing_retry.append(meta)
                             continue
 
-                        regular_citations[idx] = resolved
+                        regular_citations[idx] = citations
 
                     if not items_needing_retry:
                         break
@@ -1336,22 +1328,12 @@ class Simulation:
                             continue
 
                         citations = result['citations']
-                        resolved = []
-                        valid = True
-                        for c in citations:
-                            c_idx = int(c)
-                            if 1 <= c_idx <= len(meta['candidate_papers']):
-                                resolved.append(meta['candidate_papers'][c_idx - 1]['id'])
-                            else:
-                                valid = False
-                                break
-
-                        if not valid:
+                        if not set(citations) <= meta['candidate_paper_ids']:
                             logger.warning(f"Invalid extended citations for paper {meta['paper']['id']}, retrying")
                             items_needing_retry.append(meta)
                             continue
 
-                        extended_citations[idx] = resolved
+                        extended_citations[idx] = citations
 
                     if not items_needing_retry:
                         break
@@ -1467,14 +1449,10 @@ class Simulation:
                             llm_response, message_history = self.llm.generate(prompt=prompt, response_format=response_format)
 
                             assert llm_response.get('citations') is not None
-                            raw_citations = llm_response.get('citations')
+                            citations_of_paper = llm_response.get('citations')
 
-                            resolved = []
-                            for c in raw_citations:
-                                c_idx = int(c)
-                                assert 1 <= c_idx <= len(candidate_papers)
-                                resolved.append(candidate_papers[c_idx - 1]['id'])
-                            citations_of_paper = resolved
+                            assert set(citations_of_paper) <= set(
+                                [candidate_paper['id'] for candidate_paper in candidate_papers])
 
                             break
 
@@ -1511,14 +1489,9 @@ class Simulation:
 
                                 llm_response, message_history = self.llm.generate(prompt=prompt, response_format=response_format)
                                 assert llm_response.get('citations') is not None
-                                raw_citations = llm_response.get('citations')
-
-                                resolved = []
-                                for c in raw_citations:
-                                    c_idx = int(c)
-                                    assert 1 <= c_idx <= len(candidate_papers)
-                                    resolved.append(candidate_papers[c_idx - 1]['id'])
-                                citations_of_paper = resolved
+                                citations_of_paper = llm_response.get('citations')
+                                assert set(citations_of_paper) <= set(
+                                    [candidate_paper['id'] for candidate_paper in candidate_papers])
                                 break
 
                             except Exception as e:
@@ -1844,10 +1817,10 @@ class Simulation:
                 'maturity'
             ].sum()
 
-        if self.funding_allocation_mode == 'fixed':
-            industry_funding_per_unit = SIMULATION_CONFIG['funding']['industry_base_budget']
-        elif denominator == 0:
+        if denominator == 0:
             industry_funding_per_unit = 0
+        elif self.funding_allocation_mode == 'fixed':
+            industry_funding_per_unit = SIMULATION_CONFIG['funding']['industry_base_budget']
         else:
             industry_funding_per_unit = max(self.funding_tracker.get_funding_allocation_amount(year, 'industry') // denominator, 1)
 
@@ -1980,7 +1953,7 @@ class Simulation:
                                 raise Exception("Failed to prepare funding application after retries")
                             time.sleep(1)
 
-        # Evaluate applications across all funding agencies (one batch call)
+        # Evaluate applications across all funding agencies
         all_funding_winners_dict, all_funding_programs_dict = {}, {}
 
         logger.debug(f"Calculating weights for funding applications in year {year}...")
@@ -1989,42 +1962,16 @@ class Simulation:
 
         winners_list = []
         submitted_papers_dict = {pid: paper.to_dict() for pid, paper in self.paper_tracker.papers_by_id.items()}
-
-        # Collect prompts from all agencies
-        all_eval_prompts = []
-        all_eval_metadata = []
-        eval_response_format = None
-
         for funding_agent in funding_agencies:
-            prompts, response_format, metadata_list = funding_agent.get_funding_evaluation_prompts(
-                university_applications, submitted_papers_dict
+            winners_for_program = funding_agent.evaluate_funding_applications(
+                university_applications,
+                submitted_papers_dict=submitted_papers_dict
             )
-            all_eval_prompts.extend(prompts)
-            all_eval_metadata.extend(metadata_list)
+            all_funding_winners_dict.update(winners_for_program)
             all_funding_programs_dict.update(funding_agent.funding_programs)
-            if eval_response_format is None and response_format is not None:
-                eval_response_format = response_format
 
-        # One batch LLM call for all agencies
-        if all_eval_prompts:
-            if hasattr(self.llm, 'generate_batch'):
-                eval_batch_results = self.llm.generate_batch(
-                    all_eval_prompts,
-                    response_format=eval_response_format,
-                    desc=f"{len(all_eval_prompts)} funding evaluations"
-                )
-            else:
-                eval_batch_results = [
-                    self.llm.generate(prompt=p, response_format=eval_response_format)
-                    for p in all_eval_prompts
-                ]
-
-            all_funding_winners_dict = FundingAgency.process_funding_evaluation_results(
-                eval_batch_results, all_eval_metadata, all_funding_programs_dict
-            )
-
-        for program_id, winners in all_funding_winners_dict.items():
-            winners_list.extend([agent['id'] for agent in winners])
+            for program_id, winners in winners_for_program.items():
+                winners_list.extend([agent['id'] for agent in winners])
 
         active_papers_dataframe = active_papers_dataframe.set_index('author_id')
 
@@ -2111,7 +2058,7 @@ class Simulation:
         self.wandb_logger.log_phase(year, 0, year_results, self, num_resubmissions=len(resubmissions_list))
 
         # Phase 1: Assign research directions
-        directions, active_authors, avg_funding = self._run_phase_1_assign_directions(year, year_results)
+        directions, active_authors, avg_funding = self._run_phase_1_research_directions(year, year_results)
         self.wandb_logger.log_phase(year, 1, year_results, self, num_active_authors=len(active_authors), avg_funding=avg_funding)
 
         # Phase 2: Generate and submit papers
@@ -2246,6 +2193,7 @@ class Simulation:
             'ecosystem_data': self.ecosystem.to_dict(),
             'conference_system': self.conference_system.to_dict(),
             'citation_tracker': self.citation_tracker.to_dict(),
+            'agent_tracker': self.agent_tracker.to_dict(),
             'funding_tracker': self.funding_tracker.to_dict(),
             'rag': self.rag.to_dict(),
             'paper_tracker': self.paper_tracker.to_dict(),
@@ -2255,14 +2203,12 @@ class Simulation:
         }
 
         # Save exploration experiment trackers if enabled
-        if self.exploration_experiment:
+        if self.experiment_name == 'exploration_vs_exploitation':
             checkpoint_data['exploration_experiment'] = {
                 'enabled': True,
                 'embedding_tracker': self.embedding_tracker.to_dict() if self.embedding_tracker else None,
                 'exploration_metrics': self.exploration_metrics.to_dict() if self.exploration_metrics else None,
             }
-        else:
-            checkpoint_data['exploration_experiment'] = {'enabled': False}
 
         with open(checkpoint_path, 'w') as f:
             json.dump(checkpoint_data, f, indent=2)
@@ -2303,7 +2249,7 @@ class Simulation:
 
         # Reconstruct citation tracker
         self.citation_tracker = CitationTracker.from_dict(checkpoint_data.get('citation_tracker', {'citations': {}}))
-        self.agent_tracker = AgentTracker.from_dict(checkpoint_data.get('agent_tracker', {'metrics': {}}))
+        self.agent_tracker = AgentTracker.from_dict(checkpoint_data.get('agent_tracker', {'resources': {}}))
         self.funding_tracker = FundingTracker.from_dict(checkpoint_data.get('funding_tracker', {}))
         self.funding_tracker.funding_allocation_mode = self.funding_allocation_mode
         # Reconstruct paper tracker
@@ -2328,7 +2274,7 @@ class Simulation:
 
         # Reconstruct exploration experiment trackers if enabled
         if 'exploration_experiment' in checkpoint_data and checkpoint_data['exploration_experiment'].get('enabled', False):
-            self.exploration_experiment = True
+            self.experiment_name = 'exploration_vs_exploitation'
             exp_data = checkpoint_data['exploration_experiment']
 
             if exp_data.get('embedding_tracker'):
@@ -2383,7 +2329,6 @@ def main():
             model_name=args.model,
             base_url=args.vllm_url,
             max_concurrent_requests=args.batch_size,
-            enable_thinking=args.enable_thinking,
         )
     else:
         # Any non-OpenAI model uses vLLM (e.g., "Qwen/Qwen3-8B", "meta-llama/Llama-3-8B")
@@ -2393,7 +2338,6 @@ def main():
             tensor_parallel_size=args.tensor_parallel_size,
             gpu_memory_utilization=args.gpu_memory_utilization,
             max_model_len=args.max_model_len,
-            enable_thinking=args.enable_thinking
         )
     logger.info(f"LLM initialized in {time.time() - t0:.1f}s")
 

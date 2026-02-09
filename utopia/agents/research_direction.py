@@ -18,6 +18,7 @@ from utopia.data.paper_tracker import PaperTracker
 
 logger = logging.getLogger(__name__)
 
+ALL_CS_TOPICS = ["cs.AI", "cs.AR", "cs.CC", "cs.CE", "cs.CG", "cs.CL", "cs.CR", "cs.CY", "cs.DB", "cs.DC", "cs.DL", "cs.DM", "cs.DS", "cs.ET", "cs.FL", "cs.LG", "cs.LO", "cs.NI", "cs.OH", "cs.OS", "cs.PF", "cs.PL", "cs.RO", "cs.SE", "cs.SY"]
 
 class ResearchDirectionSelection(BaseModel):
     """Pydantic model for structured output of research direction selection"""
@@ -107,7 +108,7 @@ def build_direction_prompt(
     """
     if not candidate_directions:
         candidate_directions = agent.expertise
-
+        
     core_expertise = []
     related_expertise = set()
     for direction in agent.expertise:
@@ -115,8 +116,6 @@ def build_direction_prompt(
         related_expertise.update(direction.related_topics)
 
     related_expertise = list(related_expertise)
-
-    candidate_directions = core_expertise + related_expertise
 
     past_accepted_papers, past_rejected_papers = paper_tracker.get_papers_by_decision(agent.id)
 
@@ -130,23 +129,19 @@ Now, you are trying to decide the research direction of your next project.
 
         prompt += f"""## Your Past Publications (Accepted Papers)
 The following are your past accepted papers.
-You can use them to inspire your next project, such as deciding on research directions or topics.
-You may also use the reviews to decide how you conduct future peer reviews (e.g. giving higher or lower scores).
-Ratings in the reviews are from 1 to 5.
+You can use them to inspire your next project, such as deciding on research directions.
 """
-        for paper in past_accepted_papers:
-            prompt += f"  - \"{paper.title}\" (Conference: {paper.conference}). Average score: {paper.review_history[-1]['score']:.2f}. Abstract: {paper.abstract[:300]} ...\n"
+        for idx_paper, paper in enumerate(past_accepted_papers):
+            prompt += f"  - Paper {idx_paper + 1}: \"{paper.title}\" (Accepted in Conference {paper.conference}). Topic: {paper.topics}. Average score: {paper.review_history[-1]['score']:.2f}. Abstract: {paper.abstract[:300]} ...\n"
 
     if len(past_rejected_papers) > 0:
         prompt += f"""
 ## Your Past Rejected Papers
 The following are your past rejected papers.
 You can use them to learn from your mistakes and improve your next project, such as deciding on research directions or topics.
-You may also use the reviews to decide how you conduct future peer reviews (e.g. giving higher or lower scores).
-Ratings in the reviews are from 1 to 5.
 """
-    for paper in past_rejected_papers:
-        prompt += f"  - \"{paper.title}\". Average score: {paper.review_history[-1]['score']:.2f}. Abstract: {paper.abstract[:300]} ...\n"
+    for idx_paper, paper in enumerate(past_rejected_papers):
+        prompt += f"  - Paper {idx_paper + 1}: \"{paper.title}\". Topic: {paper.topics}. Average score: {paper.review_history[-1]['score']:.2f}. Abstract: {paper.abstract[:300]} ...\n"
 
     prompt += f"""
 ## Your Funding Situation
@@ -202,7 +197,7 @@ Below are the candidate directions you can choose from. Please note that project
         if isinstance(direction, ResearchDirection):
             prompt += f"""### Direction {i + 1}: {direction.topic}
 - Focus Areas: {', '.join(direction.focus_areas[:3])}
-- Expected Project Duration: {direction.years} year(s) (projects in all directions are expected to complete in either 1, 2, or 3 years)
+- Expected Project Duration: {direction.years} year(s) 
 - Keywords: {', '.join(direction.keywords[:8])}
 
 """
@@ -223,12 +218,13 @@ Propose the directions based on your expertise:
 """
 
     prompt += """
-## Sample Response
+## Example Response
+The response must contain 3 fields: "topic", "detailed_focus", and "reason".
 ```json
 {
     "topic": "natural_language_processing", <- MUST be one of the candidate directions
-    "detailed_focus": "I will develop methods that leverage reinforcement learning from human feedback (RLHF) to align large language models with clinical reasoning, ethical standards, and domain-specific decision-making in healthcare." <- 1-2 sentence detailed description of the research direction. mention the main techniques you will use.
-    "reason": "This direction aligns with my recent publications, such as the paper titled 'Towards LLM Alignment using Reinforcement Learning from Human Feedback'." <- 1 sentence justification
+    "detailed_focus": "I will develop methods that leverage reinforcement learning from human feedback (RLHF) to align large language models with clinical reasoning, ethical standards, and domain-specific decision-making in healthcare." <- 4-5 sentence detailed description of the research direction. mention the main techniques you will use.
+    "reason": "This direction aligns with my recent publications, such as the paper titled 'Towards LLM Alignment using Reinforcement Learning from Human Feedback'." <- 2 sentence justification
 }
 ```
 """
@@ -245,7 +241,7 @@ Propose the directions based on your expertise:
     return prompt, response_format, core_expertise, related_expertise
 
 
-def assign_directions_batch(
+def create_research_directions_batch(
         agents: List,  # List of SimulationAgent
         year: int,
         paper_tracker: PaperTracker,

@@ -34,6 +34,7 @@ from datasets import load_dataset
 from langchain_community.vectorstores import FAISS
 
 from utopia.utils.data_utils import read_json
+from utopia.agents.research_direction import ALL_CS_TOPICS
 
 import pandas as pd
 
@@ -43,7 +44,7 @@ class RAGConfig:
     """Configuration for RAG system"""
     batch_size: int = 64
     chunk_size: int = 512
-    embedding_model: str = "thenlper/gte-small" 
+    embedding_model: str = "thenlper/gte-small" # "Qwen/Qwen3-Embedding-0.6B" 
     num_retrieved_docs: int = 1000
     num_docs_final: int = 5
     normalize_embeddings: bool = True
@@ -134,6 +135,7 @@ class RAG:
                     'title': title,
                     'published': published,
                     'publication_year': pub_year,
+                    'tags': item.get('tags', []),
                 }
 
                 doc = Document(
@@ -158,11 +160,13 @@ class RAG:
 
             else:
                 dataset = load_dataset("Ahren09/SciEvo", "arxiv", split="train")
+                n_workers = self.config.n_workers
+                num_proc = n_workers if n_workers > 1 else None
+
+                dataset = dataset.filter(lambda x: len(set(x['tags']) | set(ALL_CS_TOPICS)) > 0, num_proc=num_proc)
 
                 self.id2docs = {}
 
-                n_workers = self.config.n_workers
-                num_proc = n_workers if n_workers > 1 else None
 
                 if num_proc:
                     # Parallel path: use HF datasets built-in multiprocessing
@@ -200,11 +204,11 @@ class RAG:
                     self.documents = [
                         Document(
                             page_content=abstract,
-                            metadata={'id': id_, 'title': title, 'published': pub, 'publication_year': year}
+                            metadata={'id': id_, 'title': title, 'published': pub, 'publication_year': year, 'tags': tags}
                         )
-                        for abstract, id_, title, pub, year in zip(
+                        for abstract, id_, title, pub, year, tags in zip(
                             df['summary'].values, df['_id'].values, df['title'].values,
-                            df['_published'].values, df['_pub_year'].values,
+                            df['_published'].values, df['_pub_year'].values, df['tags'].values,
                         )
                     ]
                     self.id2docs = dict(zip(df['_id'].values, self.documents))
@@ -230,6 +234,7 @@ class RAG:
                             'title': title,
                             'published': published,
                             'publication_year': pub_year,
+                            'tags': item.get('tags', []),
                         }
 
                         doc = Document(page_content=abstract, metadata=metadata)
@@ -271,7 +276,7 @@ class RAG:
         print(f"[RAG] Sim year {sim_year} (real: {real_year}): {available} total papers, {unsubmitted} available for submission")
 
 
-    def build_knowledge_index(self) -> "FAISS":
+    def build_knowledge_index(self):
         """Build FAISS index with normalized embeddings using PyTorch tensors
 
         Builds TWO separate indices:

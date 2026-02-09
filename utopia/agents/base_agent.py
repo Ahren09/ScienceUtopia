@@ -397,15 +397,14 @@ Keywords: {', '.join(direction['direction'].keywords)}
 Based on your research direction, expertise, past work, and experiences, describe in 4-5 sentences what specific research you intend to pursue this round. Be concrete about the problem, method, or contribution you want to explore.
 
 {IMPORTANT_NOTES}
-```
 """
 
         prompt += """
 ## Response Format
-Respond in JSON format:
+Respond in JSON format. An example response is below (DO NOT directly copy the example response):
 ```json
 {
-    "intention": "Your 2-3 sentence research intention here."
+    "intention": "YOUR 5 SENTENCE RESEARCH INTENTION."
 }
 ```
 """

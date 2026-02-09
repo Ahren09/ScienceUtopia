@@ -14,6 +14,7 @@ import numpy as np
 from PIL import Image
 from openai import AzureOpenAI, OpenAI
 from const import IMPORTANT_NOTES
+from utopia.config import SIMULATION_CONFIG
 
 logger = logging.getLogger(__name__)
 
@@ -280,7 +281,6 @@ class VLLMModel(BaseLLM):
         tensor_parallel_size: int = 1,
         gpu_memory_utilization: float = 0.8,
         max_model_len: int = None,
-        enable_thinking: bool = False,
         distributed_executor_backend: str = "mp",
         **kwargs
     ):
@@ -291,7 +291,6 @@ class VLLMModel(BaseLLM):
             tensor_parallel_size: Number of GPUs for tensor parallelism
             gpu_memory_utilization: Fraction of GPU memory to use
             max_model_len: Maximum sequence length (optional, vLLM auto-detects if None)
-            enable_thinking: Whether to enable thinking mode for Qwen3
             distributed_executor_backend: Backend for multi-GPU ("mp" for single, "nccl" for multi)
         """
         from vllm import LLM as vLLMLLM
@@ -300,7 +299,7 @@ class VLLMModel(BaseLLM):
         self.tensor_parallel_size = tensor_parallel_size
         self.gpu_memory_utilization = gpu_memory_utilization
         self.max_model_len = max_model_len
-        self.enable_thinking = enable_thinking
+        self.enable_thinking = SIMULATION_CONFIG['llm']['enable_thinking']
 
         # Ensure vLLM uses 'spawn' method for CUDA compatibility
         os.environ.setdefault('VLLM_WORKER_MULTIPROC_METHOD', 'spawn')
@@ -437,7 +436,7 @@ class VLLMModel(BaseLLM):
         response_format: Optional[Dict] = None,
         temperature: float = 0.7,
         system_prompt: Optional[str] = "This is a simulation of an academic ecosystem, where researchers choose research directions and submit papers, reviewers conduct peer reviews of papers, and funding agencies allocate fundings.",
-        max_tokens: int = 2048,
+        max_tokens: int = SIMULATION_CONFIG['llm']['max_tokens'],
         desc: Optional[str] = None
     ) -> List[Tuple[Dict, List[Dict]]]:
         """Process ALL prompts in a single vLLM call - no for-loop over prompts
@@ -530,12 +529,11 @@ class VLLMServerModel(BaseLLM):
         model_name: str,
         base_url: str = "http://localhost:8000/v1",
         max_concurrent_requests: int = 32,
-        enable_thinking: bool = False,
     ):
         super().__init__(model_name)
         self.base_url = base_url
         self.max_concurrent_requests = max_concurrent_requests
-        self.enable_thinking = enable_thinking
+        self.enable_thinking = SIMULATION_CONFIG['llm']['enable_thinking']
 
         # vLLM server doesn't need a real API key
         self.client = OpenAI(base_url=base_url, api_key="EMPTY")
@@ -611,7 +609,7 @@ class VLLMServerModel(BaseLLM):
         response_format: Optional[Dict] = None,
         temperature: float = 0.7,
         system_prompt: Optional[str] = "This is a simulation of an academic ecosystem, where researchers choose research directions and submit papers, reviewers conduct peer reviews of papers, and funding agencies allocate fundings.",
-        max_tokens: int = 2048,
+        max_tokens: int = SIMULATION_CONFIG['llm']['max_tokens'],
         desc: Optional[str] = None,
     ) -> List[Tuple[Dict, List[Dict]]]:
         """Process prompts concurrently via the external vLLM server.
