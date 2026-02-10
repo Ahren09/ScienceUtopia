@@ -17,6 +17,7 @@ from enum import Enum
 from const import REVIEW_CRITERIA, IMPORTANT_NOTES
 from utopia.agents.conference import Conference
 from utopia.agents.research_direction import ResearchDirection
+from utopia.agents.conference import ARXIV_CATEGORY_NAMES
 from utopia.config import SIMULATION_CONFIG
 from utopia.data.paper_tracker import PaperTracker
 from utopia.models.models import BaseLLM
@@ -36,7 +37,7 @@ class CitationResponse(BaseModel):
     citations: List[int]
 
 class SelfCitationResponse(BaseModel):
-    self_citations: List[str]
+    self_citations: List[int]
 
 class MultiAgentEcosystem:
     """
@@ -126,6 +127,7 @@ class MultiAgentEcosystem:
                 agent_dict['funding_success_history'] = agent.funding_success_history
                 agent_dict['conflict_of_interest'] = list(agent.conflict_of_interest)
                 agent_dict['generate_research_proposal'] = agent.generate_research_proposal
+                agent_dict['exploration_strategy'] = agent.exploration_strategy
 
             elif isinstance(agent, IndustryResearcher):
                 agent_dict['company_name'] = agent.company_name
@@ -134,6 +136,7 @@ class MultiAgentEcosystem:
                 agent_dict['budget'] = agent.budget
                 agent_dict['conflict_of_interest'] = list(agent.conflict_of_interest)
                 agent_dict['funding_success_history'] = agent.funding_success_history
+                agent_dict['exploration_strategy'] = agent.exploration_strategy
 
             elif isinstance(agent, FundingAgency):
                 agent_dict['agency_name'] = agent.id
@@ -221,7 +224,8 @@ class MultiAgentEcosystem:
                     funding_level=agent_data['resources'],
                     expertise=expertise,
                     llm=llm,
-                    generate_research_proposal=agent_data.get('generate_research_proposal', True)
+                    generate_research_proposal=agent_data.get('generate_research_proposal', True),
+                    exploration_strategy=agent_data.get('exploration_strategy', 'balanced')
                 )
                 agent.reputation = agent_data['reputation']
                 agent.memory_bank = agent_data.get('memory_bank', [])
@@ -249,7 +253,8 @@ class MultiAgentEcosystem:
                     funding_level=agent_data['resources'],
                     expertise=expertise,
                     llm=llm,
-                    funding_mode=agent_data.get('funding_mode', 'performance')
+                    funding_mode=agent_data.get('funding_mode', 'performance'),
+                    exploration_strategy=agent_data.get('exploration_strategy', 'balanced')
                 )
                 agent.reputation = agent_data['reputation']
                 agent.memory_bank = agent_data.get('memory_bank', [])
@@ -444,12 +449,12 @@ Your Expertise: {', '.join(expertise)}
 
 ## Paper
 
-Title: {paper.get('title', 'Unknown')}
+Title: {paper['title']}
 
 Abstract:
-{paper.get('abstract', '')}
+{paper['abstract']}
 
-Paper Topics: {', '.join(paper.get('topics', []))}
+Paper Topics: {', '.join(paper['topics'])}
 
 {memory_context}
 
@@ -827,6 +832,7 @@ The following papers were accepted in previous years and can be cited in your wo
 ID: {i + 1}
 arXiv ID: {paper.metadata['id']}
 Title: {paper.metadata['title']}
+Topics: {', '.join(paper.metadata['topics'])}
 Abstract: {paper.page_content}
 
 """
@@ -888,7 +894,7 @@ If you choose not to submit (only due to funding issues), explain using factors 
         }
         return prompt, response_format
 
-    def get_potential_cited_papers_prompt(self, paper: Dict, direction: ResearchDirection, candidate_papers: List[Dict], max_papers: int = 10) -> Tuple[str, Dict]:
+    def get_citation_prompt(self, paper: Dict, direction: ResearchDirection, candidate_papers: List[Dict], max_papers: int = 10) -> Tuple[str, Dict]:
         """
         Get potential cited papers prompt for this agent
         """
@@ -911,7 +917,7 @@ Topics: {', '.join(paper['topics'])}
 
 """
         for i, cited_paper in enumerate(candidate_papers[:max_papers]):
-            prompt += f"""Paper {i + 1}
+            prompt += f"""Paper {i}
 - arXiv ID: {cited_paper['id']}
 - Title: {cited_paper['title']}
 - Abstract: {cited_paper['abstract'][:300]}...
@@ -920,13 +926,10 @@ Topics: {', '.join(paper['topics'])}
 
         prompt += f"""
 ## Sample Response
-Respond in JSON format with the numeric ids (integers) of the candidate papers you want to cite:
+Respond in JSON format with the numeric ids (integers) of the candidate papers you want to cite. An example response is as follows (DO NOT directly copy the exact response):
 ```json
 {{
-    "citations": [
-        9,
-        13
-    ]
+    "citations": [9, 13] <- must be a list of integers between 0 and {len(candidate_papers[:max_papers]) - 1}
 }}
 ```
 """
@@ -969,35 +972,45 @@ Detailed Focus: {direction['detailed_focus']}
 Keywords: {', '.join(direction['direction'].keywords)}
 
 ## Your Previous Accepted Papers
-
 """
-        for i, own_paper in enumerate(own_papers):
+
+
+        paper_idx = 0
+        
+        accepted_papers = [p for p in own_papers if p.status == 'accept']
+        rejected_papers = [p for p in own_papers if p.status == 'reject']
+        assert len(accepted_papers) + len(rejected_papers) == len(own_papers)
+        
+        for i, own_paper in enumerate(accepted_papers):
             latest_score = own_paper.review_history[-1]['score'] if own_paper.review_history else 0.0
-            prompt += f"""### Paper {i + 1}
-arXiv ID: {own_paper.id}
+            prompt += f"""### Paper {paper_idx}
 Title: {own_paper.title}
 Abstract: {own_paper.abstract[:300]}...
 Year: {own_paper.year}
-"""
 
-        prompt += """
-## Sample Response
-If you want to cite any of your own previous work, respond with the following JSON format:
+"""
+            paper_idx += 1
+            
+        prompt += "## Your Previous Rejected Papers\n"
+        for i, own_paper in enumerate(rejected_papers):
+            prompt += f"""### Paper {paper_idx}
+Title: {own_paper.title}
+Abstract: {own_paper.abstract[:300]}...
+Year: {own_paper.year}
+
+"""
+            paper_idx += 1
+        
+
+        prompt += f"""
+## Response Format
+Respond in JSON format with the numeric ids (integers) of the candidate papers you want to cite. An example response is as follows (DO NOT directly copy the exact response):
 ```json
-{
-    "self_citations": [ <- arXiv IDs of your own papers you want to cite. Return empty list if none are relevant
-        "https://arxiv.org/abs/2407.00005v1",
-        "https://arxiv.org/abs/2407.00006v1"
-    ]
-}
+{{
+    "citations": [2, 1] <- must be a list of integers between 0 and {len(own_papers) - 1}
+}}
 ```
-If you do not want to cite any of your own previous work, respond with an empty list:
-```json
-{
-    "self_citations": []
-}
 """
-
         response_format = {
             'type': 'json_schema',
             'json_object': {

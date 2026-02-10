@@ -100,8 +100,9 @@ class Simulation:
         self.verbose = kwargs.get('verbose', False)
         self.citation_tracker = CitationTracker()
         self.agent_tracker = AgentTracker()
-        self.funding_tracker = FundingTracker()
-        self.funding_tracker.funding_allocation_mode = kwargs.get('funding_allocation_mode', 'consumption_based')
+        
+        assert kwargs.get('funding_allocation_mode') in ['fixed', 'consumption_based'], f"Invalid funding allocation mode: {kwargs.get('funding_allocation_mode', 'consumption_based')}"
+        self.funding_tracker = FundingTracker(funding_allocation_mode=kwargs.get('funding_allocation_mode'))
         self.industry_funding_mode = kwargs.get('industry_funding_mode', 'performance')
         self.always_rerun = kwargs.get('always_rerun', False)
         self.use_langchain = kwargs.get('use_langchain', False)
@@ -110,7 +111,7 @@ class Simulation:
         self.funding_allocation_mode = kwargs.get('funding_allocation_mode', 'consumption_based')
         self.experiment_name = kwargs.get('experiment_name', 'default')
         
-        assert self.experiment_name in ['default', 'exploration_vs_exploitation'], f"Invalid experiment name: {self.experiment_name}"
+        assert self.experiment_name.startswith('default') or self.experiment_name in ['exploration_vs_exploitation'], f"Invalid experiment name: {self.experiment_name}"
 
         # Store args for backward compatibility with existing code
         if args is None:
@@ -142,19 +143,15 @@ class Simulation:
 
         self.wandb_logger = WandbLogger(SIMULATION_CONFIG, self.args)
 
-        # NEW: Initialize exploration experiment trackers (opt-in via flag)
-        if self.experiment_name == 'exploration_vs_exploitation':
-            logger.info("Initializing Exploration vs Exploitation experiment...")
-            # Will be lazily imported to avoid dependencies when experiment is disabled
-            self.embedding_tracker = None  # Will initialize after first use
-            self.cd_calculator = None
-            self.exploration_metrics = None
-            self.keyword_extractor = None
-        else:
-            self.embedding_tracker = None
-            self.cd_calculator = None
-            self.exploration_metrics = None
-            self.keyword_extractor = None
+        # Exploration experiment trackers (lazily initialized)
+        self.embedding_tracker = None
+        self.cd_calculator = None
+        self.exploration_metrics = None
+        self.keyword_extractor = None
+
+    @property
+    def is_exploration_experiment(self) -> bool:
+        return self.experiment_name == 'exploration_vs_exploitation'
 
     def initialize_agents(self):
         """Initialize the agent population
@@ -209,7 +206,7 @@ class Simulation:
                 funding_level = 160 if university in rich_universities else 80
 
                 # Assign exploration strategy if experiment is enabled
-                if self.experiment_name == 'exploration_vs_exploitation':
+                if self.is_exploration_experiment:
                     # 50% explorer, 50% exploiter
                     exploration_strategy = "explorer" if counter % 2 == 0 else "exploiter"
                 else:
@@ -343,7 +340,7 @@ class Simulation:
 
     def _initialize_experiment_trackers(self):
         """Lazy initialization of exploration experiment trackers"""
-        if self.experiment_name != 'exploration_vs_exploitation':
+        if not self.is_exploration_experiment:
             return
 
         if self.embedding_tracker is None:
@@ -387,7 +384,7 @@ class Simulation:
             author_id: Author ID
             year: Current year
         """
-        if self.experiment_name != 'exploration_vs_exploitation':
+        if not self.is_exploration_experiment:
             return
 
         # Lazy initialize trackers on first use
@@ -420,32 +417,21 @@ class Simulation:
         Args:
             year: Current year number
         """
-        if self.experiment_name != 'exploration_vs_exploitation':
+        if not self.is_exploration_experiment:
             return
 
         self._initialize_experiment_trackers()
 
         exp_config = SIMULATION_CONFIG['exploration_experiment']
 
-        # Compute topic distances for papers submitted this year
-        paper_ids_this_year = [p.id for p in self.paper_tracker.papers_by_id.values()
-                              if p.year == year]
+        # Compute topic distances for papers submitted this year (batch)
+        papers_this_year = [(p.id, p.author_id) for p in self.paper_tracker.papers_by_id.values()
+                            if p.year == year]
+        paper_ids_this_year = [pid for pid, _ in papers_this_year]
 
-        for paper_id in paper_ids_this_year:
-            paper = self.paper_tracker.papers_by_id[paper_id]
-            author_id = paper.author_id
-
-            # Calculate distance to author's previous work
-            distance = self.embedding_tracker.compute_distance_to_previous(
-                paper_id=paper_id,
-                author_id=author_id
-            )
-
-            self.exploration_metrics.record_topic_distance(
-                author_id=author_id,
-                year=year,
-                distance=distance
-            )
+        distances = self.embedding_tracker.compute_distances_batch(papers_this_year)
+        for paper_id, author_id in papers_this_year:
+            self.exploration_metrics.record_topic_distance(author_id, year, distances[paper_id])
 
         # Compute CD index for papers with sufficient citations
         min_citations = exp_config['min_citations_for_cd']
@@ -464,8 +450,9 @@ class Simulation:
 
         # Aggregate metrics by strategy
         for strategy in exp_config['strategies']:
-            agents = [a for a in self.ecosystem.get_agents_by_type('university')
-                     if hasattr(a, 'exploration_strategy') and a.exploration_strategy == strategy]
+            agents = [a for a in self.ecosystem.agent_population.values()
+                     if isinstance(a, UniversityResearcher)
+                     and hasattr(a, 'exploration_strategy') and a.exploration_strategy == strategy]
 
             if agents:
                 distances = []
@@ -817,9 +804,9 @@ class Simulation:
 
         if supports_batching:
             intention_results = self.llm.generate_batch(
-                intention_prompts, max_tokens=512,
+                intention_prompts, max_tokens=SIMULATION_CONFIG['llm']['max_tokens'],
                 response_format=intention_response_format,
-                desc=f"{len(intention_prompts)} round intentions"
+                desc=f"Generating {len(intention_prompts)} intentions"
             )
             for agent, (result_json, _) in zip(active_authors, intention_results):
                 intention = self._parse_intention(result_json, directions[agent.id])
@@ -830,7 +817,7 @@ class Simulation:
                 intention = self._parse_intention(result_json, directions[agent.id])
                 round_intentions[agent.id] = intention
 
-        logger.info(f"Generated {len(round_intentions)} round intentions")
+        logger.info(f"Generated {len(round_intentions)} intentions")
         year_results['round_intentions'] = round_intentions
 
         # ---- Build RAG queries from intentions + keywords ----
@@ -909,7 +896,7 @@ class Simulation:
                 if not batch_prompts:
                     break
 
-                batch_results = self.llm.generate_batch(batch_prompts, temperature=0.7, response_format=paper_submission_response_format, desc=f"{len(batch_prompts)} paper submissions (attempt {attempt+1}/{MAX_SUBMISSION_RETRIES})")
+                batch_results = self.llm.generate_batch(batch_prompts, max_tokens=SIMULATION_CONFIG['llm']['max_tokens'], temperature=0.7, response_format=paper_submission_response_format, desc=f"{len(batch_prompts)} paper submissions (attempt {attempt+1}/{MAX_SUBMISSION_RETRIES})")
 
                 agents_needing_fallback = []
 
@@ -978,7 +965,8 @@ class Simulation:
                         'author_type': agent.get_type(),
                         'title': paper_doc.metadata['title'],
                         'abstract': paper_doc.page_content,
-                        'topics': paper_doc.metadata.get('categories', '').split(),
+                        'tags': paper_doc.metadata['tags'],
+                        'topics': paper_doc.metadata['topics'],
                         'conference': submission_metadata['conference'],
                         'type': 'submission',
                         'year': year,
@@ -1054,7 +1042,8 @@ class Simulation:
                         'author_type': agent.get_type(),
                         'title': paper_doc.metadata['title'],
                         'abstract': paper_doc.page_content,
-                        'topics': paper_doc.metadata.get('categories', '').split(),
+                        'tags': paper_doc.metadata['tags'],
+                        'topics': paper_doc.metadata['topics'],
                         'conference': conference,
                         'type': 'submission',
                         'year': year,
@@ -1152,7 +1141,8 @@ class Simulation:
                         'author_type': agent.get_type(),
                         'title': paper_doc.metadata['title'],
                         'abstract': paper_doc.page_content,
-                        'topics': paper_doc.metadata.get('categories', '').split(),
+                        'tags': paper_doc.metadata['tags'],
+                        'topics': paper_doc.metadata['topics'],
                         'conference': submission_metadata['conference'],
                         'type': 'submission',
                         'year': year,  # Current year for submission
@@ -1219,7 +1209,7 @@ class Simulation:
                     assert set([cp['id'] for cp in candidate_papers]) <= accepted_papers_arxiv_ids, \
                         f"Submitted paper {submitted_paper['id']} is trying to cite non-accepted papers"
 
-                    prompt, response_format = agent.get_potential_cited_papers_prompt(
+                    prompt, response_format = agent.get_citation_prompt(
                         paper=submitted_paper, direction=directions[agent.id],
                         candidate_papers=candidate_papers, max_papers=30
                     )
@@ -1227,7 +1217,6 @@ class Simulation:
                     batch_metadata.append({
                         'paper_idx': i, 'paper': submitted_paper, 'agent': agent,
                         'candidate_papers': candidate_papers,
-                        'candidate_paper_ids': set(cp['id'] for cp in candidate_papers),
                     })
                     if citation_response_format is None:
                         citation_response_format = response_format
@@ -1253,12 +1242,13 @@ class Simulation:
                             continue
 
                         citations = result['citations']
-                        if not set(citations) <= meta['candidate_paper_ids']:
+                        num_candidates = len(meta['candidate_papers'])
+                        if not all(isinstance(c, int) and 0 <= c < num_candidates for c in citations):
                             logger.warning(f"Invalid citations for paper {meta['paper']['id']}, retrying")
                             items_needing_retry.append(meta)
                             continue
 
-                        regular_citations[idx] = citations
+                        regular_citations[idx] = [meta['candidate_papers'][c]['id'] for c in citations]
 
                     if not items_needing_retry:
                         break
@@ -1267,7 +1257,7 @@ class Simulation:
                     batch_prompts = []
                     batch_metadata = []
                     for meta in items_needing_retry:
-                        prompt, _ = meta['agent'].get_potential_cited_papers_prompt(
+                        prompt, _ = meta['agent'].get_citation_prompt(
                             paper=meta['paper'], direction=directions[meta['agent'].id],
                             candidate_papers=meta['candidate_papers'], max_papers=30
                         )
@@ -1296,7 +1286,7 @@ class Simulation:
                             {'id': paper.metadata['id'], 'title': paper.metadata['title'], 'abstract': paper.page_content}
                             for paper in candidate_papers]
 
-                        prompt, response_format = agent.get_potential_cited_papers_prompt(
+                        prompt, response_format = agent.get_citation_prompt(
                             paper=submitted_paper, direction=directions[agent.id],
                             candidate_papers=candidate_papers, max_papers=30
                         )
@@ -1304,7 +1294,6 @@ class Simulation:
                         batch_metadata.append({
                             'paper_idx': i, 'paper': submitted_paper, 'agent': agent,
                             'candidate_papers': candidate_papers,
-                            'candidate_paper_ids': set(cp['id'] for cp in candidate_papers),
                         })
                         if citation_response_format is None:
                             citation_response_format = response_format
@@ -1328,12 +1317,13 @@ class Simulation:
                             continue
 
                         citations = result['citations']
-                        if not set(citations) <= meta['candidate_paper_ids']:
-                            logger.warning(f"Invalid extended citations for paper {meta['paper']['id']}, retrying")
+                        num_candidates = len(meta['candidate_papers'])
+                        if not all(isinstance(c, int) and 0 <= c < num_candidates for c in citations):
+                            logger.warning(f"Invalid citations for paper {meta['paper']['id']}, retrying")
                             items_needing_retry.append(meta)
                             continue
 
-                        extended_citations[idx] = citations
+                        extended_citations[idx] = [meta['candidate_papers'][c]['id'] for c in citations]
 
                     if not items_needing_retry:
                         break
@@ -1341,7 +1331,7 @@ class Simulation:
                     batch_prompts = []
                     batch_metadata = []
                     for meta in items_needing_retry:
-                        prompt, _ = meta['agent'].get_potential_cited_papers_prompt(
+                        prompt, _ = meta['agent'].get_citation_prompt(
                             paper=meta['paper'], direction=directions[meta['agent'].id],
                             candidate_papers=meta['candidate_papers'], max_papers=30
                         )
@@ -1358,7 +1348,7 @@ class Simulation:
                     submitted_paper = submissions_list[i]
                     agent = self.ecosystem.get_agent_by_id(submitted_paper['author_id'])
                     own_papers = self.paper_tracker.get_papers_by_author(agent.id)
-                    own_papers = [p for p in own_papers if p.project_end_year < year]
+                    own_papers = [p for p in own_papers if p.project_end_year < year and p.status != 'pending']
                     if not own_papers:
                         continue
 
@@ -1392,7 +1382,13 @@ class Simulation:
                             items_needing_retry.append(meta)
                             continue
 
-                        self_citations_dict[idx] = result['self_citations']
+                        self_cites = result['self_citations']
+                        num_own = len(meta['own_papers'])
+                        if not all(isinstance(c, int) and 0 <= c < num_own for c in self_cites):
+                            items_needing_retry.append(meta)
+                            continue
+
+                        self_citations_dict[idx] = [meta['own_papers'][c].id for c in self_cites]
 
                     if not items_needing_retry:
                         break
@@ -1435,7 +1431,7 @@ class Simulation:
                     assert set([candidate_paper['id'] for candidate_paper in
                                 candidate_papers]) <= accepted_papers_arxiv_ids, f"Submitted paper {submitted_paper['id']} is trying to cite non-accepted papers"
 
-                    prompt, response_format = agent.get_potential_cited_papers_prompt(
+                    prompt, response_format = agent.get_citation_prompt(
                         paper=submitted_paper,
                         direction=directions[agent.id],
                         candidate_papers=candidate_papers,
@@ -1451,8 +1447,9 @@ class Simulation:
                             assert llm_response.get('citations') is not None
                             citations_of_paper = llm_response.get('citations')
 
-                            assert set(citations_of_paper) <= set(
-                                [candidate_paper['id'] for candidate_paper in candidate_papers])
+                            num_candidates = len(candidate_papers)
+                            assert all(isinstance(c, int) and 0 <= c < num_candidates for c in citations_of_paper)
+                            citations_of_paper = [candidate_papers[c]['id'] for c in citations_of_paper]
 
                             break
 
@@ -1475,7 +1472,7 @@ class Simulation:
                             {'id': paper.metadata['id'], 'title': paper.metadata['title'], 'abstract': paper.page_content}
                             for paper in candidate_papers]
 
-                        prompt, response_format = agent.get_potential_cited_papers_prompt(
+                        prompt, response_format = agent.get_citation_prompt(
                             paper=submitted_paper,
                             direction=directions[agent.id],
                             candidate_papers=candidate_papers,
@@ -1490,8 +1487,9 @@ class Simulation:
                                 llm_response, message_history = self.llm.generate(prompt=prompt, response_format=response_format)
                                 assert llm_response.get('citations') is not None
                                 citations_of_paper = llm_response.get('citations')
-                                assert set(citations_of_paper) <= set(
-                                    [candidate_paper['id'] for candidate_paper in candidate_papers])
+                                num_candidates = len(candidate_papers)
+                                assert all(isinstance(c, int) and 0 <= c < num_candidates for c in citations_of_paper)
+                                citations_of_paper = [candidate_papers[c]['id'] for c in citations_of_paper]
                                 break
 
                             except Exception as e:
@@ -1520,6 +1518,8 @@ class Simulation:
                                     llm_response, _ = self.llm.generate(prompt=self_citation_prompt, response_format=self_citation_response_format)
                                     assert llm_response.get('self_citations') is not None
                                     self_citations = llm_response.get('self_citations')
+                                    assert all(isinstance(c, int) and 0 <= c < len(own_papers) for c in self_citations)
+                                    self_citations = [own_papers[c].id for c in self_citations]
                                     # Combine regular citations with self-citations
                                     citations_of_paper = list(set(citations_of_paper + self_citations))
                                     break
@@ -1786,6 +1786,49 @@ class Simulation:
 
         logger.info(f"  Accepted: {total_accepted}, Rejected: {total_rejected}")
 
+    def _validate_single_funding_proposal(self, proposal, metadata):
+        """Validate a single-program funding proposal from batch generation.
+
+        Returns:
+            (is_valid, cleaned_proposal_or_None, reason)
+        """
+        if proposal is None:
+            return False, None, "proposal is None"
+        if not isinstance(proposal, dict):
+            return False, None, f"proposal is not a dict (got {type(proposal).__name__})"
+
+        all_papers = metadata['all_papers']  # ordered list of {'id': ..., 'status': ...}
+        num_papers = len(all_papers)
+
+        # Check required fields
+        if 'submit' not in proposal:
+            return False, None, "missing 'submit' field"
+        if 'research_proposal' not in proposal:
+            return False, None, "missing 'research_proposal' field"
+        if 'relevant_projects' not in proposal:
+            return False, None, "missing 'relevant_projects' field"
+        if not isinstance(proposal.get('relevant_projects'), list):
+            return False, None, "relevant_projects is not a list"
+
+        # Validate integer indices and convert to {arxiv_id, status} dicts
+        if proposal.get('submit', True):
+            indices = proposal.get('relevant_projects', [])
+            valid_papers = []
+            invalid_count = 0
+            for idx in indices:
+                if isinstance(idx, int) and 0 <= idx < num_papers:
+                    p = all_papers[idx]
+                    valid_papers.append({"arxiv_id": p['id'], "status": p['status']})
+                else:
+                    invalid_count += 1
+            if indices and invalid_count > len(indices) * 0.5:
+                return False, None, f">50% invalid paper indices ({invalid_count}/{len(indices)})"
+            if invalid_count > 0:
+                logger.warning(f"Agent {metadata['agent'].id} program {metadata['program_id']}: filtered {invalid_count} invalid paper indices")
+            proposal['relevant_projects'] = valid_papers
+
+        return True, proposal, "ok"
+
     def _run_phase_5_update_funding(self, year: int, submissions_list: List[Dict], year_results: Dict):
         """Phase 5: Update funding for all agents
 
@@ -1866,7 +1909,7 @@ class Simulation:
             if isinstance(agent, UniversityResearcher)
         ]
 
-        # Collect prompts and metadata for batch processing
+        # Collect prompts and metadata for batch processing — one prompt per (agent, program)
         batch_prompts = []
         batch_metadata = []
         funding_response_format = None
@@ -1878,13 +1921,13 @@ class Simulation:
                 success_history,
                 num_submitted_proposals=3
             )
-            if selected_program_ids:
-                prompt, response_format, metadata = agent.get_funding_application_prompt(
-                    past_accepted_papers=self.conference_system.authors_to_accepted_papers.get(agent.id, []),
-                    past_rejected_papers=self.conference_system.authors_to_rejected_papers.get(agent.id, []),
-                    programs=all_programs,
-                    selected_program_ids=selected_program_ids,
-                    success_history=success_history
+            past_accepted = self.conference_system.authors_to_accepted_papers.get(agent.id, [])
+            past_rejected = self.conference_system.authors_to_rejected_papers.get(agent.id, [])
+            for program_id in selected_program_ids:
+                prompt, response_format, metadata = agent.funding_application_prompt(
+                    program=all_programs[program_id],
+                    past_accepted_papers=past_accepted,
+                    past_rejected_papers=past_rejected,
                 )
                 if prompt:
                     batch_prompts.append(prompt)
@@ -1895,54 +1938,87 @@ class Simulation:
         # Generate all funding applications in one batch call (if vLLM) or sequentially
         if batch_prompts:
             if hasattr(self.llm, 'generate_batch'):
-                batch_results = self.llm.generate_batch(batch_prompts, temperature=0.7, response_format=funding_response_format, desc=f"{len(batch_prompts)} funding applications")
+                MAX_FUNDING_RETRIES = 5
+                # Collect successful (agent_id, program_id, app_data) tuples
+                successful_items = []
 
-                # Process results with validation
-                for i, (proposal, batch_message_history) in enumerate(batch_results):
-                    if proposal is None:
-                        logger.warning(f"Failed to parse funding application for agent {batch_metadata[i]['agent'].id}")
+                for attempt in range(MAX_FUNDING_RETRIES):
+                    if not batch_prompts:
+                        break
+
+                    try:
+                        batch_results = self.llm.generate_batch(
+                            batch_prompts, temperature=0.7,
+                            response_format=funding_response_format,
+                            desc=f"{len(batch_prompts)} funding applications (attempt {attempt+1}/{MAX_FUNDING_RETRIES})"
+                        )
+                    except Exception as e:
+                        logger.warning(f"Batch funding generation failed on attempt {attempt+1}: {e}")
+                        if attempt < MAX_FUNDING_RETRIES - 1:
+                            time.sleep(1)
                         continue
 
-                    metadata = batch_metadata[i]
-                    agent = metadata['agent']
-                    all_paper_ids = metadata['all_paper_ids']
+                    items_needing_retry = []
+                    for j, (proposal, _) in enumerate(batch_results):
+                        meta = batch_metadata[j]
+                        agent = meta['agent']
+                        program_id = meta['program_id']
 
-                    # Filter out invalid referred papers (instead of discarding entire proposal)
-                    for program_id, program_data in proposal.items():
-                        if program_data.get('submit', True):
-                            referred_papers = program_data.get('relevant_projects', [])
-                            valid_papers = [p for p in referred_papers if p.get('arxiv_id') in all_paper_ids]
-                            if len(valid_papers) < len(referred_papers):
-                                logger.warning(f"Agent {agent.id} program {program_id}: filtered {len(referred_papers) - len(valid_papers)} invalid paper references")
-                            program_data['relevant_projects'] = valid_papers
+                        is_valid, cleaned, reason = self._validate_single_funding_proposal(proposal, meta)
+                        if not is_valid:
+                            logger.warning(f"Funding proposal invalid for agent {agent.id} program {program_id} (attempt {attempt+1}): {reason}")
+                            items_needing_retry.append(meta)
+                            continue
 
-                    # Add author to application
-                    for k in proposal:
-                        proposal[k]['author'] = agent
-                    university_applications.append(proposal)
+                        successful_items.append((agent.id, program_id, cleaned, agent))
+
+                    if not items_needing_retry:
+                        batch_prompts = []
+                        batch_metadata = []
+                        break
+
+                    # Rebuild batch with only failed items
+                    batch_prompts = []
+                    batch_metadata = []
+                    for meta in items_needing_retry:
+                        agent = meta['agent']
+                        prompt, _, new_meta = agent.funding_application_prompt(
+                            program=all_programs[meta['program_id']],
+                            past_accepted_papers=self.conference_system.authors_to_accepted_papers.get(agent.id, []),
+                            past_rejected_papers=self.conference_system.authors_to_rejected_papers.get(agent.id, []),
+                        )
+                        assert prompt
+                        batch_prompts.append(prompt)
+                        batch_metadata.append(new_meta)
+
+                # Log items that failed all retries
+                if batch_prompts:
+                    for meta in batch_metadata:
+                        logger.warning(f"Agent {meta['agent'].id} program {meta['program_id']} funding application failed all {MAX_FUNDING_RETRIES} retries, skipping")
+
+                # Reassemble into per-agent dicts: {program_id: app_data}
+                agent_applications = {}
+                for agent_id, program_id, app_data, agent in successful_items:
+                    app_data['author'] = agent
+                    agent_applications.setdefault(agent_id, {})[program_id] = app_data
+                university_applications.extend(agent_applications.values())
             else:
                 # Sequential fallback for non-vLLM models
+                sequential_items = []
                 for i, prompt in enumerate(tqdm(batch_prompts, desc="Generating funding applications")):
                     metadata = batch_metadata[i]
                     agent = metadata['agent']
+                    program_id = metadata['program_id']
                     num_retries = 0
                     while True:
                         try:
                             proposal, _ = self.llm.generate(prompt=prompt)
 
-                            # Filter out invalid referred papers
-                            all_paper_ids = metadata['all_paper_ids']
-                            for program_id, program_data in proposal.items():
-                                if program_data.get('submit', True):
-                                    referred_papers = program_data.get('relevant_projects', [])
-                                    valid_papers = [p for p in referred_papers if p.get('arxiv_id') in all_paper_ids]
-                                    if len(valid_papers) < len(referred_papers):
-                                        logger.warning(f"Agent {agent.id} program {program_id}: filtered {len(referred_papers) - len(valid_papers)} invalid paper references")
-                                    program_data['relevant_projects'] = valid_papers
+                            is_valid, cleaned, reason = self._validate_single_funding_proposal(proposal, metadata)
+                            if not is_valid:
+                                raise ValueError(f"Invalid proposal: {reason}")
 
-                            for k in proposal:
-                                proposal[k]['author'] = agent
-                            university_applications.append(proposal)
+                            sequential_items.append((agent.id, program_id, cleaned, agent))
                             break
 
                         except Exception as e:
@@ -1953,6 +2029,13 @@ class Simulation:
                                 raise Exception("Failed to prepare funding application after retries")
                             time.sleep(1)
 
+                # Reassemble into per-agent dicts
+                agent_applications = {}
+                for agent_id, program_id, app_data, agent in sequential_items:
+                    app_data['author'] = agent
+                    agent_applications.setdefault(agent_id, {})[program_id] = app_data
+                university_applications.extend(agent_applications.values())
+
         # Evaluate applications across all funding agencies
         all_funding_winners_dict, all_funding_programs_dict = {}, {}
 
@@ -1962,15 +2045,40 @@ class Simulation:
 
         winners_list = []
         submitted_papers_dict = {pid: paper.to_dict() for pid, paper in self.paper_tracker.papers_by_id.items()}
-        for funding_agent in funding_agencies:
-            winners_for_program = funding_agent.evaluate_funding_applications(
-                university_applications,
-                submitted_papers_dict=submitted_papers_dict
-            )
-            all_funding_winners_dict.update(winners_for_program)
-            all_funding_programs_dict.update(funding_agent.funding_programs)
 
-            for program_id, winners in winners_for_program.items():
+        # Step 1: Collect prompts from ALL funding agencies into one batch
+        all_eval_prompts = []
+        all_eval_metadata = []
+        eval_response_format = None
+
+        for funding_agent in funding_agencies:
+            all_funding_programs_dict.update(funding_agent.funding_programs)
+            eval_prompts, resp_fmt, eval_metadata = funding_agent.get_funding_evaluation_prompts(
+                university_applications, submitted_papers_dict=submitted_papers_dict
+            )
+            all_eval_prompts.extend(eval_prompts)
+            all_eval_metadata.extend(eval_metadata)
+            if eval_response_format is None:
+                eval_response_format = resp_fmt
+
+        # Step 2: Single LLM call for all programs across all agencies
+        if all_eval_prompts:
+            if hasattr(self.llm, 'generate_batch'):
+                eval_results = self.llm.generate_batch(
+                    all_eval_prompts, response_format=eval_response_format,
+                    desc=f"{len(all_eval_prompts)} funding evaluations"
+                )
+            else:
+                eval_results = []
+                for prompt in all_eval_prompts:
+                    result, msg_hist = self.llm.generate(prompt=prompt, response_format=eval_response_format)
+                    eval_results.append((result, msg_hist))
+
+            # Step 3: Process all results at once (static method handles routing via metadata)
+            all_funding_winners_dict = FundingAgency.process_funding_evaluation_results(
+                eval_results, all_eval_metadata, all_funding_programs_dict
+            )
+            for program_id, winners in all_funding_winners_dict.items():
                 winners_list.extend([agent['id'] for agent in winners])
 
         active_papers_dataframe = active_papers_dataframe.set_index('author_id')
@@ -2203,7 +2311,7 @@ class Simulation:
         }
 
         # Save exploration experiment trackers if enabled
-        if self.experiment_name == 'exploration_vs_exploitation':
+        if self.is_exploration_experiment:
             checkpoint_data['exploration_experiment'] = {
                 'enabled': True,
                 'embedding_tracker': self.embedding_tracker.to_dict() if self.embedding_tracker else None,
@@ -2349,11 +2457,11 @@ def main():
         output_dir=args.output_dir,
         debug=args.debug,
         industry_funding_mode=args.industry_funding_mode,
+        funding_allocation_mode=args.funding_allocation_mode,
         always_rerun=args.always_rerun,
         use_langchain=args.use_langchain,
         max_retries=args.max_retries,
         weighted_funding_assignment=args.weighted_funding_assignment,
-        funding_allocation_mode=args.funding_allocation_mode,
         experiment_name=args.experiment_name,
         start_year=args.start_year,
         args=args

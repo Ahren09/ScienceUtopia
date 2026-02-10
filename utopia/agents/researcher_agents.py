@@ -6,7 +6,7 @@ EXTENDS base agent classes WITHOUT modifying existing AI-Scientist code
 
 from typing import List, Dict, Optional, Set, Tuple
 
-from pydantic import BaseModel, RootModel
+from pydantic import BaseModel
 
 from utopia.config import SIMULATION_CONFIG
 from utopia.models.models import BaseLLM
@@ -15,19 +15,11 @@ from .funding_agents import FundingProgram
 from .research_direction import ResearchDirection
 
 
-class RelevantProject(BaseModel):
-    arxiv_id: str
-    status: str
-
-
 class ProgramApplication(BaseModel):
-    research_proposal: Optional[str] = None
+    research_proposal: str
     submit: bool
-    relevant_projects: List[RelevantProject]
+    relevant_projects: List[int]
 
-
-class FundingApplicationResponse(RootModel[Dict[str, ProgramApplication]]):
-    pass
 
 
 class UniversityResearcher(SimulationAgent):
@@ -86,22 +78,22 @@ class UniversityResearcher(SimulationAgent):
         return "university"
 
     def _get_personality_prompt(self, include_exploration_strategy: bool = False, include_funding_situation: bool = False) -> str:
-        prompt = f"""You are a university researcher at {self.university_name}. 
-You author papers and review them for conferences. 
-Compared with industry researchers, you focus more on theoretical contributions, novel methodologies, and advancing fundamental knowledge. 
+        prompt = f"""You are a university researcher at {self.university_name}.
+You author papers and review them for conferences.
+Compared with industry researchers, you focus more on theoretical contributions, novel methodologies, and advancing fundamental knowledge.
 """
         if include_exploration_strategy:
             prompt += self._get_exploration_strategy_prompt()
-                        
+
         if include_funding_situation:
             prompt += f"""
 Your current funding level is {self.resources}.
 """
 
         return prompt
-    
-               
-    
+
+
+
 
     def _apply_agent_review_biases(self, review: Dict) -> Dict:
         """Apply university-specific biases to reviews"""
@@ -148,159 +140,22 @@ Your current funding level is {self.resources}.
         scores.sort(key=lambda x: x[1], reverse=True)
         return [pid for pid, score in scores[:num_submitted_proposals] if score >= 1]
 
-    def prepare_funding_application(
+    def funding_application_prompt(
             self,
+            program: 'FundingProgram',
             past_accepted_papers: List[Dict],
             past_rejected_papers: List[Dict],
-            programs: List['FundingProgram'],
-            selected_program_ids: List[str],
-            success_history: Optional[Dict[str, float]] = None
-    ) -> Dict:
-        """Prepare a funding application for submission to funding agencies
-
-        Args:
-            past_accepted_papers: accepted papers in previous years
-            past_rejected_papers: rejected papers in previous years
-            funding_programs: List of all available FundingProgram objects
-            selected_program_ids: List of program IDs to apply to
-            success_history: Historical success rates per program
-
-        Returns:
-            Dictionary with application details
-        """
-        if not selected_program_ids:
-            return None
-
-        # Get selected programs info
-        selected_programs = [programs[program_id] for program_id in selected_program_ids]
-        # for program_id, program in programs.items():
-        #     if program_id in selected_program_ids:
-        #         selected_programs.append(program)
-
-        # Generate targeted proposal using LLM
-        if self.generate_research_proposal:
-            expertise_topics = [rd.topic if isinstance(rd, ResearchDirection) else str(rd)
-                                for rd in self.expertise]
-
-            program_details = ""
-
-            for program in selected_programs:
-                program_details += f"""### Program ID: \"{program.program_id}\"
-Name: \"{program.name}\"
-Focus Areas: {', '.join([rd.topic for rd in program.research_directions])}
-
-"""
-
-            prompt = f"""You are a university researcher from {self.university_name} applying for research funding based on your expertise and past papers.
-
-## Your Profile
-- Expertise: {', '.join(expertise_topics)}
-- Recent performance: {len(past_accepted_papers)} accepted papers, {len(past_rejected_papers)} rejected papers
-- Current funding: {self.resources}
-
-## Candidate Programs
-{program_details}
-
-For each program, if you think the program is a good fit for your expertise, generate a compelling 100-word proposal and mention your past works that are relevant to the program. 
-
-The research proposal should be:
-1. Aligns with program focus areas.
-2. Leverages your expertise and past works, either accepted papers or preprints / rejected papers
-3. Emphasizes feasibility and impact.
-
-"""
-
-            if len(past_accepted_papers) > 0:
-                prompt += "\n\n## Past Accepted Paper\n"
-                for paper in past_accepted_papers:
-                    prompt += f"""
-Title: {paper['title']}
-Arxiv ID: {paper['id']}
-Abstract: {paper['abstract']}
-Status: {paper['status']}
-
-"""
-
-            if len(past_rejected_papers) > 0:
-                prompt += "\n\n## Past Rejected Papers\n"
-                for paper in past_rejected_papers:
-                    prompt += f"""Title: {paper['title']}
-Arxiv ID: \"{paper['id']}\"
-Abstract: {paper['abstract']}
-Status: {paper['status']}
-
-"""
-
-            ## Past Accepted Papers
-            prompt += """## Response Format
-Respond in JSON format. Each key is a program_id. Set "submit" to true with a proposal and relevant projects to apply, or false with null proposal and empty list to skip:
-```json
-{
-    "DARPA_AUTONOMOUS": {
-        "research_proposal": "Your 100-word proposal here.",
-        "submit": true,
-        "relevant_projects": [
-            {"arxiv_id": "https://arxiv.org/abs/2406.12708v2", "status": "accept"},
-            {"arxiv_id": "https://arxiv.org/abs/2406.00001v1", "status": "reject"}
-        ]
-    },
-    "DARPA_AI_APPS": {
-        "research_proposal": null,
-        "submit": false,
-        "relevant_projects": []
-    }
-}
-```
-"""
-            proposal, message_history = self.llm.generate(prompt=prompt)
-
-            # Check if the referred papers are from the current author
-            all_paper_ids_of_current_author = set(paper['id'] for paper in past_accepted_papers + past_rejected_papers)
-            all_paper_ids_in_proposals = set()
-            for program_id, program in proposal.items():
-                if program.get('submit', True):
-                    referred_papers = program['relevant_projects']
-                    all_paper_ids_in_proposals.update([paper['arxiv_id'] for paper in referred_papers])
-
-            assert all_paper_ids_in_proposals <= all_paper_ids_of_current_author
-
-        else:
-            raise NotImplementedError("This method is not supported for generate_research_proposal == False")
-
-        return proposal
-
-    def get_funding_application_prompt(
-            self,
-            past_accepted_papers: List[Dict],
-            past_rejected_papers: List[Dict],
-            programs: List['FundingProgram'],
-            selected_program_ids: List[str],
-            success_history: Optional[Dict[str, float]] = None
     ) -> Tuple[Optional[str], Optional[Dict], Optional[Dict]]:
-        """Get the funding application prompt without making an LLM call
+        """Get a funding application prompt for a single program.
 
         Returns:
             Tuple of (prompt, response_format, metadata) where metadata contains info for post-processing
         """
-        if not selected_program_ids:
-            return None, None, None
-
-        # Get selected programs info
-        selected_programs = [programs[program_id] for program_id in selected_program_ids]
-
         if not self.generate_research_proposal:
             raise NotImplementedError("This method is not supported for generate_research_proposal == False")
 
         expertise_topics = [rd.topic if isinstance(rd, ResearchDirection) else str(rd)
                             for rd in self.expertise]
-
-        program_details = ""
-        for program in selected_programs:
-            program_details += f"""### Program ID: \"{program.program_id}\"
-Name: \"{program.name}\"
-Focus Areas: {', '.join([rd.topic for rd in program.research_directions])}
-
-"""
 
         prompt = f"""You are a university researcher from {self.university_name} applying for research funding based on your expertise and past papers.
 
@@ -309,73 +164,76 @@ Focus Areas: {', '.join([rd.topic for rd in program.research_directions])}
 - Recent performance: {len(past_accepted_papers)} accepted papers, {len(past_rejected_papers)} rejected papers
 - Current funding: {self.resources}
 
-## Candidate Programs
-{program_details}
+## Funding Program
+Program ID: "{program.program_id}"
+Name: "{program.name}"
+Focus Areas: {', '.join([rd.topic for rd in program.research_directions])}
 
-For each program, if you think the program is a good fit for your expertise, generate a compelling 100-word proposal and mention your past works that are relevant to the program.
+If you think this program is a good fit for your expertise, generate a compelling 100-word proposal and mention your past works that are relevant to the program.
 
-The research proposal should be:
-1. Aligns with program focus areas.
-2. Leverages your expertise and past works, either accepted papers or preprints / rejected papers
-3. Emphasizes feasibility and impact.
+The research proposal should:
+1. Align with program focus areas.
+2. Leverage your expertise and past works, either accepted papers or preprints / rejected papers
+3. Emphasize feasibility and impact.
 
 """
 
-        prompt += "## Past Accepted Papers"
-        for paper in past_accepted_papers:
-            prompt += f"""Title: {paper['title']}
-Arxiv ID: {paper['id']}
+        # Build ordered list of all papers: accepted first, then rejected
+        all_papers = []
+        paper_idx = 0
+
+        if past_accepted_papers:
+            prompt += "## Past Accepted Papers\n"
+            for paper in past_accepted_papers:
+                prompt += f"""### Paper {paper_idx}
+Title: {paper['title']}
 Abstract: {paper['abstract']}
-Status: {paper['status']}
 
 """
+                all_papers.append({'id': paper['id'], 'status': paper['status']})
+                paper_idx += 1
 
-        prompt += "## Past Rejected Papers"
-        for paper in past_rejected_papers:
-            prompt += f"""Title: {paper['title']}
-Arxiv ID: \"{paper['id']}\"
+        if past_rejected_papers:
+            prompt += "## Past Rejected Papers\n"
+            for paper in past_rejected_papers:
+                prompt += f"""### Paper {paper_idx}
+Title: {paper['title']}
 Abstract: {paper['abstract']}
-Status: {paper['status']}
 
 """
+                all_papers.append({'id': paper['id'], 'status': paper['status']})
+                paper_idx += 1
 
-        prompt += """## Response Format
-Respond in JSON format. Each key is a program_id. Set "submit" to true with a proposal and relevant projects to apply, or false with null proposal and empty list to skip
+        num_papers = len(all_papers)
+        citation_prompt = f"A ranked list of paper indices (most relevant first). Each value must be an integer between 0 and {num_papers - 1}."
 
-An example response is shown below (DO NOT directly copy the exact response:
+        prompt += f"""## Response Format
+Respond in JSON format. Set "submit" to true with a proposal and relevant projects to apply, or false with null proposal and empty list to skip.
+
+An example response is shown below (DO NOT directly copy the exact response):
 ```json
-{
-    "DARPA_AUTONOMOUS": {  
-        "submit": true, <- If you chose to apply to this program, set to true.
-        "research_proposal": "Your 100-word proposal here.",
-        "relevant_projects": [
-            {"arxiv_id": "https://arxiv.org/abs/2406.12708v2", "status": "accept"},
-            {"arxiv_id": "https://arxiv.org/abs/2406.00001v1", "status": "reject"}
-        ]
-    },
-    "DARPA_AI_APPS": {
-        "submit": false, <- If you chose to NOT apply to this program, set to false.
-        "research_proposal": null, <- If you chose to NOT apply to this program, set to null.
-        "relevant_projects": []
-    }
-}
+{{
+    "submit": true,
+    "research_proposal": "Your 100-word proposal here.",
+    "relevant_projects": [0, 2, 1] <- {citation_prompt}
+}}
 ```
+
 """
+
         response_format = {
             'type': 'json_schema',
             'json_object': {
                 'name': 'funding_application',
                 'strict': True,
-                'schema': FundingApplicationResponse.model_json_schema()
+                'schema': ProgramApplication.model_json_schema()
             },
         }
 
-        # Metadata for post-processing validation
-        all_paper_ids = set(paper['id'] for paper in past_accepted_papers + past_rejected_papers)
         metadata = {
             'agent': self,
-            'all_paper_ids': all_paper_ids,
-            'selected_program_ids': selected_program_ids
+            'program_id': program.program_id,
+            'all_papers': all_papers,
         }
 
         return prompt, response_format, metadata
@@ -396,7 +254,8 @@ class IndustryResearcher(SimulationAgent):
             expertise: Optional[List] = None,
             llm: BaseLLM = None,
             funding_mode: str = "performance",  # "performance" or "consistent"
-            max_retries: int = 10
+            max_retries: int = 10,
+            exploration_strategy: str = "balanced"
     ):
         """Initialize an industry researcher
 
@@ -433,18 +292,19 @@ class IndustryResearcher(SimulationAgent):
             self.research_priorities = {rd.topic if hasattr(rd, 'topic') else str(rd) for rd in expertise}
 
         self.conflict_of_interest = set()  # set of authors they have collaborated with or belong to the same institution
+        self.exploration_strategy = exploration_strategy
 
     def get_type(self) -> str:
         return "industry"
 
     def _get_personality_prompt(self, include_exploration_strategy: bool = False, include_funding_situation: bool = False) -> str:
-        prompt = f"""You are an industry researcher at {self.company_name}. 
-You author papers and review them for conferences. 
-Compared with university researchers, you focus more on practical applications, scalable solutions, and commercially viable innovations. 
+        prompt = f"""You are an industry researcher at {self.company_name}.
+You author papers and review them for conferences.
+Compared with university researchers, you focus more on practical applications, scalable solutions, and commercially viable innovations.
 """
         if include_exploration_strategy:
             prompt += self._get_exploration_strategy_prompt()
-            
+
         if include_funding_situation:
             prompt += f"""
 Your current funding level is {self.resources}.
@@ -475,68 +335,20 @@ Your current funding level is {self.resources}.
             return []
 
         scores = []
-        for program in funding_programs:
+        for program_id, program in funding_programs.items():
             # Industry prefers applied programs (DARPA over NSF)
-            overlap = sum(1 for exp in self.expertise if exp in program.focus_areas)
+            overlap = sum(1 for exp in self.expertise if exp in program.research_directions)
             expertise_score = overlap / max(len(self.expertise), 1)
 
             # Boost DARPA programs
             practical_boost = 0.2 if "DARPA" in program.program_id else 0
-            success_rate = success_history.get(program.program_id, 0.5) if success_history else 0.5
+            success_rate = success_history[program.program_id] if success_history and program.program_id in success_history else 0.5
 
             final_score = 0.6 * expertise_score + 0.2 * success_rate + practical_boost
             scores.append((program.program_id, final_score))
 
         scores.sort(key=lambda x: x[1], reverse=True)
         return [pid for pid, score in scores[:2] if score > 0.3]
-
-    def prepare_funding_application(
-            self,
-            past_performance: int,
-            funding_programs: List['FundingProgram'],
-            selected_program_ids: List[str]
-    ) -> Dict:
-        """Prepare industry funding application focused on practical impact"""
-        if not selected_program_ids:
-            return None
-
-        selected_programs = [p for p in funding_programs if p.program_id in selected_program_ids]
-        focus_topics = list(set([rd.topic for p in selected_programs for rd in p.focus_areas]))
-
-        expertise_topics = [rd.topic if isinstance(rd, ResearchDirection) else str(rd)
-                            for rd in self.expertise]
-
-        prompt = f"""You are an industry researcher applying for research funding.
-
-## Your Profile
-- Company: {self.company_name}
-- Expertise: {', '.join(expertise_topics)}
-- Recent performance: {past_performance} papers
-- Focus: Practical applications, scalability, commercial impact
-
-## Target Focus Areas
-{', '.join(focus_topics)}
-
-Generate a 100-word proposal emphasizing:
-1. Real-world applications and deployment
-2. Scalability and efficiency
-3. Commercial viability
-
-Return JSON with "research_proposal" field only."""
-
-        result, message_history = self.llm.generate(prompt=prompt)
-        proposal = result.get('research_proposal', 'Industry research proposal.')
-
-        return {
-            'applicant_id': self.id,
-            'affiliation': self.company_name,
-            'research_proposal': proposal,
-            'expertise': self.expertise if self.expertise else [],
-            'past_performance': past_performance,
-            'current_funding': self.resources,
-            'applicant_type': 'industry',
-            'target_programs': selected_program_ids
-        }
 
     def update_research_direction(self, direction: 'ResearchDirection'):
         """Update company research priorities via LLM"""
@@ -584,10 +396,10 @@ class FreelancerAgent(SimulationAgent):
         assert agent_id is not None, "agent_id is required"
         super().__init__(
             reputation=4,
-            funding_level=funding_level,
             agent_id=researcher_name,
             llm=llm
         )
+        self.resources = funding_level
 
         self.can_author = True  # Freelancers primarily write papers
         self.can_review = True  # Freelancers can review, but less frequently invited
@@ -596,8 +408,8 @@ class FreelancerAgent(SimulationAgent):
         self.expertise_directions = expertise_directions or []
 
     def _get_personality_prompt(self) -> str:
-        return """You are an independent researcher who challenges conventional wisdom 
-               and pursues unconventional approaches. You value radical innovation, 
+        return """You are an independent researcher who challenges conventional wisdom
+               and pursues unconventional approaches. You value radical innovation,
                interdisciplinary thinking, and paradigm-shifting discoveries. When reviewing,
                you appreciate bold ideas and are willing to champion unconventional work."""
 

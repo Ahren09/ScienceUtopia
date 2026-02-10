@@ -147,6 +147,7 @@ class FundingAgency(SimulationAgent):
         self.can_review = False
         self.default_funding_rate = default_funding_rate if default_funding_rate is not None else \
         SIMULATION_CONFIG['funding']['default_funding_rate']
+        self.conflict_of_interest = set()
         self.funding_programs: Dict[str, FundingProgram] = {}
         self._initialize_funding_programs(agency_name)
 
@@ -370,18 +371,18 @@ Based on the following criteria, provide a complete ranking of all applications:
 
             prompt += """
 ## Response Format
-Respond in JSON format with all applications ranked from most preferred (rank 1) to least preferred. An example response is shown below (DO NOT directly copy the exact response:
+Respond in JSON format with all applications ranked from most preferred (rank 1) to least preferred. An example response is shown below (DO NOT directly copy the exact response):
 ```json
 {
     "ranked_applications": [
         {
-            "id": 12, <- MUST BE an integer
+            "id": "Applicant_ID_1", <- MUST BE a string that is the same as the "Applicant ID" field
             "applicant_id": "Applicant_ID_1", <- MUST BE a string that is the same as the "Applicant ID" field
             "rank": 1, <- MUST BE 1 because this is the most preferred application
             "reason": "BRIEF REASON"
         },
         {
-            "id": 9,
+            "id": "Applicant_ID_2", <- MUST BE a string that is the same as the "Applicant ID" field
             "applicant_id": "Applicant_ID_2", <- MUST BE a string that is the same as the "Applicant ID" field
             "rank": 2, <- MUST BE 2 because this is the second most preferred application
             "reason": "BRIEF REASON"

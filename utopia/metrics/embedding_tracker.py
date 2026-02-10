@@ -42,6 +42,52 @@ class EmbeddingTracker:
         similarity = np.dot(emb1, emb2) / (np.linalg.norm(emb1) * np.linalg.norm(emb2))
         return float(1 - similarity)
 
+    def compute_distances_batch(self, paper_author_pairs: List[tuple]) -> Dict[str, Optional[float]]:
+        """Compute cosine distances for multiple (paper_id, author_id) pairs at once.
+
+        Returns:
+            Dict mapping paper_id -> distance (None if no previous paper exists)
+        """
+        if not paper_author_pairs:
+            return {}
+
+        # Build author -> [(paper_id, year)] index, sorted by year
+        author_papers: Dict[str, List[tuple]] = {}
+        for pid, meta in self.paper_metadata.items():
+            author_papers.setdefault(meta['author_id'], []).append((pid, meta['year']))
+        for aid in author_papers:
+            author_papers[aid].sort(key=lambda x: x[1])
+
+        # Separate pairs into those with/without a previous paper
+        valid_ids, current_embs, prev_embs = [], [], []
+        results: Dict[str, Optional[float]] = {}
+
+        for paper_id, author_id in paper_author_pairs:
+            if paper_id not in self.embeddings:
+                results[paper_id] = None
+                continue
+
+            current_year = self.paper_metadata[paper_id]['year']
+            prev = [p for p in author_papers.get(author_id, []) if p[1] < current_year]
+
+            if not prev:
+                results[paper_id] = None
+                continue
+
+            valid_ids.append(paper_id)
+            current_embs.append(self.embeddings[paper_id])
+            prev_embs.append(self.embeddings[prev[-1][0]])  # most recent (list is sorted)
+
+        # Vectorized cosine distance
+        if valid_ids:
+            cur = np.stack(current_embs)
+            prv = np.stack(prev_embs)
+            sims = np.sum(cur * prv, axis=1) / (np.linalg.norm(cur, axis=1) * np.linalg.norm(prv, axis=1))
+            for pid, dist in zip(valid_ids, 1 - sims):
+                results[pid] = float(dist)
+
+        return results
+
     def to_dict(self) -> Dict:
         """Serialize for checkpoint"""
         return {

@@ -132,6 +132,7 @@ def main():
         output_dir=args.output_dir,
         debug=args.debug,
         industry_funding_mode=args.industry_funding_mode,
+        funding_allocation_mode=args.funding_allocation_mode,
         always_rerun=args.always_rerun,
         use_langchain=args.use_langchain
     )

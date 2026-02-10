@@ -56,11 +56,10 @@ def load_checkpoint_papers(checkpoint_path: str) -> list[dict]:
 
 
 def load_scievo_cache(cache_path: str):
-    """Build id->global_index and year->range mappings from SciEvo pickle cache.
+    """Load SciEvo pickle cache with id->global_index mapping.
 
     Returns:
         id2global_idx: dict mapping paper ID -> global document index
-        year_ranges: dict mapping real year -> (start_idx, end_idx)
         documents: list of Document objects
     """
     with open(cache_path, 'rb') as f:
@@ -69,15 +68,7 @@ def load_scievo_cache(cache_path: str):
     documents = cache_data['documents']
     id2global_idx = {doc.metadata['id']: i for i, doc in enumerate(documents)}
 
-    year_ranges = {}
-    for i, doc in enumerate(documents):
-        yr = doc.metadata['publication_year']
-        if yr not in year_ranges:
-            year_ranges[yr] = [i, i + 1]
-        else:
-            year_ranges[yr][1] = i + 1
-
-    return id2global_idx, year_ranges, documents
+    return id2global_idx, documents
 
 
 def resolve_topic(author_id: str, project_start_year: int, author_directions: dict) -> str:
@@ -95,9 +86,7 @@ def build_embedding_dataframe(
     papers: list[dict],
     author_directions: dict,
     id2global_idx: dict,
-    year_ranges: dict,
-    documents: list,
-    embedding_dir: str,
+    embedding_path: str,
     start_year: int,
     method: str = 'tsne',
 ) -> pd.DataFrame:
@@ -105,59 +94,35 @@ def build_embedding_dataframe(
 
     Columns: id, sim_year, real_year, status, author_id, topic, x, y
     """
-    # Group papers by publication year so each .pt file is loaded once.
-    # Each group entry is (paper_dict, global_document_index).
-    papers_by_pub_year: dict[int, list[tuple[dict, int]]] = {}
+    all_embeddings = torch.load(embedding_path, map_location='cpu', weights_only=True)
+
+    rows = []
+    valid_indices = []
     skipped = 0
 
     for p in papers:
-        global_idx = id2global_idx.get(p['id'])
-        if global_idx is None:
+        idx = id2global_idx.get(p['id'])
+        if idx is None or idx >= all_embeddings.shape[0]:
             skipped += 1
             continue
-        pub_year = documents[global_idx].metadata['publication_year']
-        papers_by_pub_year.setdefault(pub_year, []).append((p, global_idx))
-
-    rows = []
-    embeddings = []
-
-    for pub_year in sorted(papers_by_pub_year):
-        cache_file = os.path.join(embedding_dir, f"cache_embeddings_{pub_year}.pt")
-        if not os.path.exists(cache_file):
-            logger.warning(f"Embedding cache not found: {cache_file}, skipping {len(papers_by_pub_year[pub_year])} papers")
-            skipped += len(papers_by_pub_year[pub_year])
-            continue
-
-        year_embeddings = torch.load(cache_file, map_location='cpu', weights_only=True)
-        year_offset = year_ranges.get(pub_year, [0, 0])[0]
-        group = papers_by_pub_year[pub_year]
-
-        # Batch: compute all local indices, filter valid ones, index tensor once
-        global_indices = np.array([gidx for _, gidx in group])
-        local_indices = global_indices - year_offset
-        valid = (local_indices >= 0) & (local_indices < year_embeddings.shape[0])
-        skipped += int((~valid).sum())
-
-        embeddings.append(year_embeddings[local_indices[valid]].numpy())
-
-        for (p, _), ok in zip(group, valid):
-            if not ok:
-                continue
-            topic = resolve_topic(p['author_id'], p['project_start_year'], author_directions)
-            rows.append({
-                'id': p['id'],
-                'sim_year': p['sim_year'],
-                'real_year': start_year + p['sim_year'] - 1,
-                'status': p['status'],
-                'author_id': p['author_id'],
-                'topic': topic,
-            })
+        valid_indices.append(idx)
+        topic = resolve_topic(p['author_id'], p['project_start_year'], author_directions)
+        rows.append({
+            'id': p['id'],
+            'sim_year': p['sim_year'],
+            'real_year': start_year + p['sim_year'] - 1,
+            'status': p['status'],
+            'author_id': p['author_id'],
+            'topic': topic,
+        })
 
     if skipped:
         logger.warning(f"Skipped {skipped} papers (missing in cache or embeddings)")
 
-    # Dimensionality reduction
-    embeddings = np.concatenate(embeddings)
+    # Batch index with torch, convert to numpy only for dimensionality reduction
+    selected = all_embeddings[torch.tensor(valid_indices)]
+    embeddings = selected.numpy()
+
     logger.info(f"Reducing {embeddings.shape[0]} embeddings with {method}...")
     if method == 'tsne':
         perplexity = min(30, max(5, len(embeddings) // 5))
@@ -264,7 +229,6 @@ def main():
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
     output_dir = args.output_dir
-    end_real_year = args.start_year + args.num_years - 1
 
     # 1. Load papers + author directions from final checkpoint
     checkpoint_path = os.path.join(output_dir, f"checkpoint_year_{args.num_years}.json")
@@ -273,17 +237,17 @@ def main():
     logger.info(f"Loaded {len(papers)} submitted papers")
 
     # 2. Load SciEvo document cache
-    cache_path = f"outputs/cache_scievo_{args.start_year}-{end_real_year}.pkl"
+    cache_path = "outputs/cache_scievo.pkl"
     logger.info(f"Loading SciEvo cache: {cache_path}")
-    id2global_idx, year_ranges, documents = load_scievo_cache(cache_path)
-    logger.info(f"SciEvo cache: {len(id2global_idx)} documents, years {sorted(year_ranges.keys())}")
+    id2global_idx, documents = load_scievo_cache(cache_path)
+    logger.info(f"SciEvo cache: {len(id2global_idx)} documents")
 
     # 3. Build DataFrame with embeddings, 2D coords, and topics
     model_tag = args.embedding_model.replace("/", "_")
-    embedding_dir = f"outputs/{model_tag}"
+    embedding_path = f"outputs/{model_tag}/cache_embeddings.pt"
     df = build_embedding_dataframe(
-        papers, author_directions, id2global_idx, year_ranges, documents,
-        embedding_dir, args.start_year, method=args.method,
+        papers, author_directions, id2global_idx,
+        embedding_path, args.start_year, method=args.method,
     )
     logger.info(f"DataFrame: {len(df)} papers, {df['topic'].nunique()} topics")
 

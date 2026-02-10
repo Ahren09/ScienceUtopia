@@ -18,7 +18,6 @@ from utopia.data.paper_tracker import PaperTracker
 
 logger = logging.getLogger(__name__)
 
-ALL_CS_TOPICS = ["cs.AI", "cs.AR", "cs.CC", "cs.CE", "cs.CG", "cs.CL", "cs.CR", "cs.CY", "cs.DB", "cs.DC", "cs.DL", "cs.DM", "cs.DS", "cs.ET", "cs.FL", "cs.LG", "cs.LO", "cs.NI", "cs.OH", "cs.OS", "cs.PF", "cs.PL", "cs.RO", "cs.SE", "cs.SY"]
 
 class ResearchDirectionSelection(BaseModel):
     """Pydantic model for structured output of research direction selection"""

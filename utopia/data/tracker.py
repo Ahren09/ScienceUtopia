@@ -11,12 +11,12 @@ logger = logging.getLogger(__name__)
 class FundingTracker:
     """Tracks global funding consumption across all agents to maintain constant total funding."""
 
-    def __init__(self):
+    def __init__(self, funding_allocation_mode):
         self.funding_allocation_per_cycle: Dict[int, Dict[str, float]] = {}  # year -> total funding
         self.consumption_per_cycle: Dict[int, Dict[str, float]] = {}     # year -> total consumed
 
         self.growth_rate = 0.1 # 10% growth rate for the fundings
-        self.funding_allocation_mode = 'consumption_based'  # set externally after init
+        self.funding_allocation_mode = funding_allocation_mode  # set externally after init
 
     def start_cycle(self, year: int, agents: Dict[str, Any]) -> float:
         """Record total funding at start of cycle.
@@ -140,6 +140,7 @@ class FundingTracker:
     def to_dict(self) -> Dict:
         """Serialize to dict."""
         return {
+            "funding_allocation_mode": self.funding_allocation_mode,
             "funding_allocation_per_cycle": self.funding_allocation_per_cycle,
             "consumption_per_cycle": self.consumption_per_cycle
         }
@@ -147,7 +148,7 @@ class FundingTracker:
     @classmethod
     def from_dict(cls, data: Dict) -> "FundingTracker":
         """Deserialize from dict."""
-        tracker = cls()
+        tracker = cls(data.get("funding_allocation_mode", "fixed"))
         tracker.funding_allocation_per_cycle = data.get("funding_allocation_per_cycle", {})
         tracker.funding_allocation_per_cycle = {int(year): allocation for year, allocation in tracker.funding_allocation_per_cycle.items()}
         

@@ -13,7 +13,8 @@ class ExplorationMetrics:
 
     def record_topic_distance(self, author_id: str, year: int, distance: float):
         """Record topic distance for an author in a given year"""
-        self.topic_distances[author_id][year].append(distance)
+        if distance is not None:
+            self.topic_distances[author_id][year].append(distance)
 
     def record_cd_index(self, paper_id: str, year: int, cd_score: float):
         """Record CD index for a paper"""

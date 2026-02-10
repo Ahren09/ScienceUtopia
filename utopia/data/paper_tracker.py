@@ -29,6 +29,7 @@ class ArchivedPaper:
     conference: str
     status: str  # 'pending', 'accept', 'reject'
     topics: List[str] = field(default_factory=list)
+    tags: List[str] = field(default_factory=list)
     project_start_year: int = 0
     project_end_year: int = 0
     maturity: int = 1
@@ -45,6 +46,7 @@ class ArchivedPaper:
             'year': self.year,
             'conference': self.conference,
             'topics': self.topics,
+            'tags': self.tags,
             'status': self.status,
             'project_start_year': self.project_start_year,
             'project_end_year': self.project_end_year,
@@ -63,7 +65,8 @@ class ArchivedPaper:
             author_type=data['author_type'],
             year=data['year'],
             conference=data['conference'],
-            topics=data.get('topics', []),
+            topics=data['topics'],
+            tags=data['tags'],
             status=data['status'],
             project_start_year=data.get('project_start_year', 0),
             project_end_year=data.get('project_end_year', 0),
@@ -81,7 +84,8 @@ class ArchivedPaper:
                 'author_id': self.author_id,
                 'year': self.year,
                 'conference': self.conference,
-                'topics': ', '.join(self.topics),
+                'topics': list(self.topics),
+                'tags': list(self.tags),
                 'source': 'simulation'
             }
         )
@@ -180,7 +184,8 @@ class PaperTracker:
                     author_type=paper_dict['author_type'],
                     year=paper_dict['year'],  # The current year (updated time of the submission)
                     conference=paper_dict['conference'],
-                    topics=paper_dict.get('topics', []),
+                    topics=paper_dict['topics'],
+                    tags=paper_dict['tags'],
                     status=status,
                     project_start_year=paper_dict['project_start_year'],
                     project_end_year=paper_dict['project_end_year'],

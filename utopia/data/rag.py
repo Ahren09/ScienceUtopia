@@ -34,7 +34,7 @@ from datasets import load_dataset
 from langchain_community.vectorstores import FAISS
 
 from utopia.utils.data_utils import read_json
-from utopia.agents.research_direction import ALL_CS_TOPICS
+from utopia.agents.conference import ALL_CS_TOPICS, ARXIV_CATEGORY_NAMES
 
 import pandas as pd
 
@@ -112,148 +112,130 @@ class RAG:
         valid_years = set(range(self.start_year, end_real_year + 1))
 
         self.id2docs = {}
-        if self.debug:
-            dataset = read_json("data/additional_data_2024_7.json")
 
-            nat_count = 0
-            for item in dataset[:256]:
+        cache_path = "outputs/cache_scievo.pkl"
+        cache_valid = False
+        if os.path.exists(cache_path):
+            print(f"[Cache HIT] Loading documents from {cache_path}")
+            with open(cache_path, 'rb') as f:
+                cache_data = pickle.load(f)
+            self.documents = cache_data['documents']
+            # Validate cache has 'tags' metadata and id2year_pos mapping
+            if self.documents and 'tags' in self.documents[0].metadata and 'id2year_pos' in cache_data:
+                self.id2year_pos = cache_data['id2year_pos']
+                cache_valid = True
+            else:
+                print(f"[Cache STALE] Missing 'tags' or 'id2year_pos' — regenerating cache")
+                self.documents = []
 
-                title = re.sub(r'\s+', ' ', item.get('title', '').replace('\n', ' ')).strip()
-                abstract = re.sub(r'\s+', ' ', item.get('summary', '').replace('\n', ' ')).strip()
+        if not cache_valid:
+            dataset = load_dataset("Ahren09/SciEvo", "arxiv", split="train")
+            n_workers = self.config.n_workers
+            num_proc = n_workers if n_workers > 1 else None
 
-                published = _as_datetime(item.get('published', ''))
-                if pd.isna(published):
-                    nat_count += 1
-                    continue
+            dataset = dataset.filter(lambda x: len(set(x['tags']) & set(ALL_CS_TOPICS)) > 0, num_proc=num_proc)
 
-                pub_year = published.year
-                if pub_year not in valid_years:
-                    continue
+            self.id2docs = {}
 
-                metadata = {
-                    'id': item.get('id', ''),
-                    'title': title,
-                    'published': published,
-                    'publication_year': pub_year,
-                    'tags': item.get('tags', []),
-                }
 
-                doc = Document(
-                    page_content=abstract,
-                    metadata=metadata
+            if num_proc:
+                # Parallel path: use HF datasets built-in multiprocessing
+                print(f"[RAG] Processing dataset with {n_workers} workers...")
+
+                def _parse_pub_year(item):
+                    ts = item.get('published', '')
+                    if ts is None or ts == '':
+                        return {'_pub_year': -1}
+                    try:
+                        dt = pd.to_datetime(ts)
+                        return {'_pub_year': dt.year if not pd.isna(dt) else -1}
+                    except Exception:
+                        return {'_pub_year': -1}
+
+                dataset = dataset.map(_parse_pub_year, num_proc=num_proc, desc="Parsing dates")
+
+                nat_count = sum(1 for y in dataset['_pub_year'] if y == -1)
+
+                valid_years_list = sorted(valid_years)
+                valid_years_set_for_filter = set(valid_years_list)
+                dataset = dataset.filter(
+                    lambda x: x['_pub_year'] in valid_years_set_for_filter,
+                    num_proc=num_proc,
+                    desc="Filtering by year",
                 )
-                self.id2docs[item['id']] = doc
+
+                df = dataset.to_pandas()
+
+                # Vectorized operations — no per-item Python calls
+                df['_published'] = pd.to_datetime(df['published'])
+                df['_id'] = df['id'].str.replace('http://', 'https://', regex=False)
+
+                # Build Document list via zip over numpy arrays (no for-loop)
+                self.documents = [
+                    Document(
+                        page_content=abstract,
+                        metadata={'id': id_, 'title': title, 'published': pub, 'publication_year': int(year), 'tags': list(tags), 'topics': list([ARXIV_CATEGORY_NAMES[tag] for tag in tags if tag in ARXIV_CATEGORY_NAMES])}
+                    )
+                    for abstract, id_, title, pub, year, tags in zip(
+                        df['summary'].values, df['_id'].values, df['title'].values,
+                        df['_published'].values, df['_pub_year'].values, df['tags'].values,
+                    )
+                ]
+                self.id2docs = dict(zip(df['_id'].values, self.documents))
+
+            else:
+                # Sequential path (original)
+                nat_count = 0
+                for item in tqdm(dataset, desc="Processing dataset"):
+                    title = _normalize_whitespace(item.get('title', ''))
+                    abstract = _normalize_whitespace(item.get('summary', ''))
+
+                    published = _as_datetime(item.get('published', ''))
+                    if pd.isna(published):
+                        nat_count += 1
+                        continue
+
+                    pub_year = published.year
+                    if pub_year not in valid_years:
+                        continue
+
+                    metadata = {
+                        'id': item.get('id', '').replace('http://', 'https://'),
+                        'title': title,
+                        'published': published,
+                        'publication_year': int(pub_year),
+                        'tags': list(item['tags']),
+                        'topics': list([ARXIV_CATEGORY_NAMES[tag] for tag in item['tags'] if tag in ARXIV_CATEGORY_NAMES]),
+                    }
+                    doc = Document(page_content=abstract, metadata=metadata)
+                    self.id2docs[metadata['id']] = doc
 
             if nat_count > 0:
                 print(f"[RAG] Skipped {nat_count} papers with missing publication dates")
 
             docs = list(self.id2docs.values())
             self.documents = docs
+            self.documents.sort(key=lambda doc: doc.metadata['publication_year'])
 
-        else:
-            cache_path = f"outputs/cache_scievo_{self.start_year}-{end_real_year}.pkl"
-            if os.path.exists(cache_path):
-                print(f"[Cache HIT] Loading documents from {cache_path}")
-                with open(cache_path, 'rb') as f:
-                    cache_data = pickle.load(f)
-                self.documents = cache_data['documents']
+            # Build id -> (year, position_within_year) mapping
+            year_counts = {}
+            id2year_pos = {}
+            for doc in self.documents:
+                yr = doc.metadata['publication_year']
+                pos = year_counts.get(yr, 0)
+                id2year_pos[doc.metadata['id']] = (yr, pos)
+                year_counts[yr] = pos + 1
+            self.id2year_pos = id2year_pos
 
-            else:
-                dataset = load_dataset("Ahren09/SciEvo", "arxiv", split="train")
-                n_workers = self.config.n_workers
-                num_proc = n_workers if n_workers > 1 else None
+            cache_data = {
+                'documents': self.documents,
+                'id2year_pos': id2year_pos,
+            }
+            os.makedirs(os.path.dirname(cache_path) or '.', exist_ok=True)
+            with open(cache_path, 'wb') as f:
+                pickle.dump(cache_data, f)
 
-                dataset = dataset.filter(lambda x: len(set(x['tags']) | set(ALL_CS_TOPICS)) > 0, num_proc=num_proc)
-
-                self.id2docs = {}
-
-
-                if num_proc:
-                    # Parallel path: use HF datasets built-in multiprocessing
-                    print(f"[RAG] Processing dataset with {n_workers} workers...")
-
-                    def _parse_pub_year(item):
-                        ts = item.get('published', '')
-                        if ts is None or ts == '':
-                            return {'_pub_year': -1}
-                        try:
-                            dt = pd.to_datetime(ts)
-                            return {'_pub_year': dt.year if not pd.isna(dt) else -1}
-                        except Exception:
-                            return {'_pub_year': -1}
-
-                    dataset = dataset.map(_parse_pub_year, num_proc=num_proc, desc="Parsing dates")
-
-                    nat_count = sum(1 for y in dataset['_pub_year'] if y == -1)
-
-                    valid_years_list = sorted(valid_years)
-                    valid_years_set_for_filter = set(valid_years_list)
-                    dataset = dataset.filter(
-                        lambda x: x['_pub_year'] in valid_years_set_for_filter,
-                        num_proc=num_proc,
-                        desc="Filtering by year",
-                    )
-
-                    df = dataset.to_pandas()
-
-                    # Vectorized operations — no per-item Python calls
-                    df['_published'] = pd.to_datetime(df['published'])
-                    df['_id'] = df['id'].str.replace('http://', 'https://', regex=False)
-
-                    # Build Document list via zip over numpy arrays (no for-loop)
-                    self.documents = [
-                        Document(
-                            page_content=abstract,
-                            metadata={'id': id_, 'title': title, 'published': pub, 'publication_year': year, 'tags': tags}
-                        )
-                        for abstract, id_, title, pub, year, tags in zip(
-                            df['summary'].values, df['_id'].values, df['title'].values,
-                            df['_published'].values, df['_pub_year'].values, df['tags'].values,
-                        )
-                    ]
-                    self.id2docs = dict(zip(df['_id'].values, self.documents))
-
-                else:
-                    # Sequential path (original)
-                    nat_count = 0
-                    for item in tqdm(dataset, desc="Processing dataset"):
-                        title = _normalize_whitespace(item.get('title', ''))
-                        abstract = _normalize_whitespace(item.get('summary', ''))
-
-                        published = _as_datetime(item.get('published', ''))
-                        if pd.isna(published):
-                            nat_count += 1
-                            continue
-
-                        pub_year = published.year
-                        if pub_year not in valid_years:
-                            continue
-
-                        metadata = {
-                            'id': item.get('id', '').replace('http://', 'https://'),
-                            'title': title,
-                            'published': published,
-                            'publication_year': pub_year,
-                            'tags': item.get('tags', []),
-                        }
-
-                        doc = Document(page_content=abstract, metadata=metadata)
-                        self.id2docs[metadata['id']] = doc
-
-                if nat_count > 0:
-                    print(f"[RAG] Skipped {nat_count} papers with missing publication dates")
-
-                docs = list(self.id2docs.values())
-                self.documents = docs
-                self.documents.sort(key=lambda doc: doc.metadata['publication_year'])
-                cache_data = {
-                    'documents': self.documents,
-                }
-                os.makedirs(os.path.dirname(cache_path) or '.', exist_ok=True)
-                with open(cache_path, 'wb') as f:
-                    pickle.dump(cache_data, f)
-
-            self.id2docs = {doc.metadata['id']: doc for doc in self.documents}
+        self.id2docs = {doc.metadata['id']: doc for doc in self.documents}
 
         # Log year distribution
         year_counts = Counter(doc.metadata['publication_year'] for doc in self.documents)
@@ -307,67 +289,32 @@ class RAG:
         # https://arxiv.org/pdf/1234.12345.pdf -> 0
         self.id2document_indices = {doc.metadata['id']: i for i, doc in enumerate(self.documents)}
 
-        # --- Per-year embedding caching ---
-        # Documents are sorted by year, so find contiguous year ranges
+        # --- Single-file embedding caching ---
         model_tag = self.config.embedding_model.replace("/", "_")
         os.makedirs(f"outputs/{model_tag}", exist_ok=True)
+        cache_file = f"outputs/{model_tag}/cache_embeddings.pt"
 
-        year_ranges = {}  # year -> (start_idx, end_idx)
-        for i, doc in enumerate(self.documents):
-            yr = doc.metadata['publication_year']
-            if yr not in year_ranges:
-                year_ranges[yr] = [i, i + 1]
-            else:
-                year_ranges[yr][1] = i + 1
+        if os.path.exists(cache_file):
+            print(f"[Cache HIT] Loading embeddings from {cache_file}")
+            self.document_embeddings = torch.load(cache_file, map_location=self.device, weights_only=True)
+            if self.document_embeddings.shape[0] != len(self.documents):
+                print(f"[Cache STALE] Embedding count {self.document_embeddings.shape[0]} != document count {len(self.documents)} — re-encoding")
+                self.document_embeddings = None
+        else:
+            self.document_embeddings = None
 
-        # Pass 1: Load cached embeddings, collect uncached years
-        sorted_years = sorted(year_ranges)
-        per_year_embeddings = [None] * len(sorted_years)
-        uncached = []  # list of (index_in_sorted, year, start_idx, end_idx)
-
-        for i, yr in enumerate(sorted_years):
-            start_idx, end_idx = year_ranges[yr]
-            cache_file = f"outputs/{model_tag}/cache_embeddings_{yr}.pt"
-
-            if os.path.exists(cache_file):
-                print(f"[Cache HIT] Year {yr}: loading embeddings from {cache_file}")
-                tc = time()
-                per_year_embeddings[i] = torch.load(cache_file, map_location=self.device, weights_only=True)
-                print(f"[Cache HIT] Year {yr}: {per_year_embeddings[i].shape[0]} docs loaded in {time() - tc:.1f}s")
-            else:
-                uncached.append((i, yr, start_idx, end_idx))
-
-        # Pass 2: Encode all uncached years in one multi-GPU batch
-        if uncached:
-            all_uncached_texts = []
-            year_boundaries = []  # (index_in_sorted, year, slice_start, slice_end)
-            for idx_in_sorted, yr, start_idx, end_idx in uncached:
-                slice_start = len(all_uncached_texts)
-                all_uncached_texts.extend(doc_texts[start_idx:end_idx])
-                slice_end = len(all_uncached_texts)
-                year_boundaries.append((idx_in_sorted, yr, slice_start, slice_end))
-
-            print(f"Encoding {len(all_uncached_texts)} documents from {len(uncached)} uncached years...")
-            
-
-            for idx_in_sorted, yr, slice_start, slice_end in year_boundaries:
-                texts = all_uncached_texts[slice_start:slice_end]
-                emb = self.sentence_transformer_model.encode(
-                    texts,
-                    convert_to_tensor=True,
-                    normalize_embeddings=self.config.normalize_embeddings,
-                    batch_size=512,
-                    show_progress_bar=True,
-                    device=self.device,
-                )
-                cache_file = f"outputs/{model_tag}/cache_embeddings_{yr}.pt"
-                torch.save(emb, cache_file)
-                print(f"[Cache SAVE] Year {yr}: saved {emb.shape[0]} embeddings to {cache_file}")
-                per_year_embeddings[idx_in_sorted] = emb
-           
-
-        self.document_embeddings = torch.cat(per_year_embeddings, dim=0)  # (D, dim)
-        del per_year_embeddings
+        if self.document_embeddings is None:
+            print(f"Encoding {len(doc_texts)} documents...")
+            self.document_embeddings = self.sentence_transformer_model.encode(
+                doc_texts,
+                convert_to_tensor=True,
+                normalize_embeddings=self.config.normalize_embeddings,
+                batch_size=512,
+                show_progress_bar=True,
+                device=self.device,
+            )
+            torch.save(self.document_embeddings, cache_file)
+            print(f"[Cache SAVE] Saved {self.document_embeddings.shape[0]} embeddings to {cache_file}")
 
         print(f"[SentenceTransformer] Encode documents: {time() - t0:.2f} seconds")
 
@@ -648,7 +595,7 @@ class RAG:
             for d_idx, doc in enumerate(docs[:max_docs_display], 1):
                 print(f"\n  [{d_idx}] {doc.metadata.get('title', 'No title')}")
                 print(f"      Authors: {doc.metadata.get('authors', 'Unknown')}")
-                print(f"      Tags: {doc.metadata.get('tags', 'None')}")
+                print(f"      Tags: {doc.metadata['tags']}")
                 print(f"      Summary: {doc.page_content[:150]}...")
 
             if len(docs) > max_docs_display:

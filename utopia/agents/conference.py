@@ -844,6 +844,40 @@ for conference in CONFERENCES.values():
         CONFERENCES_BY_CATEGORY[conference.category] = []
     CONFERENCES_BY_CATEGORY[conference.category].append(conference)
 
+
+ARXIV_CATEGORY_NAMES = {
+    "cs.AI": "Artificial Intelligence",
+    "cs.AR": "Hardware Architecture",
+    "cs.CC": "Computational Complexity",
+    "cs.CE": "Computational Engineering",
+    "cs.CG": "Computational Geometry",
+    "cs.CL": "Computation and Language",
+    "cs.CR": "Cryptography",
+    "cs.CY": "Cybersecurity",
+    "cs.DB": "Databases and Data Mining",
+    "cs.DC": "Distributed Computing",
+    "cs.DL": "Deep Learning",
+    "cs.DM": "Data Mining",
+    "cs.DS": "Data Structures",
+    "cs.ET": "Embedded Systems",
+    "cs.FL": "Formal Languages and Automata Theory",
+    "cs.LG": "Machine Learning",
+    "cs.LO": "Logic in Computer Science",
+    "cs.NI": "Network and Information Systems",
+    "cs.OH": "Other",
+    "cs.OS": "Operating Systems",
+    "cs.PF": "Parallel and Distributed Computing",
+    "cs.PL": "Programming Languages",
+    "cs.RO": "Robotics",
+    "cs.SE": "Software Engineering",
+    "cs.SY": "Systems and Networking",
+    
+}
+
+ALL_CS_TOPICS = list(ARXIV_CATEGORY_NAMES.keys())
+
+
+
 # Mapping from research direction topics to conference categories
 # This maps the topics in ResearchDirection to the conference categories
 TOPIC_TO_CATEGORY_MAPPING = {

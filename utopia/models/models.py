@@ -499,7 +499,11 @@ class VLLMModel(BaseLLM):
         for i, output in enumerate(outputs):
             response_text = output.outputs[0].text.strip()
 
-            response_json = self._parse_json_response(response_text)
+            try:
+                response_json = self._parse_json_response(response_text)
+            except Exception as e:
+                logger.warning(f"Prompt {i} JSON parse failed: {e}")
+                response_json = None
 
             # Build message history for this prompt
             messages = []

@@ -28,102 +28,78 @@ We conducted a large-scale simulation, based on \textcolor{blue}{X} research pap
 
 \section{Method}
 
-
 Academic science reserves its greatest rewards for discoveries and the
 development of theories that explain the world. Industrial research, by
 contrast, receives compensation through markets for technologies that
-provide consumers with control over the world~\cite{fleming2001technology, evans2010industry}. Institutions differ significantly in the motivation of creating academic knowledge
+provide consumers with control over the world~\cite{fleming2001technology, evans2010industry}. Institutions differ significantly in the motivation of creating academic knowledge.
 
-We create several types of agents according to the dimension listed in Table~\ref{tab:personality}.
+We create several types of agents according to the dimensions listed in Table~\ref{tab:personality}.
 
 \subsection{Agent Population}
 
-The framework instantiates multiple researcher agents mapped to institutions, with each agent possessing three inherent expertise directions sampled from available research topics. We implement two primary agent types:
+The framework instantiates \textbf{300 researcher agents} (150 university + 150 industry) and \textbf{2 funding agencies}.
 
-\noindent \textbf{University Researchers}  represent academic institutions prioritizing theoretical contributions and fundamental knowledge advancement. These agents maintain baseline funding levels (70/100) and must apply for grants through competitive processes with funding agencies. Their review behavior emphasizes reproducibility and theoretical rigor.
+\noindent \textbf{University Researchers} represent academic institutions prioritizing theoretical contributions and fundamental knowledge advancement. We define two funding tiers: 10 well-funded institutions (funding = 160 units) and 20 normally-funded institutions (funding = 80 units), each hosting 5 researchers. University researchers must apply for grants through competitive processes with funding agencies. Their review behavior emphasizes reproducibility and theoretical rigor.
 
-\noindent \textbf{Industry Researchers} represent commercial research labs focusing on practical applications. These agents start with higher baseline funding and have consistent funding allocation. 
-However, good performance such as publication success or real-world profits can lead to increased funding.
+\noindent \textbf{Industry Researchers} represent commercial research labs focusing on practical applications and scalable solutions. Similarly, 10 well-funded companies (funding = 320 units) and 20 normally-funded companies (funding = 160 units) each host 5 researchers. Industry funding is allocated based on publication performance: strong output leads to increased support, while underperformance may reduce it.
 
-\noindent \textbf{Funding Agencies} manage diverse competitive grant programs. NSF emphasizes foundational research, while DARPA prioritizes application-driven projects.
+\noindent Each agent is initialized with \textbf{3 inherent expertise directions} sampled from 53 available research directions spanning arXiv CS categories. Each direction specifies a topic, focus areas, keywords, related topics, and a project duration (1--3 years). Agents from the same institution are marked as \textbf{conflicts of interest} and cannot review each other's work.
+
+\noindent \textbf{Funding Agencies.} NSF (30\% funding rate) and DARPA (20\% funding rate) each operate 3 competitive grant programs targeting distinct research areas. NSF programs emphasize foundational research, while DARPA programs prioritize application-driven projects. Full institution lists, company lists, and program details are deferred to Table~\ref{tab:personality} in the appendix.
 
 
 \subsection{Conference System}
 
-The simulation maintains a number of conferences selected proportionally to agent expertise distribution. Each conference targets specific research topics from the arXiv taxonomy. We enforce a 30\% acceptance rate for each conference. 
+The simulation draws from a pool of 54 pre-defined conferences covering major CS domains (ML, CV, NLP, systems, security, theory, etc.). At simulation start, \textbf{10 conferences} are selected proportionally to the agent expertise distribution. Each conference defines an ordered list of preferred arXiv categories and enforces a default \textbf{30\% acceptance rate}. Conferences progress through a yearly lifecycle: accepting submissions $\rightarrow$ under review $\rightarrow$ decisions made $\rightarrow$ concluded.
 
 
 \subsection{Simulation Pipeline}
 
 \paragraph{Phase 1: Research Direction}
-Each agent has an innate set of expertise. 
+Each agent possesses an innate set of expertise (3 research directions). At the beginning of each year, agents whose previous projects have completed and who have sufficient resources ($\geq 20$ units) select a new research direction. The LLM receives the agent's memory bank (past review experiences, funding outcomes), lists of previously accepted and rejected papers with scores, current funding relative to the ecosystem average, and candidate directions drawn from the agent's core expertise and related topics. The agent outputs a structured response containing the selected topic, a detailed research focus, and reasoning.
 
-At the beginning of each year, if an agent does not run out of funding or is not occupied with an ongoing project, they select one research direction they want to focus on based on expertise, funding availabilities, and maturity. Research directions must require specialized expertise. For example, a researcher in database are more possible to take up directions like data mining instead of numeric analysis. 
-
-Some research directions (e.g. database and systems) require longer time period, whereas others require shorter time. We assume that cost-per-unit-time remains constant across different research topics. 
-Subsequent years employ individual selection where agents choose directions based on their expertise and prior experiences. Only agents with sufficient resources ($\geq 20$) participate.
+Project durations vary by field: fast-moving areas (e.g., NLP, deep learning) require 1 year; standard engineering topics (e.g., databases, HCI) require 2 years; deep theoretical work (e.g., complexity theory, quantum computing) requires 3 years. All directions yield the same amortized return per year but differ in total project duration.
 
 
 \paragraph{Phase 2: Paper Submission}
 
-Each agent can choose one paper from the database as their submission. They can submit at most 1 paper, respecting the fact that submission takes their bandwidth. 
+Each agent submits at most \textbf{1 paper per year}. The submission process proceeds in multiple steps:
 
-If they submit, their funding will decrease by a variable amount, depending on the research topic. 
+\begin{enumerate}
+    \item \textbf{Round Intention.} Each agent generates a brief research intention statement.
+    \item \textbf{RAG Retrieval.} The intention and direction keywords query a FAISS vector index built from SciEvo~\cite{jin2024scievo} arXiv papers, partitioned by publication year. Up to 1{,}000 candidates are retrieved via semantic similarity; the top 5 are presented to the agent. Only papers from the current simulation year that have not yet been submitted are eligible.
+    \item \textbf{Paper \& Venue Selection.} The LLM selects one paper and one target conference from the candidates. Agents may also choose not to submit.
+    \item \textbf{Cost.} Each submission consumes 15 funding units. Each active project incurs an annual cost of 10 units.
+\end{enumerate}
 
-
-Submission to a conference with mismatched topics can lower the probability of acceptance. 
-
-Conferences operate independently with topic-matching submission filters, ensuring papers align with conference focus areas.
-
-This design simulates authorship behavior while maintaining computational efficiency by leveraging existing scientific literature.
-
-
-Active researchers submit papers through a RAG-based retrieval pipeline. For each agent's research direction keywords, the system:
-
-Batch retrieves $k=50$ candidate papers from a scientific corpus using semantic similarity. Agents is prompted to select one candidate paper matching their research direction as their submission. 
-
-Agents submit selected papers to compatible conferences based on topic alignment
+\noindent \textbf{Citation Generation} (Year 2+). Citations are assigned through a three-phase process: (a)~the system retrieves the top-20 similar accepted papers via RAG, and the LLM selects citations; (b)~if fewer than 2 citations result, retrieval is extended to both accepted and rejected papers, modeling preprint availability; (c)~the agent reviews its own previous work and selects relevant self-citations.
 
 
 \paragraph{Phase 3: Paper Review}
 
-Each paper is submitted to a venue. Each paper randomly draws 3 reviewers (without conflict of interests) that also submit to the conference. 
+Three reviewers are randomly assigned per paper, excluding the author and co-institutional agents (conflict of interest). The review pipeline follows the design of AgentReview~\citep{jin2024agentreview}. Reviewers score papers on a \textbf{1--5 scale}: 1 (Reject), 2 (Major Revisions), 3 (Borderline Accept), 4 (Strong Accept), 5 (Award-worthy), with calibration guidance that $>$60\% of papers should receive scores of 2.0--2.5 or lower. Decimal scores (e.g., 1.5) are permitted. Review prompts incorporate the reviewer's expertise, memory context, and paper metadata. Reviewer personality biases apply: university reviewers favor theoretical rigor, while industry reviewers favor practical applicability. Each review produces an overall score and a written justification.
 
-The review pipeline is similar to AgentReview~\citep{jin2024agentreview}. We follow review guidelines of the ACL Review Form\footnote{\url{https://aclrollingreview.org/reviewform}}. 
 
 \paragraph{Phase 4: Paper Decisions}
 
-Conferences aggregate review scores and accept the top 30\% of submissions according to the average score. Authors who receive reviews and process feedback and update their internal memory banks. For example, a harsh review may lead to harsher judgment, and good reviews and decisions lead to better evaluation scores.
+Papers are ranked by average review score; the \textbf{top 30\%} are accepted per conference. Authors process received reviews and update their memory banks. Responses are calibrated by percentile: top-10\% papers generate positive reinforcement in the agent's memory, while bottom-30\% papers generate negative memory. These memories influence all future LLM-based decisions (direction selection, paper writing, reviewing, and funding applications).
 
+\textbf{Resubmissions} (Year 2+). Authors with rejected papers may resubmit to a different conference at a cost of 5 funding units. The agent uses the LLM to decide which papers to resubmit and to which venues. Review history accumulates across resubmissions, allowing reviewers at subsequent venues to see prior feedback.
 
 
 \paragraph{Phase 5: Research Fund Allocation}
 
-We design the funding mechanism so that the total funding in the system only changes by a small amount (increase of 10\%). This is similar to real world scenarios.
+The total funding pool grows by approximately \textbf{10\% annually}, reflecting real-world budget dynamics.
 
-Researchers write funding applications to secure fundings for the next phase. 
+\noindent \textbf{Industry funding} is allocated proportionally to accepted papers, weighted by project maturity (longer-running projects receive more).
 
+\noindent \textbf{University funding} follows a competitive grant process. Each researcher applies to up to 3 grant programs, selected by expertise overlap. The LLM generates a research proposal per program. Funding agencies rank all applications via LLM-based evaluation considering alignment, track record, and feasibility. The top $N$\% of applicants are funded per program (30\% for NSF, 20\% for DARPA). Each active project also incurs an annual research cost of 10 units.
 
-University researchers prepare funding applications based on past performance (accepted papers) and current research directions. Funding agencies evaluate applications using LLM-based judgment incorporating.
-
-
-Industry researchers receive funding updates according to their allocation mode (performance-based or consistent). 
-
-Agents with depleted resources are eliminated from the ecosystem.
+\noindent Agents with depleted resources ($\leq 10$ units) are eliminated from the ecosystem.
 
 
-% We define the allocation formula for institution $i$ based on the number of accepted papers in previous years, applying an exponential decay to the contributions of older papers. Let the decay factor be $\lambda$, where $0 < \lambda < 1$ (e.g., $\lambda = 0.5$).
-
-% \subsection{Funding Allocation}
-
-% \paragraph{Score Calculation for Each institution}
-% For institution $i$, let $P_{ij}$ be the set of papers accepted in year $j \in [1, T]$. The contribution of each paper is weighted exponentially:
-
-% $$
-% \text{Score}(i, j) = \sum_{j=1}^{n_i} |P_{ij}| \cdot \lambda^{j-1}
-% $$
-
-% where $\lambda$ is the decay factor that emphasizes recent papers and penalizes papers in previous years. We set $\lambda = 0.5$ in our experiment.
+\paragraph{Agent Memory and Adaptation}
+Agents maintain a persistent memory bank recording review outcomes, funding results, and direction selections. This memory is included in LLM prompts for all major decisions, creating a closed-loop feedback system where past experiences shape future behavior. This enables emergent adaptation: agents who receive harsh reviews may shift research directions or adopt more conservative strategies, while consistently funded agents may pursue riskier, longer-horizon projects.
 
 
 \section{Evaluation}

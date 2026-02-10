@@ -145,12 +145,6 @@ def parse_arguments():
         model_short = args.model.split('/')[-1]
         args.experiment_name = f'default_{model_short}'
 
-    # Debug mode defaults: fewer years, more recent data
-    if args.debug:
-        if '--num_years' not in sys.argv:
-            args.num_years = 4
-        if '--start_year' not in sys.argv:
-            args.start_year = 2022
 
     if args.debug:
         args.output_dir = os.path.join(args.output_dir, 'debug', args.experiment_name)
