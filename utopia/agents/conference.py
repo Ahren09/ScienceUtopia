@@ -957,6 +957,95 @@ TOPIC_TO_CATEGORY_MAPPING = {
     'computing_education': 'Interdisciplinary',
 }
 
+# Mapping from research direction topics to arXiv category codes
+# Derived from the arXiv category annotations in AVAILABLE_DIRECTIONS (research_direction.py).
+# For directions whose primary arXiv code is not in ARXIV_CATEGORY_NAMES,
+# we map to the closest available codes so that translated topic names can be produced.
+DIRECTION_TO_ARXIV = {
+    # cs.AI - Artificial Intelligence
+    'artificial_intelligence': ['cs.AI'],
+    'planning_and_scheduling': ['cs.AI'],
+    'neural_symbolic_ai': ['cs.AI', 'cs.LG'],
+    # cs.AR - Hardware Architecture
+    'computer_architecture': ['cs.AR'],
+    # cs.CC - Computational Complexity
+    'complexity_theory': ['cs.CC'],
+    # cs.CE - Computational Engineering
+    'computational_science': ['cs.CE'],
+    # cs.CG - Computational Geometry
+    'geometric_algorithms': ['cs.CG'],
+    'computational_topology': ['cs.CG'],
+    'computer_graphics': ['cs.CG'],
+    # cs.CL - Computation and Language
+    'natural_language_processing': ['cs.CL', 'cs.AI'],
+    'dialogue_systems': ['cs.CL', 'cs.AI'],
+    'audio_computing': ['cs.CL'],
+    # cs.CR - Cryptography
+    'cryptography': ['cs.CR'],
+    'cybersecurity': ['cs.CR', 'cs.CY'],
+    # cs.CV - Computer Vision (not in ARXIV_CATEGORY_NAMES, mapped to closest)
+    'image_recognition': ['cs.AI', 'cs.LG'],
+    '3d_vision': ['cs.AI', 'cs.LG'],
+    'video_understanding': ['cs.AI', 'cs.LG'],
+    # cs.CY - Cybersecurity
+    'ai_ethics': ['cs.CY', 'cs.AI'],
+    # cs.DB - Databases and Data Mining
+    'database_systems': ['cs.DB'],
+    'information_retrieval': ['cs.DB', 'cs.AI'],
+    'digital_libraries': ['cs.DB'],
+    # cs.DC - Distributed Computing
+    'distributed_systems': ['cs.DC'],
+    'parallel_computing': ['cs.DC', 'cs.PF'],
+    # cs.DM - Data Mining
+    'discrete_mathematics': ['cs.DM', 'cs.DS'],
+    # cs.DS - Data Structures
+    'algorithms': ['cs.DS', 'cs.CC'],
+    'data_structures': ['cs.DS'],
+    # cs.ET - Embedded Systems / Emerging Technologies
+    'quantum_computing': ['cs.ET', 'cs.CC'],
+    # cs.FL - Formal Languages and Automata Theory
+    'formal_methods': ['cs.FL', 'cs.LO'],
+    # cs.LG - Machine Learning
+    'deep_learning': ['cs.LG', 'cs.AI'],
+    'reinforcement_learning': ['cs.LG', 'cs.AI'],
+    'generative_models': ['cs.LG', 'cs.AI'],
+    'meta-learning': ['cs.LG', 'cs.AI'],
+    'interpretable_ml': ['cs.LG', 'cs.AI'],
+    'evolutionary_computation': ['cs.AI', 'cs.LG'],
+    # cs.LO - Logic in Computer Science
+    'logic_in_cs': ['cs.LO'],
+    'symbolic_computation': ['cs.LO'],
+    # cs.MA - Multiagent Systems (mapped to closest)
+    'multiagent_systems': ['cs.AI'],
+    'algorithmic_game_theory': ['cs.AI'],
+    # cs.NI - Network and Information Systems
+    'computer_networks': ['cs.NI'],
+    'social_networks': ['cs.NI'],
+    # cs.OH - Other
+    'interdisciplinary_cs': ['cs.OH'],
+    'computing_education': ['cs.OH'],
+    # cs.OS - Operating Systems
+    'operating_systems': ['cs.OS'],
+    # cs.PF - Parallel and Distributed Computing / Performance
+    'performance_analysis': ['cs.PF'],
+    # cs.PL - Programming Languages
+    'programming_languages': ['cs.PL'],
+    # cs.RO - Robotics
+    'robotics': ['cs.RO', 'cs.AI'],
+    # cs.SE - Software Engineering
+    'software_engineering': ['cs.SE'],
+    # cs.SY - Systems and Networking / Control
+    'control_systems': ['cs.SY', 'cs.RO'],
+    # cs.CE - Computational Engineering (math tools)
+    'mathematical_software': ['cs.CE'],
+    'numerical_analysis': ['cs.CE'],
+    # cs.HC / cs.MM - mapped to closest available
+    'human_computer_interaction': ['cs.AI'],
+    'multimedia_systems': ['cs.AI'],
+    # cs.IT - Information Theory
+    'information_theory': ['cs.CC'],
+}
+
 
 def select_conferences_for_simulation(
         agents: List,

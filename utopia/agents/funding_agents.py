@@ -9,11 +9,12 @@ from pydantic import BaseModel
 from utopia.config import SIMULATION_CONFIG
 from utopia.models.models import BaseLLM
 from .base_agent import SimulationAgent
+from .conference import DIRECTION_TO_ARXIV, ARXIV_CATEGORY_NAMES
 from .research_direction import ResearchDirection
 
 
 class RankedApplication(BaseModel):
-    id: str
+    application_id: int
     applicant_id: str
     rank: int
     reason: str
@@ -111,6 +112,14 @@ class FundingProgram:
         self.research_directions = research_directions
         self.funding_mode = funding_mode
 
+        # Derive translated arXiv topic names from research directions
+        arxiv_codes = set()
+        for rd in self.research_directions:
+            arxiv_codes.update(DIRECTION_TO_ARXIV.get(rd.topic, []))
+        self.topics = sorted(set(
+            ARXIV_CATEGORY_NAMES[code] for code in arxiv_codes if code in ARXIV_CATEGORY_NAMES
+        ))
+
         if funding_mode == "fixed_budget":
             self.budget = budget if budget is not None else SIMULATION_CONFIG['funding']['default_budget']
         elif funding_mode == "fixed_rate":
@@ -120,6 +129,12 @@ class FundingProgram:
             SIMULATION_CONFIG['funding']['academic_base_budget']
         else:
             raise ValueError(f"Unknown funding mode: {funding_mode}")
+
+    def is_topic_match(self, paper_topics: List[str]) -> bool:
+        """Check if paper topics match program topics"""
+        paper_topic_set = set(t.lower() for t in paper_topics)
+        program_topic_set = set(t.lower() for t in self.topics)
+        return bool(paper_topic_set.intersection(program_topic_set))
 
     def reset_for_new_cycle(self):
         """Reset program state for a new funding cycle"""
@@ -339,7 +354,7 @@ class FundingAgency(SimulationAgent):
                         for paper in rejected_papers:
                             past_performance += f" - {submitted_papers_dict[paper['arxiv_id']]['title']}\n"
 
-                applications_text += f"""### Application {i + 1}
+                applications_text += f"""### Application {i}
 Applicant ID: {app['applicant_id']}
 Research Proposal: {app.get('research_proposal', 'No proposal provided')}
 Expertise: {', '.join(expertise_topics)}
@@ -368,28 +383,28 @@ Based on the following criteria, provide a complete ranking of all applications:
 ## Applications to Evaluate
 {applications_text}
 """
-
-            prompt += """
+            instruction = f"MUST BE an integer between 0 and {len(apps) - 1}."
+            prompt += f"""
 ## Response Format
 Respond in JSON format with all applications ranked from most preferred (rank 1) to least preferred. An example response is shown below (DO NOT directly copy the exact response):
 ```json
-{
+{{
     "ranked_applications": [
-        {
-            "id": "Applicant_ID_1", <- MUST BE a string that is the same as the "Applicant ID" field
-            "applicant_id": "Applicant_ID_1", <- MUST BE a string that is the same as the "Applicant ID" field
+        {{
+            "application_id": 21, <- {instruction}
+            "applicant_id": "Harvard_researcher_4", <- MUST BE a string that is the same as the "Applicant ID" in the applications
             "rank": 1, <- MUST BE 1 because this is the most preferred application
             "reason": "BRIEF REASON"
-        },
-        {
-            "id": "Applicant_ID_2", <- MUST BE a string that is the same as the "Applicant ID" field
-            "applicant_id": "Applicant_ID_2", <- MUST BE a string that is the same as the "Applicant ID" field
+        }},
+        {{
+            "application_id": 13, <- {instruction}
+            "applicant_id": "Gatech_researcher_2", <- MUST BE a string that is the same as the "Applicant ID" in the applications
             "rank": 2, <- MUST BE 2 because this is the second most preferred application
             "reason": "BRIEF REASON"
-        },
+        }},
         ...
     ]
-}
+}}
 ```
 """
 
@@ -437,18 +452,22 @@ Respond in JSON format with all applications ranked from most preferred (rank 1)
             else:
                 ranked_apps = result.get('ranked_applications', [])
 
-            # Validate all application IDs are present
-            ranked_ids = {app['id'] for app in ranked_apps}
-            expected_ids = {app['applicant_id'] for app in apps}
+            # Validate all applicant IDs are present
+            ranked_applicant_ids = {app['applicant_id'] for app in ranked_apps}
+            expected_applicant_ids = {app['applicant_id'] for app in apps}
 
-            if ranked_ids != expected_ids:
-                logger.debug(f"Ranked IDs (length: {len(ranked_ids)}): {ranked_ids}")
-                logger.debug(f"Expected IDs (length: {len(expected_ids)}): {expected_ids}")
-                ranked_apps = [app for app in ranked_apps if app['id'] in expected_ids & ranked_ids]
+            if ranked_applicant_ids != expected_applicant_ids:
+                logger.debug(f"Ranked applicant IDs (length: {len(ranked_applicant_ids)}): {ranked_applicant_ids}")
+                logger.debug(f"Expected applicant IDs (length: {len(expected_applicant_ids)}): {expected_applicant_ids}")
+                # Keep only ranked apps whose applicant_id is valid
+                ranked_apps = [app for app in ranked_apps if app['applicant_id'] in expected_applicant_ids]
 
-                for missing_id in expected_ids - ranked_ids:
+                # Append missing applicant IDs at the end with fallback ranking
+                matched_ids = {app['applicant_id'] for app in ranked_apps}
+                for missing_id in expected_applicant_ids - matched_ids:
                     ranked_apps.append({
-                        'id': missing_id,
+                        'application_id': -1,
+                        'applicant_id': missing_id,
                         'rank': len(ranked_apps) + 1,
                         'reason': ""
                     })
@@ -459,3 +478,28 @@ Respond in JSON format with all applications ranked from most preferred (rank 1)
             winners_all_programs[program_id] = ranked_apps_sorted[:num_winners]
 
         return winners_all_programs
+
+    @staticmethod
+    def validate_funding_result(result, apps):
+        """Check if a single funding evaluation result is valid."""
+        if result is None:
+            return False
+        ranked_apps = result if isinstance(result, list) else result.get('ranked_applications', [])
+        if not ranked_apps:
+            return False
+
+        # Check all expected applicant_ids are present
+        ranked_applicant_ids = {app.get('applicant_id') for app in ranked_apps}
+        expected_applicant_ids = {app['applicant_id'] for app in apps}
+        if ranked_applicant_ids > expected_applicant_ids:
+            return False
+
+        # Check application_id <-> applicant_id correspondence
+        # In the prompt, Application i has applicant_id = apps[i]['applicant_id']
+        id_to_applicant = {i: app['applicant_id'] for i, app in enumerate(apps)}
+        for app in ranked_apps:
+            app_id = app.get('application_id')
+            if app_id not in id_to_applicant or id_to_applicant[app_id] != app.get('applicant_id'):
+                return False
+
+        return True

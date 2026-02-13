@@ -111,34 +111,47 @@ Your current funding level is {self.resources}.
 
     def select_funding_programs(
             self,
-            funding_programs: List['FundingProgram'],
-            success_history: Optional[Dict[str, float]] = None,
-            num_submitted_proposals: int = 3
+            funding_programs: Dict[str, 'FundingProgram'],
+            past_accepted_papers: List[Dict],
+            past_rejected_papers: List[Dict],
     ) -> List[str]:
-        """Select funding programs to apply to based on expertise overlap and success rates
-
-        Args:
-            funding_programs: List of available FundingProgram objects
-            success_history: Dict mapping program_id -> historical success rate (0-1)
+        """Select funding programs based on paper topic overlap and expertise match.
 
         Returns:
-            List of selected program IDs
+            List of program_ids the agent should apply to.
         """
+        # Collect topics from past papers
+        paper_topics_lower = set()
+        for paper in past_accepted_papers + past_rejected_papers:
+            paper_topics_lower.update(t.lower() for t in paper.get('topics', []))
 
-        if not self.expertise:
-            return []
+        expertise_topics = {rd.topic for rd in self.expertise}
 
         scores = []
         for program_id, program in funding_programs.items():
-            # Calculate expertise overlap
-            # focus_areas: List[str] = [area.topic for area in program.focus_areas]
+            # Paper topic overlap score
+            if program.topics and paper_topics_lower:
+                overlap = sum(1 for t in program.topics if t.lower() in paper_topics_lower)
+                topic_score = overlap / len(program.topics)
+            else:
+                topic_score = 0
 
-            overlap = sum(1 for exp in self.expertise if exp in program.research_directions)
-            scores.append((program.program_id, overlap))
+            # Expertise overlap score (research direction matching)
+            program_dir_topics = {rd.topic for rd in program.research_directions}
+            expertise_overlap = len(expertise_topics & program_dir_topics) / max(len(program_dir_topics), 1)
 
-        # Select top 2-3 programs with score > 0.3
+            # Success history bonus
+            success_rate = 0.5  # neutral default
+            if self.funding_success_history and program_id in self.funding_success_history:
+                success_rate = min(1.0, len(self.funding_success_history[program_id]) * 0.2)
+
+            final_score = 0.4 * topic_score + 0.4 * expertise_overlap + 0.2 * success_rate
+            scores.append((program_id, final_score))
+
         scores.sort(key=lambda x: x[1], reverse=True)
-        return [pid for pid, score in scores[:num_submitted_proposals] if score >= 1]
+        # Return programs above threshold, at least 1
+        selected = [pid for pid, score in scores if score > 0.1]
+        return selected if selected else [scores[0][0]] if scores else []
 
     def funding_application_prompt(
             self,
@@ -176,6 +189,9 @@ The research proposal should:
 2. Leverage your expertise and past works, either accepted papers or preprints / rejected papers
 3. Emphasize feasibility and impact.
 
+## Important Notes
+- Applying to a funding is time-consuming. You should only apply to programs that are a good match to your papers and that you are confident about. 
+
 """
 
         # Build ordered list of all papers: accepted first, then rejected
@@ -210,13 +226,22 @@ Abstract: {paper['abstract']}
         prompt += f"""## Response Format
 Respond in JSON format. Set "submit" to true with a proposal and relevant projects to apply, or false with null proposal and empty list to skip.
 
-An example response is shown below (DO NOT directly copy the exact response):
+If you choose to submit, An example response (DO NOT directly copy the exact response):
 ```json
 {{
     "submit": true,
     "research_proposal": "Your 100-word proposal here.",
     "relevant_projects": [0, 2, 1] <- {citation_prompt}
 }}
+```
+If you choose not to submit, respond with the following JSON format:
+```json
+{{
+    "submit": false,
+    "research_proposal": "",
+    "relevant_projects": []
+}}
+
 ```
 
 """

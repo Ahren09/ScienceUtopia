@@ -635,11 +635,11 @@ class VLLMServerModel(BaseLLM):
 
         def _call_single(idx_prompt):
             idx, prompt = idx_prompt
-            prompt_with_notes = f"{prompt}\n{IMPORTANT_NOTES}"
+            
             msgs = []
             if system_prompt:
                 msgs.append({"role": "system", "content": system_prompt})
-            msgs.append({"role": "user", "content": prompt_with_notes})
+            msgs.append({"role": "user", "content": f"{IMPORTANT_NOTES}\n\n{prompt}"})
 
             success = False
             response_text = ""
