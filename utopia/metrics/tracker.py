@@ -93,17 +93,23 @@ def calculate_citation_metrics(citations: Dict[str, Set], papers_by_year: Dict[i
     self_citations = 0
     institutional_citations = 0
 
+    def _get_author_set(author_id):
+        """Normalize author_id to a set of author IDs."""
+        if isinstance(author_id, list):
+            return set(author_id)
+        return {author_id} if author_id else set()
+
     for cited_paper_id, citing_paper_ids in citations.items():
-        cited_author = paper_authors.get(cited_paper_id)
-        cited_institution = paper_institutions.get(cited_author)
+        cited_authors = _get_author_set(paper_authors.get(cited_paper_id))
+        cited_institutions = {paper_institutions.get(a) for a in cited_authors} - {None}
 
         for citing_paper_id in citing_paper_ids:
-            citing_author = paper_authors.get(citing_paper_id)
-            citing_institution = paper_institutions.get(citing_author)
+            citing_authors = _get_author_set(paper_authors.get(citing_paper_id))
+            citing_institutions = {paper_institutions.get(a) for a in citing_authors} - {None}
 
-            if cited_author == citing_author:
+            if cited_authors & citing_authors:
                 self_citations += 1
-            elif cited_institution and cited_institution == citing_institution:
+            elif cited_institutions & citing_institutions:
                 institutional_citations += 1
 
     return {

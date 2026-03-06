@@ -137,6 +137,15 @@ def parse_arguments():
         action='store_true',
         help='Funding assignment is weighted by the maturity of the paper'
     )
+    parser.add_argument(
+        '--collaboration_mode',
+        type=str,
+        default='cross_institute',
+        choices=['intra_institute', 'cross_institute'],
+        help='Collaboration mode for preferential attachment experiment: '
+             '"intra_institute" (same institution only) or "cross_institute" (different institutions only) '
+             '(default: cross_institute)'
+    )
 
     args = parser.parse_args()
 

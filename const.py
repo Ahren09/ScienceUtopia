@@ -24,5 +24,7 @@ NOTE:
 
 IMPORTANT_NOTES = """
 ## Important Notes
-* You MUST keep your thinking concise and to the point. DO NOT generate excessive reasoning.
+* You MUST keep your thinking concise, meaningfuls and to the point. DO NOT generate excessive but meaningless reasoning.
 """
+
+COI_NOTE = "(NOTE: This paper is from your own institution ({institution}). Potential conflict of interest: they may be competing for the same funding sources as you.)"

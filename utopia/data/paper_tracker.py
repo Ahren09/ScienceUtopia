@@ -9,7 +9,7 @@ references.
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import pandas as pd
 from langchain_core.documents import Document
@@ -23,8 +23,8 @@ class ArchivedPaper:
     id: str
     title: str
     abstract: str  # First 500 chars or full abstract
-    author_id: str
-    author_type: str
+    author_id: Union[str, List[str]]  # Single author or list for co-authored papers
+    author_type: Union[str, List[str]]  # Single type or list for co-authored papers
     year: int
     conference: str
     status: str  # 'pending', 'accept', 'reject'
@@ -34,6 +34,13 @@ class ArchivedPaper:
     project_end_year: int = 0
     maturity: int = 1
     review_history: List[Dict] = field(default_factory=list)  # [{"conference": str, "year": int, "score": float}]
+
+    @property
+    def all_author_ids(self) -> List[str]:
+        """Normalize author_id to a list (handles both single and co-authored papers)."""
+        if isinstance(self.author_id, list):
+            return self.author_id
+        return [self.author_id]
 
     def to_dict(self) -> Dict:
         """Convert to dictionary (for both serialization and resubmission)"""
@@ -228,12 +235,12 @@ class PaperTracker:
         else:
             raise ValueError(f"Invalid paper type: {paper_dict['type']}. Must be 'resubmission' or 'submission'")
 
-        # Update papers_by_author index
-        if archived_paper.author_id not in self.papers_by_author:
-            self.papers_by_author[archived_paper.author_id] = []
-
-        if archived_paper not in self.papers_by_author[archived_paper.author_id]:
-            self.papers_by_author[archived_paper.author_id].append(archived_paper)
+        # Update papers_by_author index (handles both single and co-authored papers)
+        for aid in archived_paper.all_author_ids:
+            if aid not in self.papers_by_author:
+                self.papers_by_author[aid] = []
+            if archived_paper not in self.papers_by_author[aid]:
+                self.papers_by_author[aid].append(archived_paper)
 
         year = paper_dict['year']
 
@@ -295,14 +302,20 @@ class PaperTracker:
         
 
     def get_papers_dataframe(self, year: int) -> pd.DataFrame:
-        """Get papers that have been accepted or rejected during a given year"""
+        """Get papers that have been accepted or rejected during a given year.
+
+        Uses lead (first) author_id and author_type for DataFrame compatibility
+        (e.g., set_index('author_id') requires hashable values).
+        """
         list_of_papers = []
         for paper in self.accepted_papers_by_year.get(year, {}).values():
+            aid = paper.author_id[0] if isinstance(paper.author_id, list) else paper.author_id
+            atype = paper.author_type[0] if isinstance(paper.author_type, list) else paper.author_type
             list_of_papers.append({
                 'id': paper.id,
                 'title': paper.title,
-                'author_id': paper.author_id,
-                'author_type': paper.author_type,
+                'author_id': aid,
+                'author_type': atype,
                 'year': paper.year,
                 'status': paper.status,
                 'project_start_year': paper.project_start_year,
@@ -310,11 +323,13 @@ class PaperTracker:
                 'maturity': paper.maturity,
             })
         for paper in self.rejected_papers_by_year.get(year, {}).values():
+            aid = paper.author_id[0] if isinstance(paper.author_id, list) else paper.author_id
+            atype = paper.author_type[0] if isinstance(paper.author_type, list) else paper.author_type
             list_of_papers.append({
                 'id': paper.id,
                 'title': paper.title,
-                'author_id': paper.author_id,
-                'author_type': paper.author_type,
+                'author_id': aid,
+                'author_type': atype,
                 'year': paper.year,
                 'status': paper.status,
                 'project_start_year': paper.project_start_year,
@@ -403,8 +418,9 @@ class PaperTracker:
                     archive.pending_papers_by_year[paper.year] = {}
                 archive.pending_papers_by_year[paper.year][paper.id] = paper
 
-            if paper.author_id not in archive.papers_by_author:
-                archive.papers_by_author[paper.author_id] = []
-            archive.papers_by_author[paper.author_id].append(paper)
+            for aid in paper.all_author_ids:
+                if aid not in archive.papers_by_author:
+                    archive.papers_by_author[aid] = []
+                archive.papers_by_author[aid].append(paper)
 
         return archive

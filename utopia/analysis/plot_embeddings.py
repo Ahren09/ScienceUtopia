@@ -106,7 +106,8 @@ def build_embedding_dataframe(
             skipped += 1
             continue
         valid_indices.append(idx)
-        topic = resolve_topic(p['author_id'], p['project_start_year'], author_directions)
+        lead_author = p['author_id'][0] if isinstance(p['author_id'], list) else p['author_id']
+        topic = resolve_topic(lead_author, p['project_start_year'], author_directions)
         rows.append({
             'id': p['id'],
             'sim_year': p['sim_year'],

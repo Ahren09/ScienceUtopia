@@ -73,6 +73,15 @@ SIMULATION_CONFIG = {
         'min_citations_for_cd': 5,  # Minimum citations to calculate CD index
     },
 
+    # Preferential Attachment Experiment
+    'preferential_attachment_experiment': {
+        'max_new_collaborations_per_year': 2,
+        'min_similarity_threshold': 0.1,
+        'top_k_candidates': 3,
+        'collaboration_mode': 'cross_institute',  # 'intra_institute' or 'cross_institute'
+        'max_collaborations_per_agent': 1,  # per round
+    },
+
     # Weights & Biases logging
     'wandb': {
         'enabled': True,           # Set to True to enable wandb logging

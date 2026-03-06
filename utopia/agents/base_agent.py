@@ -9,7 +9,7 @@ import hashlib
 import logging
 import subprocess
 import time
-from typing import List, Dict, Set, Union, Tuple
+from typing import List, Dict, Optional, Set, Union, Tuple
 from pydantic import BaseModel
 import networkx as nx
 from langchain_core.documents import Document
@@ -22,7 +22,7 @@ from utopia.config import SIMULATION_CONFIG
 from utopia.data.paper_tracker import PaperTracker
 from utopia.models.models import BaseLLM
 from utopia.utils.data_utils import top_percentile
-
+from const import COI_NOTE
 logger = logging.getLogger(__name__)
 
 
@@ -38,6 +38,11 @@ class CitationResponse(BaseModel):
 
 class SelfCitationResponse(BaseModel):
     self_citations: List[int]
+
+class CollaborationDecision(BaseModel):
+    collaborate: bool
+    collaborator_id: Optional[str] = None
+    reason: str
 
 class MultiAgentEcosystem:
     """
@@ -424,11 +429,13 @@ Respond in JSON format. An example response is below (DO NOT directly copy the e
         }
         return prompt, response_format
     
-    def get_review_prompt(self, paper: Dict) -> Tuple[str, Dict]:
+    def get_review_prompt(self, paper: Dict, author_info: Dict = None) -> Tuple[str, Dict]:
         """Build review prompt for a paper (without calling LLM)
 
         Args:
             paper: Paper dictionary with 'title', 'content', 'topics', etc.
+            author_info: Optional dict with author identity for non-blind review.
+                Keys: 'author_name', 'institution', 'network_relationship'.
 
         Returns:
             Prompt string for review generation, response format
@@ -443,6 +450,16 @@ Respond in JSON format. An example response is below (DO NOT directly copy the e
         else:
             memory_context = ""
 
+        # Non-blind author information (preferential_attachment experiment)
+        author_context = ""
+        if author_info:
+            author_context = f"""## Author Information (Non-Blind Review)
+- Author: {author_info['author_name']}
+- Institution: {author_info['institution']}
+- Your relationship: {author_info['network_relationship']}
+
+"""
+
         prompt = f"""You are a peer reviewer for an academic conference. Review the following paper based on your expertise and past experiences (e.g. your own past submissions, received reviews, your funding situations, your status level).
 
 Your Expertise: {', '.join(expertise)}
@@ -456,7 +473,7 @@ Abstract:
 
 Paper Topics: {', '.join(paper['topics'])}
 
-{memory_context}
+{author_context}{memory_context}
 
 ## Review Instructions
 Provide a comprehensive review with:
@@ -486,16 +503,17 @@ Provide a comprehensive review with:
 
         return prompt, response_format
 
-    def review_paper(self, paper: Dict) -> Dict:
+    def review_paper(self, paper: Dict, author_info: Dict = None) -> Dict:
         """Generate review for a paper using LLM
 
         Args:
             paper: Paper dictionary with 'title', 'content', 'topics', etc.
+            author_info: Optional dict with author identity for non-blind review.
 
         Returns:
             Review dictionary with 'overall_score', 'strengths', 'weaknesses', 'summary'
         """
-        prompt = self.get_review_prompt(paper)
+        prompt = self.get_review_prompt(paper, author_info=author_info)
 
         review_json, message_history = self.llm.generate(prompt=prompt)
         assert all(field in review_json for field in ['overall_score', "justification"])
@@ -674,89 +692,6 @@ If you choose not to resubmit, respond with a json file that contains an empty l
 
     # Helper methods (private)
 
-    def _parse_pipeline_output(self, result: subprocess.CompletedProcess, output_dir: str) -> Dict:
-        """Parse output from AI-Scientist pipeline"""
-        if result.returncode != 0:
-            raise RuntimeError(f"Pipeline failed: {result.stderr}")
-
-        # Try to read generated files
-        import os
-        paper_output = {
-            'writeup_md': '',
-            'plot_py': '',
-            'experiment_py': '',
-            'success': result.returncode == 0,
-            'stdout': result.stdout,
-            'stderr': result.stderr
-        }
-
-        # Check if output files exist and read them
-        if os.path.exists(output_dir):
-            for file in os.listdir(output_dir):
-                if file.endswith('.md'):
-                    with open(os.path.join(output_dir, file), 'r') as f:
-                        paper_output['writeup_md'] = f.read()
-                elif file.endswith('.py') and 'plot' in file:
-                    with open(os.path.join(output_dir, file), 'r') as f:
-                        paper_output['plot_py'] = f.read()
-                elif file.endswith('.py') and 'experiment' in file:
-                    with open(os.path.join(output_dir, file), 'r') as f:
-                        paper_output['experiment_py'] = f.read()
-
-        return paper_output
-
-    def _add_traceable_citations(self, paper_output: Dict, references: List) -> Dict:
-        """Ensure every paper has traceable citations with complete metadata"""
-        citation_list = []
-
-        # Extract citations from paper content and enrich with metadata
-        cited_papers = self._extract_citations_from_content(paper_output.get('writeup_md', ''))
-
-        for i, cited_paper in enumerate(cited_papers):
-            # Create structured citation entry with traceable fields
-            citation_entry = {
-                'id': cited_paper.get('paper_id', f"paper_{hashlib.md5(str(cited_paper).encode()).hexdigest()[:8]}"),
-                'title': cited_paper.get('title', f'Unknown Title {i + 1}'),
-                'authors': cited_paper.get('authors', ['Unknown Author']),
-                'venue': cited_paper.get('venue', 'Unknown Venue'),
-                'year': cited_paper.get('year', 'Unknown Year'),
-                'abstract': cited_paper.get('abstract', ''),
-                'paper_type': cited_paper.get('paper_type', 'human_written'),  # human_written or ai_generated
-                'agent_author': cited_paper.get('agent_author', None),  # If AI-generated, track which agent
-                'citation_context': cited_paper.get('context', ''),  # How this paper relates to the citing work
-                'semantic_scholar_id': cited_paper.get('s2_id', None),  # For real papers
-                'simulation_id': cited_paper.get('sim_id', None)  # For simulation-generated papers
-            }
-            citation_list.append(citation_entry)
-
-        # Add structured citation list to paper output
-        paper_output['citations'] = citation_list
-        paper_output['citation_metadata'] = {
-            'total_citations': len(citation_list),
-            'human_papers_cited': len([c for c in citation_list if c['paper_type'] == 'human_written']),
-            'ai_papers_cited': len([c for c in citation_list if c['paper_type'] == 'ai_generated']),
-            'citation_diversity_score': self._calculate_citation_diversity(citation_list)
-        }
-
-        return paper_output
-
-    def _extract_citations_from_content(self, content: str) -> List[Dict]:
-        """Extract citations from paper content - simplified implementation"""
-        # Simple implementation - in practice would use more sophisticated parsing
-        citations = []
-        # For now, return empty list - would implement actual citation extraction
-        return citations
-
-    def _calculate_citation_diversity(self, citation_list: List[Dict]) -> float:
-        """Calculate citation diversity score"""
-        if not citation_list:
-            return 0.0
-
-        # Simple diversity measure: ratio of unique venues
-        unique_venues = len(set(c['venue'] for c in citation_list))
-        total_citations = len(citation_list)
-        return unique_venues / total_citations if total_citations > 0 else 0.0
-
     def _record_authoring_experience(self, idea: Dict, paper_output: Dict, year: int):
         """Record paper authoring experience"""
         self.memory_bank.append({
@@ -894,7 +829,7 @@ If you choose not to submit (only due to funding issues), explain using factors 
         }
         return prompt, response_format
 
-    def get_citation_prompt(self, paper: Dict, direction: ResearchDirection, candidate_papers: List[Dict], max_papers: int = 10) -> Tuple[str, Dict]:
+    def get_citation_prompt(self, paper: Dict, direction: ResearchDirection, candidate_papers: List[Dict], max_papers: int = 10, citing_institution: str = None) -> Tuple[str, Dict]:
         """
         Get potential cited papers prompt for this agent
         """
@@ -917,9 +852,13 @@ Topics: {', '.join(paper['topics'])}
 
 """
         for i, cited_paper in enumerate(candidate_papers[:max_papers]):
+            coi_note = ""
+            if citing_institution and cited_paper['institution'] == citing_institution:
+                coi_note = COI_NOTE.format(institution=citing_institution)
             prompt += f"""Paper {i}
 - arXiv ID: {cited_paper['id']}
 - Title: {cited_paper['title']}
+- Author Affiliation: {cited_paper['institution']}{coi_note}
 - Abstract: {cited_paper['abstract'][:300]}...
 
 """
@@ -978,8 +917,7 @@ Keywords: {', '.join(direction['direction'].keywords)}
         paper_idx = 0
         
         accepted_papers = [p for p in own_papers if p.status == 'accept']
-        rejected_papers = [p for p in own_papers if p.status == 'reject']
-        assert len(accepted_papers) + len(rejected_papers) == len(own_papers)
+        rejected_papers = [p for p in own_papers if p.status != 'accept']
         
         for i, own_paper in enumerate(accepted_papers):
             latest_score = own_paper.review_history[-1]['score'] if own_paper.review_history else 0.0
@@ -1048,3 +986,62 @@ Respond in JSON format with the numeric ids (integers) of the candidate papers y
 """
 
         return prompt
+
+    def get_collaboration_decision_prompt(self, candidates: List[Dict]) -> Tuple[str, Dict]:
+        """Build prompt for collaboration decision.
+
+        Args:
+            candidates: List of dicts with keys: id, institution, expertise, recent_papers, score
+
+        Returns:
+            Tuple of (prompt string, response_format dict)
+        """
+        expertise = [e.topic if hasattr(e, 'topic') else str(e) for e in getattr(self, 'expertise', [])]
+        institution = getattr(self, 'university_name', None) or getattr(self, 'company_name', None) or 'Unknown'
+
+        prompt = f"""You are a researcher at {institution}, specializing in {', '.join(expertise)}.
+
+## Your Task
+You are considering whether to collaborate with another researcher on your next paper. Collaborating can combine complementary expertise and improve paper quality, but requires coordination.
+
+## Candidate Collaborators
+"""
+        for i, c in enumerate(candidates):
+            prompt += f"""### Candidate {i}
+- ID: "{c['id']}"
+- Institution: {c['institution']}
+- Expertise: {', '.join(c['expertise'])}
+- Recent papers: {c['recent_papers']}
+- Compatibility score: {c['score']:.2f}
+
+"""
+
+        prompt += """## Instructions
+Decide whether to collaborate with one of the candidates or work solo this round. If you collaborate, specify the collaborator_id exactly as shown above.
+
+## Response Format
+```json
+{
+    "collaborate": true,
+    "collaborator_id": "candidate_id_here",
+    "reason": "Brief explanation"
+}
+```
+Or if working solo:
+```json
+{
+    "collaborate": false,
+    "collaborator_id": null,
+    "reason": "Brief explanation"
+}
+```
+"""
+        response_format = {
+            'type': 'json_schema',
+            'json_object': {
+                'name': 'collaboration_decision',
+                'strict': True,
+                'schema': CollaborationDecision.model_json_schema()
+            },
+        }
+        return prompt, response_format

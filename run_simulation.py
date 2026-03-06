@@ -110,8 +110,10 @@ class Simulation:
         self.weighted_funding_assignment = kwargs.get('weighted_funding_assignment', False)
         self.funding_allocation_mode = kwargs.get('funding_allocation_mode', 'consumption_based')
         self.experiment_name = kwargs.get('experiment_name', 'default')
-        
-        assert self.experiment_name.startswith('default') or self.experiment_name in ['exploration_vs_exploitation'], f"Invalid experiment name: {self.experiment_name}"
+        self.collaboration_mode = kwargs.get('collaboration_mode',
+                                              SIMULATION_CONFIG['preferential_attachment_experiment']['collaboration_mode'])
+
+        assert self.experiment_name.startswith('default') or self.experiment_name in ['exploration_vs_exploitation', 'preferential_attachment'], f"Invalid experiment name: {self.experiment_name}"
 
         # Store args for backward compatibility with existing code
         if args is None:
@@ -148,6 +150,11 @@ class Simulation:
         self.cd_calculator = None
         self.exploration_metrics = None
         self.keyword_extractor = None
+
+        # Preferential attachment experiment trackers (lazily initialized)
+        self.collaboration_tracker = None
+        self.network_metrics = None
+        self._collaboration_pairs = {}  # {year: {lead_id: co_author_id}}
 
     @property
     def is_exploration_experiment(self) -> bool:
@@ -425,7 +432,7 @@ class Simulation:
         exp_config = SIMULATION_CONFIG['exploration_experiment']
 
         # Compute topic distances for papers submitted this year (batch)
-        papers_this_year = [(p.id, p.author_id) for p in self.paper_tracker.papers_by_id.values()
+        papers_this_year = [(p.id, p.all_author_ids[0]) for p in self.paper_tracker.papers_by_id.values()
                             if p.year == year]
         paper_ids_this_year = [pid for pid, _ in papers_this_year]
 
@@ -472,6 +479,275 @@ class Simulation:
                     )
 
         logger.info(f"Year {year}: Collected exploration metrics for {len(paper_ids_this_year)} papers")
+
+    # ==================== Preferential Attachment Experiment ====================
+
+    def _initialize_preferential_attachment_trackers(self):
+        """Lazily initialize trackers for the preferential attachment experiment."""
+        if self.experiment_name != 'preferential_attachment':
+            return
+        if self.collaboration_tracker is None:
+            from utopia.data.collaboration_tracker import CollaborationTracker
+            self.collaboration_tracker = CollaborationTracker()
+        if self.network_metrics is None:
+            from utopia.metrics.network_metrics import NetworkMetrics
+            self.network_metrics = NetworkMetrics()
+
+    def _run_phase_1_5_collaboration_formation(self, year: int, directions: Dict,
+                                                active_authors: List, year_results: Dict):
+        """Phase 1.5: Form collaboration pairs for co-authored papers.
+
+        Hybrid approach: heuristic scoring filters candidates, then LLM decides.
+        Only runs for the preferential_attachment experiment.
+        """
+        if self.experiment_name != 'preferential_attachment':
+            return
+
+        self._initialize_preferential_attachment_trackers()
+
+        pa_config = SIMULATION_CONFIG['preferential_attachment_experiment']
+        top_k = pa_config['top_k_candidates']
+        collaboration_mode = self.collaboration_mode
+
+        # Build topic vectors for all active authors
+        agent_topics = {}
+        for agent in active_authors:
+            direction = directions.get(agent.id)
+            keywords = set()
+            if direction and direction.get('direction'):
+                d = direction['direction']
+                keywords = set(getattr(d, 'keywords', []))
+            expertise_topics = {e.topic if hasattr(e, 'topic') else str(e)
+                                for e in getattr(agent, 'expertise', [])}
+            agent_topics[agent.id] = keywords | expertise_topics
+
+        def _get_institution(agent):
+            return getattr(agent, 'university_name', None) or getattr(agent, 'company_name', None)
+
+        # --- Step 1: Heuristic scoring for each agent ---
+        agent_candidates = {}  # agent_id -> [(candidate_id, score, candidate_info_dict)]
+
+        active_author_ids = set(a.id for a in active_authors)
+        for agent in active_authors:
+            topics_a = agent_topics.get(agent.id, set())
+            if not topics_a:
+                continue
+
+            inst_a = _get_institution(agent)
+            recent_papers_a = self.paper_tracker.get_papers_by_author(agent.id)
+            recent_topics_a = set()
+            for p in sorted(recent_papers_a, key=lambda x: x.year, reverse=True)[:3]:
+                recent_topics_a.update(p.topics)
+
+            scored = []
+            for other in active_authors:
+                if other.id == agent.id:
+                    continue
+                inst_b = _get_institution(other)
+
+                # Filter by collaboration mode
+                if collaboration_mode == 'intra_institute' and inst_a != inst_b:
+                    continue
+                if collaboration_mode == 'cross_institute' and inst_a == inst_b:
+                    continue
+
+                topics_b = agent_topics.get(other.id, set())
+                union = topics_a | topics_b
+                if not union:
+                    continue
+
+                # Topic overlap (Jaccard): weight 0.4
+                topic_score = len(topics_a & topics_b) / len(union)
+
+                # Recent publication overlap: weight 0.4
+                recent_papers_b = self.paper_tracker.get_papers_by_author(other.id)
+                recent_topics_b = set()
+                for p in sorted(recent_papers_b, key=lambda x: x.year, reverse=True)[:3]:
+                    recent_topics_b.update(p.topics)
+                pub_union = recent_topics_a | recent_topics_b
+                pub_score = len(recent_topics_a & recent_topics_b) / len(pub_union) if pub_union else 0.0
+
+                # Network proximity bonus: weight 0.2
+                net_score = 0.0
+                if self.collaboration_tracker.graph.has_node(agent.id) and self.collaboration_tracker.graph.has_node(other.id):
+                    dist = self.collaboration_tracker.get_network_distance(agent.id, other.id)
+                    if dist == 1:
+                        net_score = 1.0
+                    elif dist == 2:
+                        net_score = 0.5
+
+                final_score = 0.4 * topic_score + 0.4 * pub_score + 0.2 * net_score
+                if final_score > pa_config['min_similarity_threshold']:
+                    expertise_b = [e.topic if hasattr(e, 'topic') else str(e) for e in getattr(other, 'expertise', [])]
+                    recent_paper_titles = [p.title for p in sorted(recent_papers_b, key=lambda x: x.year, reverse=True)[:3]]
+                    scored.append((other.id, final_score, {
+                        'id': other.id,
+                        'institution': inst_b or 'Unknown',
+                        'expertise': expertise_b,
+                        'recent_papers': '; '.join(recent_paper_titles) if recent_paper_titles else 'None',
+                        'score': final_score,
+                    }))
+
+            scored.sort(key=lambda x: x[1], reverse=True)
+            agent_candidates[agent.id] = scored[:top_k]
+
+        # --- Step 2: LLM collaboration decision ---
+        supports_batching = hasattr(self.llm, 'generate_batch')
+        collab_decisions = {}  # agent_id -> (collaborate, collaborator_id)
+
+        if supports_batching:
+            batch_prompts = []
+            batch_metadata = []
+            collab_response_format = None
+
+            for agent in active_authors:
+                candidates = agent_candidates.get(agent.id, [])
+                if not candidates:
+                    continue
+                candidate_infos = [c[2] for c in candidates]
+                prompt, response_format = agent.get_collaboration_decision_prompt(candidate_infos)
+                batch_prompts.append(prompt)
+                batch_metadata.append({'agent': agent, 'candidate_ids': [c[0] for c in candidates]})
+                if collab_response_format is None:
+                    collab_response_format = response_format
+
+            if batch_prompts:
+                batch_results = self.llm.generate_batch(
+                    batch_prompts, response_format=collab_response_format,
+                    desc=f"{len(batch_prompts)} collaboration decisions"
+                )
+                for i, (result, _) in enumerate(batch_results):
+                    meta = batch_metadata[i]
+                    agent_id = meta['agent'].id
+                    if result and result.get('collaborate') and result.get('collaborator_id'):
+                        cid = result['collaborator_id']
+                        if cid in meta['candidate_ids']:
+                            collab_decisions[agent_id] = (True, cid)
+        else:
+            for agent in active_authors:
+                candidates = agent_candidates.get(agent.id, [])
+                if not candidates:
+                    continue
+                candidate_infos = [c[2] for c in candidates]
+                prompt, response_format = agent.get_collaboration_decision_prompt(candidate_infos)
+                result, _ = self.llm.generate(prompt=prompt, response_format=response_format)
+                if result and result.get('collaborate') and result.get('collaborator_id'):
+                    cid = result['collaborator_id']
+                    candidate_ids = [c[0] for c in candidates]
+                    if cid in candidate_ids:
+                        collab_decisions[agent.id] = (True, cid)
+
+        # --- Step 3: Form pairs (mutual or one-sided matching) ---
+        claimed = set()
+        collaboration_pairs = {}  # lead_id -> co_author_id
+
+        for agent_id, (_, chosen_id) in collab_decisions.items():
+            if agent_id in claimed or chosen_id in claimed:
+                continue
+
+            # Check if mutual (both chose each other)
+            other_decision = collab_decisions.get(chosen_id)
+            is_mutual = other_decision and other_decision[1] == agent_id
+
+            # Check if one-sided (chosen_id didn't choose anyone else)
+            chosen_available = chosen_id not in collab_decisions or is_mutual
+
+            if is_mutual or chosen_available:
+                collaboration_pairs[agent_id] = chosen_id
+                claimed.add(agent_id)
+                claimed.add(chosen_id)
+
+                # Update collaboration tracker and COI
+                self.collaboration_tracker.add_collaboration(agent_id, chosen_id, year)
+                agent_a = self.ecosystem.get_agent_by_id(agent_id)
+                agent_b = self.ecosystem.get_agent_by_id(chosen_id)
+                agent_a.add_conflict_of_interest(chosen_id)
+                agent_b.add_conflict_of_interest(agent_id)
+
+        self._collaboration_pairs[year] = collaboration_pairs
+
+        # Record network snapshot
+        basic_metrics = self.collaboration_tracker.compute_metrics()
+        self.network_metrics.record_network_snapshot(year, basic_metrics)
+
+        year_results['collaboration_formation'] = {
+            'new_pairs': len(collaboration_pairs),
+            'total_edges': self.collaboration_tracker.graph.number_of_edges(),
+            'total_nodes': self.collaboration_tracker.graph.number_of_nodes(),
+            **basic_metrics,
+        }
+
+        logger.info(f"Year {year} Phase 1.5: Formed {len(collaboration_pairs)} collaboration pairs "
+                     f"(total: {self.collaboration_tracker.graph.number_of_edges()} edges, "
+                     f"{self.collaboration_tracker.graph.number_of_nodes()} nodes)")
+
+    def _apply_coauthorship(self, paper_dict: Dict, agent, year: int):
+        """If agent has a collaboration partner this round, update paper_dict with co-author info."""
+        collab_pairs = self._collaboration_pairs.get(year, {})
+        co_author_id = collab_pairs.get(agent.id)
+        if co_author_id:
+            co_author = self.ecosystem.get_agent_by_id(co_author_id)
+            paper_dict['author_id'] = [agent.id, co_author_id]
+            paper_dict['author_type'] = [agent.get_type(), co_author.get_type()]
+
+    @staticmethod
+    def _get_lead_author_id(paper: Dict) -> str:
+        """Get the lead (first) author ID from a paper dict, handling both single and co-authored papers."""
+        aid = paper['author_id']
+        return aid[0] if isinstance(aid, list) else aid
+
+    @staticmethod
+    def _get_all_author_ids(paper: Dict) -> List[str]:
+        """Get all author IDs from a paper dict as a list."""
+        aid = paper['author_id']
+        return aid if isinstance(aid, list) else [aid]
+
+    def _describe_network_relationship(self, distance: int) -> str:
+        """Describe the collaboration network relationship for non-blind review prompts."""
+        if distance == 1:
+            return "You have directly collaborated with this author before."
+        elif distance == 2:
+            return "You share a mutual collaborator with this author (2-hop connection)."
+        elif distance == 3:
+            return "You have a distant connection through the collaboration network (3 hops)."
+        elif distance > 3:
+            return f"You are distantly connected ({distance} hops away in the collaboration network)."
+        else:
+            return "You have no collaboration history with this author."
+
+    def _build_author_info_for_review(self, reviewer, paper: Dict) -> Dict:
+        """Build author info dict for non-blind review in the preferential attachment experiment.
+
+        Returns None if the experiment is not active.
+        """
+        if self.experiment_name != 'preferential_attachment' or not self.collaboration_tracker:
+            return None
+
+        lead_id = self._get_lead_author_id(paper)
+        author = self.ecosystem.get_agent_by_id(lead_id)
+        institution = getattr(author, 'university_name', None) or getattr(author, 'company_name', None) or 'Unknown'
+        distance = self.collaboration_tracker.get_network_distance(reviewer.id, lead_id)
+
+        return {
+            'author_name': lead_id,
+            'institution': institution,
+            'network_relationship': self._describe_network_relationship(distance),
+            'network_distance': distance,
+        }
+
+    def _collect_preferential_attachment_metrics(self, year: int):
+        """Collect preferential attachment metrics at end of year."""
+        if self.experiment_name != 'preferential_attachment':
+            return
+        self._initialize_preferential_attachment_trackers()
+
+        all_metrics = self.network_metrics.compute_all_metrics(
+            year, self.collaboration_tracker, self.ecosystem
+        )
+        if all_metrics.get('pearson_r') is not None:
+            logger.info(f"Year {year}: Distance-score correlation: "
+                        f"Pearson r={all_metrics['pearson_r']:.3f} (p={all_metrics['pearson_p']:.4f}), "
+                        f"Spearman r={all_metrics['spearman_r']:.3f}")
 
     def _setup_year(self, year: int) -> Dict:
         """Setup year: log start, reset funding tracker, reset conferences
@@ -754,6 +1030,26 @@ class Simulation:
 
         return directions, active_authors, average_funding_level
 
+    def _build_candidate_papers(self, rag_documents, indices):
+        """Build enriched candidate paper dicts with author_id and institution."""
+        candidate_papers = []
+        for idx in indices:
+            paper = rag_documents[idx]
+            paper_id = paper.metadata['id']
+            archived = self.paper_tracker.papers_by_id[paper_id]
+            lead_id = archived.all_author_ids[0]
+            cp_agent = self.ecosystem.get_agent_by_id(lead_id)
+            institution = getattr(cp_agent, 'university_name', None) or getattr(cp_agent, 'company_name', None)
+            assert institution is not None, f"Paper {paper_id} has no valid institution."
+            candidate_papers.append({
+                'id': paper_id,
+                'title': paper.metadata['title'],
+                'abstract': paper.page_content,
+                'author_id': lead_id,
+                'institution': institution,
+            })
+        return candidate_papers
+
     def _run_phase_2_submit_papers(self, year: int, directions: Dict, active_authors: List,
                                     resubmissions_list: List[Dict], year_results: Dict) -> List[Dict]:
         """Phase 2: Generate and submit papers
@@ -769,6 +1065,15 @@ class Simulation:
             submissions_list: List of newly submitted papers (not resubmissions)
         """
         logger.info(f"Year {year} Phase 2: Submitting papers...")
+
+        # Identify co-authors claimed by collaboration pairs (they don't submit their own paper)
+        collab_pairs = self._collaboration_pairs.get(year, {})
+        co_author_ids = set(collab_pairs.values())
+        if co_author_ids:
+            original_count = len(active_authors)
+            active_authors = [a for a in active_authors if a.id not in co_author_ids]
+            logger.info(f"Phase 2: {original_count - len(active_authors)} agents are co-authors this round, "
+                        f"{len(active_authors)} agents will submit as lead authors")
 
         # ---- Load RAG index if needed (before intention generation) ----
         if year == 1:
@@ -975,6 +1280,7 @@ class Simulation:
                         'maturity': directions[agent.id]['direction'].years,
                         'status': 'pending'
                     }
+                    self._apply_coauthorship(paper_dict, agent, year)
 
                     message_history_dict[agent.id] = message_history
 
@@ -1052,6 +1358,7 @@ class Simulation:
                         'maturity': directions[agent.id]['direction'].years,
                         'status': 'pending'
                     }
+                    self._apply_coauthorship(paper_dict, agent, year)
 
                     message_history_dict[agent.id] = fallback_info['message_history']
                     submissions_list.append(paper_dict)
@@ -1152,6 +1459,7 @@ class Simulation:
                         'maturity': directions[agent.id]['direction'].years,
                         'status': 'pending'
                     }
+                    self._apply_coauthorship(paper_dict, agent, year)
 
                     message_history_dict[agent.id] = message_history
 
@@ -1198,20 +1506,20 @@ class Simulation:
 
                 for i in range(len(submissions_list)):
                     submitted_paper = submissions_list[i]
-                    agent = self.ecosystem.get_agent_by_id(submitted_paper['author_id'])
-                    candidate_papers = [self.rag.documents[idx] for idx in topk_indices_citation_accepted[i][
-                                                                           :SIMULATION_CONFIG['citation'][
-                                                                               'num_candidate_papers']]]
-                    candidate_papers = [
-                        {'id': paper.metadata['id'], 'title': paper.metadata['title'], 'abstract': paper.page_content}
-                        for paper in candidate_papers]
+                    agent = self.ecosystem.get_agent_by_id(self._get_lead_author_id(submitted_paper))
+                    candidate_papers = self._build_candidate_papers(
+                        self.rag.documents,
+                        topk_indices_citation_accepted[i][:SIMULATION_CONFIG['citation']['num_candidate_papers']]
+                    )
 
                     assert set([cp['id'] for cp in candidate_papers]) <= accepted_papers_arxiv_ids, \
                         f"Submitted paper {submitted_paper['id']} is trying to cite non-accepted papers"
-
+                    citing_institution = getattr(agent, 'university_name', None) or getattr(agent, 'company_name', None)
+                    assert citing_institution is not None, f"Agent {agent.id} has no valid institution."
                     prompt, response_format = agent.get_citation_prompt(
                         paper=submitted_paper, direction=directions[agent.id],
-                        candidate_papers=candidate_papers, max_papers=30
+                        candidate_papers=candidate_papers, max_papers=30,
+                        citing_institution=citing_institution
                     )
                     batch_prompts.append(prompt)
                     batch_metadata.append({
@@ -1257,9 +1565,11 @@ class Simulation:
                     batch_prompts = []
                     batch_metadata = []
                     for meta in items_needing_retry:
+                        citing_inst = getattr(meta['agent'], 'university_name', None) or getattr(meta['agent'], 'company_name', None)
                         prompt, _ = meta['agent'].get_citation_prompt(
                             paper=meta['paper'], direction=directions[meta['agent'].id],
-                            candidate_papers=meta['candidate_papers'], max_papers=30
+                            candidate_papers=meta['candidate_papers'], max_papers=30,
+                            citing_institution=citing_inst
                         )
                         batch_prompts.append(prompt)
                         batch_metadata.append(meta)
@@ -1278,17 +1588,17 @@ class Simulation:
                 for i in range(len(submissions_list)):
                     if len(regular_citations[i]) <= SIMULATION_CONFIG['citation']['expected_citation_per_round']:
                         submitted_paper = submissions_list[i]
-                        agent = self.ecosystem.get_agent_by_id(submitted_paper['author_id'])
-                        candidate_papers = [self.rag.documents[idx] for idx in topk_indices_citation_both[i][
-                                                                               :SIMULATION_CONFIG['citation'][
-                                                                                   'num_candidate_papers']]]
-                        candidate_papers = [
-                            {'id': paper.metadata['id'], 'title': paper.metadata['title'], 'abstract': paper.page_content}
-                            for paper in candidate_papers]
+                        agent = self.ecosystem.get_agent_by_id(self._get_lead_author_id(submitted_paper))
+                        candidate_papers = self._build_candidate_papers(
+                            self.rag.documents,
+                            topk_indices_citation_both[i][:SIMULATION_CONFIG['citation']['num_candidate_papers']]
+                        )
 
+                        citing_institution = getattr(agent, 'university_name', None) or getattr(agent, 'company_name', None)
                         prompt, response_format = agent.get_citation_prompt(
                             paper=submitted_paper, direction=directions[agent.id],
-                            candidate_papers=candidate_papers, max_papers=30
+                            candidate_papers=candidate_papers, max_papers=30,
+                            citing_institution=citing_institution
                         )
                         batch_prompts.append(prompt)
                         batch_metadata.append({
@@ -1331,9 +1641,11 @@ class Simulation:
                     batch_prompts = []
                     batch_metadata = []
                     for meta in items_needing_retry:
+                        citing_inst = getattr(meta['agent'], 'university_name', None) or getattr(meta['agent'], 'company_name', None)
                         prompt, _ = meta['agent'].get_citation_prompt(
                             paper=meta['paper'], direction=directions[meta['agent'].id],
-                            candidate_papers=meta['candidate_papers'], max_papers=30
+                            candidate_papers=meta['candidate_papers'], max_papers=30,
+                            citing_institution=citing_inst
                         )
                         batch_prompts.append(prompt)
                         batch_metadata.append(meta)
@@ -1346,9 +1658,9 @@ class Simulation:
 
                 for i in range(len(submissions_list)):
                     submitted_paper = submissions_list[i]
-                    agent = self.ecosystem.get_agent_by_id(submitted_paper['author_id'])
+                    agent = self.ecosystem.get_agent_by_id(self._get_lead_author_id(submitted_paper))
                     own_papers = self.paper_tracker.get_papers_by_author(agent.id)
-                    own_papers = [p for p in own_papers if p.project_end_year < year and p.status != 'pending']
+                    own_papers = [p for p in own_papers if p.project_end_year < year]
                     if not own_papers:
                         continue
 
@@ -1419,23 +1731,22 @@ class Simulation:
                 # ==================== SEQUENTIAL PATH (GPT/OpenAI) ====================
                 for i in range(len(submissions_list)):
                     submitted_paper = submissions_list[i]
-                    agent = self.ecosystem.get_agent_by_id(submitted_paper['author_id'])
-                    candidate_papers = [self.rag.documents[idx] for idx in topk_indices_citation_accepted[i][
-                                                                           :SIMULATION_CONFIG['citation'][
-                                                                               'num_candidate_papers']]]
-
-                    candidate_papers = [
-                        {'id': paper.metadata['id'], 'title': paper.metadata['title'], 'abstract': paper.page_content} for
-                        paper in candidate_papers]
+                    agent = self.ecosystem.get_agent_by_id(self._get_lead_author_id(submitted_paper))
+                    candidate_papers = self._build_candidate_papers(
+                        self.rag.documents,
+                        topk_indices_citation_accepted[i][:SIMULATION_CONFIG['citation']['num_candidate_papers']]
+                    )
 
                     assert set([candidate_paper['id'] for candidate_paper in
                                 candidate_papers]) <= accepted_papers_arxiv_ids, f"Submitted paper {submitted_paper['id']} is trying to cite non-accepted papers"
 
+                    citing_institution = getattr(agent, 'university_name', None) or getattr(agent, 'company_name', None)
                     prompt, response_format = agent.get_citation_prompt(
                         paper=submitted_paper,
                         direction=directions[agent.id],
                         candidate_papers=candidate_papers,
-                        max_papers=30
+                        max_papers=30,
+                        citing_institution=citing_institution
                     )
 
                     num_retries = 0
@@ -1464,19 +1775,17 @@ class Simulation:
                     if len(citations_of_paper) <= SIMULATION_CONFIG['citation']['expected_citation_per_round']:
 
                         # Get candidates from all papers, including rejected papers.
-                        candidate_papers = [self.rag.documents[idx] for idx in topk_indices_citation_both[i][
-                                                                               :SIMULATION_CONFIG['citation'][
-                                                                                   'num_candidate_papers']]]
-
-                        candidate_papers = [
-                            {'id': paper.metadata['id'], 'title': paper.metadata['title'], 'abstract': paper.page_content}
-                            for paper in candidate_papers]
+                        candidate_papers = self._build_candidate_papers(
+                            self.rag.documents,
+                            topk_indices_citation_both[i][:SIMULATION_CONFIG['citation']['num_candidate_papers']]
+                        )
 
                         prompt, response_format = agent.get_citation_prompt(
                             paper=submitted_paper,
                             direction=directions[agent.id],
                             candidate_papers=candidate_papers,
-                            max_papers=30
+                            max_papers=30,
+                            citing_institution=citing_institution
                         )
 
                         num_retries = 0
@@ -1539,11 +1848,12 @@ class Simulation:
         for paper_dict in submissions_list + resubmissions_list:
 
             conf: Conference = self.conference_system.conference_map[paper_dict['conference']]
-            if paper_dict['author_id'] not in submitted_papers:
-                submitted_papers[paper_dict['author_id']] = []
+            lead_id = self._get_lead_author_id(paper_dict)
+            if lead_id not in submitted_papers:
+                submitted_papers[lead_id] = []
 
             if conf.submit_paper(paper_dict, year=year):
-                submitted_papers[paper_dict['author_id']].append(paper_dict)
+                submitted_papers[lead_id].append(paper_dict)
                 self.submitted_paper_ids.add(paper_dict['id'])
 
             else:
@@ -1605,10 +1915,14 @@ class Simulation:
             peer_review_response_format = None
             for conference in self.conference_system.conferences:
                 for paper in conference.submitted_papers:
-                    # Assign reviewers (excluding paper author)
-                    author = self.ecosystem.get_agent_by_id(paper['author_id'])
+                    # Assign reviewers (excluding all paper authors + their COIs)
+                    author_ids = self._get_all_author_ids(paper)
+                    all_coi = set(author_ids)
+                    for aid in author_ids:
+                        author = self.ecosystem.get_agent_by_id(aid)
+                        all_coi.update(author.conflict_of_interest)
                     reviewers = self.ecosystem.get_available_reviewers(
-                        exclude_agent_ids=[paper['author_id']] + list(author.conflict_of_interest)
+                        exclude_agent_ids=list(all_coi)
                     )
 
                     # Select 3 random reviewers
@@ -1616,18 +1930,19 @@ class Simulation:
 
                     for reviewer in selected_reviewers:
                         # reviewer: SimulationAgent
-                        prompt, response_format = reviewer.get_review_prompt(paper)
-                        
+                        author_info = self._build_author_info_for_review(reviewer, paper)
+                        prompt, response_format = reviewer.get_review_prompt(paper, author_info=author_info)
+
                         if peer_review_response_format is None:
                             peer_review_response_format = response_format
-                        
+
                         batch_prompts.append(prompt)
-                        
+
                         batch_metadata.append({
                             'reviewer': reviewer,
-                            'paper': paper,  
+                            'paper': paper,
                             'conference': conference,
-                            
+                            'author_info': author_info,
                         })
 
             # Step 2: Single batch call for ALL prompts
@@ -1661,6 +1976,18 @@ class Simulation:
                         }
                         conference.add_review(paper['id'], review)
                         reviews_by_reviewer[reviewer.id].append(review['overall_score'])
+
+                        # Record distance-score pair for preferential attachment analysis
+                        if self.experiment_name == 'preferential_attachment' and self.network_metrics:
+                            ai = meta.get('author_info')
+                            self.network_metrics.record_review_with_distance(
+                                year=year,
+                                reviewer_id=reviewer.id,
+                                author_id=self._get_lead_author_id(paper),
+                                distance=ai['network_distance'] if ai else -1,
+                                score=review['overall_score'],
+                                paper_id=paper['id'],
+                            )
                     except (KeyError, AssertionError, ValueError) as e:
                         raise ValueError(f"Invalid review from {reviewer.id} for paper {paper['id']}: {e}")
                         
@@ -1683,23 +2010,39 @@ class Simulation:
             # ==================== SEQUENTIAL PATH (OpenAI API) ====================
             for conference in tqdm(self.conference_system.conferences, desc="Peer reviews"):
                 for paper in tqdm(conference.submitted_papers, desc=f"{conference.conference_id}"):
-                    # Assign reviewers (excluding paper author)
-                    author = self.ecosystem.get_agent_by_id(paper['author_id'])
+                    # Assign reviewers (excluding all paper authors + their COIs)
+                    author_ids = self._get_all_author_ids(paper)
+                    all_coi = set(author_ids)
+                    for aid in author_ids:
+                        author = self.ecosystem.get_agent_by_id(aid)
+                        all_coi.update(author.conflict_of_interest)
                     reviewers = self.ecosystem.get_available_reviewers(
-                        exclude_agent_ids=[paper['author_id']] + list(author.conflict_of_interest)
+                        exclude_agent_ids=list(all_coi)
                     )
 
                     # Select 3 random reviewers
                     selected_reviewers = random.sample(reviewers, min(3, len(reviewers)))
 
                     for reviewer in selected_reviewers:
+                        author_info = self._build_author_info_for_review(reviewer, paper)
                         num_retries = 0
                         review = None
                         while True:
                             try:
-                                review = reviewer.review_paper(paper)
+                                review = reviewer.review_paper(paper, author_info=author_info)
                                 conference.add_review(paper['id'], review)
                                 reviews_by_reviewer[reviewer.id].append(review['overall_score'])
+
+                                # Record distance-score pair for preferential attachment analysis
+                                if self.experiment_name == 'preferential_attachment' and self.network_metrics:
+                                    self.network_metrics.record_review_with_distance(
+                                        year=year,
+                                        reviewer_id=reviewer.id,
+                                        author_id=self._get_lead_author_id(paper),
+                                        distance=author_info['network_distance'] if author_info else -1,
+                                        score=review['overall_score'],
+                                        paper_id=paper['id'],
+                                    )
 
                                 break
 
@@ -1742,11 +2085,11 @@ class Simulation:
             for paper in conference.submitted_papers:
                 paper_reviews = conference.reviews.get(paper['id'], [])
                 if paper_reviews:
-                    # Find the author agent
-                    author = self.ecosystem.get_agent_by_id(paper['author_id'])
-
-                    author.process_received_reviews(paper_reviews, paper_id=paper['id'], year=year,
-                                                    average_scores_of_venue=average_scores[conference.conference_id])
+                    # Send reviews to ALL co-authors
+                    for aid in self._get_all_author_ids(paper):
+                        author = self.ecosystem.get_agent_by_id(aid)
+                        author.process_received_reviews(paper_reviews, paper_id=paper['id'], year=year,
+                                                        average_scores_of_venue=average_scores[conference.conference_id])
 
         return average_scores
 
@@ -1792,6 +2135,7 @@ class Simulation:
         Returns:
             (is_valid, cleaned_proposal_or_None, reason)
         """
+        
         if proposal is None:
             return False, None, "proposal is None"
         if not isinstance(proposal, dict):
@@ -1916,14 +2260,15 @@ class Simulation:
 
         for agent in university_researchers:
             success_history = agent.funding_success_history
-            selected_program_ids = agent.select_funding_programs(
-                all_programs,
-                success_history,
-                num_submitted_proposals=3
-            )
+
             past_accepted = self.conference_system.authors_to_accepted_papers.get(agent.id, [])
             past_rejected = self.conference_system.authors_to_rejected_papers.get(agent.id, [])
-            for program_id in selected_program_ids:
+
+            selected_program_ids = agent.select_funding_programs(
+                all_programs, past_accepted, past_rejected
+            )
+
+            for program_id in selected_program_ids[:3]:
                 prompt, response_format, metadata = agent.funding_application_prompt(
                     program=all_programs[program_id],
                     past_accepted_papers=past_accepted,
@@ -2047,39 +2392,72 @@ class Simulation:
         submitted_papers_dict = {pid: paper.to_dict() for pid, paper in self.paper_tracker.papers_by_id.items()}
 
         # Step 1: Collect prompts from ALL funding agencies into one batch
-        all_eval_prompts = []
+        all_funding_proposal_eval_prompts = []
         all_eval_metadata = []
         eval_response_format = None
 
         for funding_agent in funding_agencies:
             all_funding_programs_dict.update(funding_agent.funding_programs)
-            eval_prompts, resp_fmt, eval_metadata = funding_agent.get_funding_evaluation_prompts(
+            funding_proposal_eval_prompts, resp_fmt, eval_metadata = funding_agent.get_funding_evaluation_prompts(
                 university_applications, submitted_papers_dict=submitted_papers_dict
             )
-            all_eval_prompts.extend(eval_prompts)
+            all_funding_proposal_eval_prompts.extend(funding_proposal_eval_prompts)
             all_eval_metadata.extend(eval_metadata)
             if eval_response_format is None:
                 eval_response_format = resp_fmt
 
-        # Step 2: Single LLM call for all programs across all agencies
-        if all_eval_prompts:
-            if hasattr(self.llm, 'generate_batch'):
-                eval_results = self.llm.generate_batch(
-                    all_eval_prompts, response_format=eval_response_format,
-                    desc=f"{len(all_eval_prompts)} funding evaluations"
-                )
-            else:
-                eval_results = []
-                for prompt in all_eval_prompts:
-                    result, msg_hist = self.llm.generate(prompt=prompt, response_format=eval_response_format)
-                    eval_results.append((result, msg_hist))
+        # Step 2: LLM call with retry for invalid results
+        if all_funding_proposal_eval_prompts:
+            MAX_FUNDING_EVAL_RETRIES = 3
+            final_eval_results = []
+            final_eval_metadata = []
 
-            # Step 3: Process all results at once (static method handles routing via metadata)
+            for attempt in range(MAX_FUNDING_EVAL_RETRIES):
+                if not all_funding_proposal_eval_prompts:
+                    break
+
+                if hasattr(self.llm, 'generate_batch'):
+                    eval_results = self.llm.generate_batch(
+                        all_funding_proposal_eval_prompts, response_format=eval_response_format,
+                        desc=f"{len(all_funding_proposal_eval_prompts)} funding evaluations (attempt {attempt+1}/{MAX_FUNDING_EVAL_RETRIES})"
+                    )
+                else:
+                    eval_results = []
+                    for prompt in all_funding_proposal_eval_prompts:
+                        result, msg_hist = self.llm.generate(prompt=prompt, response_format=eval_response_format)
+                        eval_results.append((result, msg_hist))
+
+                # Validate each result, separate valid from invalid
+                retry_prompts = []
+                retry_metadata = []
+
+                for i, (result, msg_hist) in enumerate(eval_results):
+                    if FundingAgency.validate_funding_result(result, all_eval_metadata[i]['apps']):
+                        final_eval_results.append((result, msg_hist))
+                        final_eval_metadata.append(all_eval_metadata[i])
+                    else:
+                        program_id = all_eval_metadata[i]['program_id']
+                        logger.warning(f"Funding eval for {program_id} invalid (attempt {attempt+1}/{MAX_FUNDING_EVAL_RETRIES})")
+                        if attempt < MAX_FUNDING_EVAL_RETRIES - 1:
+                            retry_prompts.append(all_funding_proposal_eval_prompts[i])
+                            retry_metadata.append(all_eval_metadata[i])
+                        else:
+                            # Last attempt — pass through for fallback handling
+                            final_eval_results.append((result, msg_hist))
+                            final_eval_metadata.append(all_eval_metadata[i])
+
+                if not retry_prompts:
+                    break
+
+                all_funding_proposal_eval_prompts = retry_prompts
+                all_eval_metadata = retry_metadata
+
+            # Step 3: Process all results (valid + any final failures with fallback)
             all_funding_winners_dict = FundingAgency.process_funding_evaluation_results(
-                eval_results, all_eval_metadata, all_funding_programs_dict
+                final_eval_results, final_eval_metadata, all_funding_programs_dict
             )
             for program_id, winners in all_funding_winners_dict.items():
-                winners_list.extend([agent['id'] for agent in winners])
+                winners_list.extend([agent['applicant_id'] for agent in winners])
 
         active_papers_dataframe = active_papers_dataframe.set_index('author_id')
 
@@ -2104,7 +2482,7 @@ class Simulation:
         for program_id, winners_for_program in all_funding_winners_dict.items():
             for winner in winners_for_program:
                 program = all_funding_programs_dict[program_id]
-                agent = self.ecosystem.get_agent_by_id(winner['id'])
+                agent = self.ecosystem.get_agent_by_id(winner['applicant_id'])
 
                 funding_to_researcher = academic_funding_per_unit
 
@@ -2169,6 +2547,9 @@ class Simulation:
         directions, active_authors, avg_funding = self._run_phase_1_research_directions(year, year_results)
         self.wandb_logger.log_phase(year, 1, year_results, self, num_active_authors=len(active_authors), avg_funding=avg_funding)
 
+        # Phase 1.5: Collaboration formation (preferential_attachment experiment only)
+        self._run_phase_1_5_collaboration_formation(year, directions, active_authors, year_results)
+
         # Phase 2: Generate and submit papers
         submissions_list = self._run_phase_2_submit_papers(
             year, directions, active_authors, resubmissions_list, year_results
@@ -2191,6 +2572,9 @@ class Simulation:
 
         # Collect exploration metrics (if enabled)
         self._collect_exploration_metrics(year)
+
+        # Collect preferential attachment metrics (if enabled)
+        self._collect_preferential_attachment_metrics(year)
 
         # Get conference statistics
         year_results['conference_statistics'] = self.conference_system.get_all_statistics()
@@ -2318,6 +2702,15 @@ class Simulation:
                 'exploration_metrics': self.exploration_metrics.to_dict() if self.exploration_metrics else None,
             }
 
+        # Save preferential attachment experiment trackers if enabled
+        if self.experiment_name == 'preferential_attachment':
+            checkpoint_data['preferential_attachment'] = {
+                'enabled': True,
+                'collaboration_tracker': self.collaboration_tracker.to_dict() if self.collaboration_tracker else None,
+                'network_metrics': self.network_metrics.to_dict() if self.network_metrics else None,
+                'collaboration_pairs': {str(k): v for k, v in self._collaboration_pairs.items()},
+            }
+
         with open(checkpoint_path, 'w') as f:
             json.dump(checkpoint_data, f, indent=2)
 
@@ -2399,6 +2792,25 @@ class Simulation:
             self.cd_calculator = None
             self.keyword_extractor = None
 
+        # Reconstruct preferential attachment experiment trackers if enabled
+        if 'preferential_attachment' in checkpoint_data and checkpoint_data['preferential_attachment'].get('enabled', False):
+            self.experiment_name = 'preferential_attachment'
+            pa_data = checkpoint_data['preferential_attachment']
+
+            if pa_data.get('collaboration_tracker'):
+                from utopia.data.collaboration_tracker import CollaborationTracker
+                self.collaboration_tracker = CollaborationTracker.from_dict(pa_data['collaboration_tracker'])
+                logger.info(f"  Loaded CollaborationTracker with {self.collaboration_tracker.graph.number_of_edges()} edges")
+
+            if pa_data.get('network_metrics'):
+                from utopia.metrics.network_metrics import NetworkMetrics
+                self.network_metrics = NetworkMetrics.from_dict(pa_data['network_metrics'])
+                logger.info(f"  Loaded NetworkMetrics")
+
+            if pa_data.get('collaboration_pairs'):
+                self._collaboration_pairs = {int(k): v for k, v in pa_data['collaboration_pairs'].items()}
+                logger.info(f"  Loaded {len(self._collaboration_pairs)} collaboration pair records")
+
         logger.info(f"Checkpoint loaded successfully from year {checkpoint_data['year']}")
         logger.info(f"  Loaded {len(self.ecosystem.agent_population)} agents")
         logger.info(f"  Loaded {len(self.submitted_paper_ids)} submitted paper IDs")
@@ -2463,6 +2875,7 @@ def main():
         max_retries=args.max_retries,
         weighted_funding_assignment=args.weighted_funding_assignment,
         experiment_name=args.experiment_name,
+        collaboration_mode=args.collaboration_mode,
         start_year=args.start_year,
         args=args
     )

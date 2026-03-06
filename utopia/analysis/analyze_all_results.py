@@ -27,11 +27,15 @@ def analyze_citations(data: Dict[str, Any]) -> Dict[str, Any]:
         papers_by_year[paper_data['year']].append(paper_id)
         paper_authors[paper_id] = paper_data['author_id']
 
-        agent = agent_lookup[paper_data['author_id']]
-        if 'university_name' in agent:
-            paper_institutions[paper_data['author_id']] = agent['university_name']
-        elif 'company_name' in agent:
-            paper_institutions[paper_data['author_id']] = agent['company_name']
+        author_ids = paper_data['author_id'] if isinstance(paper_data['author_id'], list) else [paper_data['author_id']]
+        for aid in author_ids:
+            agent = agent_lookup.get(aid)
+            if agent is None:
+                continue
+            if 'university_name' in agent:
+                paper_institutions[aid] = agent['university_name']
+            elif 'company_name' in agent:
+                paper_institutions[aid] = agent['company_name']
 
     return calculate_citation_metrics(data['citations'], dict(papers_by_year), paper_authors, paper_institutions)
 

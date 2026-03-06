@@ -196,7 +196,9 @@ class Conference:
                 """
 
                 self.decisions['accept'].append(paper)
-                self.authors_to_accepted_papers[paper['author_id']].append(paper)
+                author_ids = paper['author_id'] if isinstance(paper['author_id'], list) else [paper['author_id']]
+                for aid in author_ids:
+                    self.authors_to_accepted_papers[aid].append(paper)
 
 
 
@@ -216,7 +218,9 @@ class Conference:
                 """
 
                 self.decisions['reject'].append(paper)
-                self.authors_to_rejected_papers[paper['author_id']].append(paper)
+                author_ids = paper['author_id'] if isinstance(paper['author_id'], list) else [paper['author_id']]
+                for aid in author_ids:
+                    self.authors_to_rejected_papers[aid].append(paper)
 
         self.status = ConferenceStatus.DECISIONS_MADE
 
@@ -375,9 +379,13 @@ class ConferenceSystem:
             conf.make_acceptance_decisions()
 
             for paper in conf.decisions['accept']:
-                self.authors_to_accepted_papers[paper['author_id']].append(paper)
+                author_ids = paper['author_id'] if isinstance(paper['author_id'], list) else [paper['author_id']]
+                for aid in author_ids:
+                    self.authors_to_accepted_papers[aid].append(paper)
             for paper in conf.decisions['reject']:
-                self.authors_to_rejected_papers[paper['author_id']].append(paper)
+                author_ids = paper['author_id'] if isinstance(paper['author_id'], list) else [paper['author_id']]
+                for aid in author_ids:
+                    self.authors_to_rejected_papers[aid].append(paper)
 
     def conclude_all_conferences(self):
         """Mark all conferences as concluded"""
