@@ -276,11 +276,12 @@ class RAG:
 
         print("[SentenceTransformer] Encoding documents using SentenceTransformer")
 
-        # Lazy-load model on first use
+        # Lazy-load model on first use (fp16 only on CUDA; CPU runs fp32)
         if getattr(self, 'sentence_transformer_model', None) is None:
             from sentence_transformers import SentenceTransformer
+            model_kwargs = {"torch_dtype": torch.float16} if 'cuda' in str(self.device) else {}
             self.sentence_transformer_model = SentenceTransformer(
-                self.config.embedding_model, device="cuda:0", model_kwargs={"torch_dtype": torch.float16}
+                self.config.embedding_model, device=self.device, model_kwargs=model_kwargs
             )
 
         doc_texts = [doc.page_content for doc in self.documents]

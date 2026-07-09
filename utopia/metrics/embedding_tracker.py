@@ -1,4 +1,7 @@
 """Track paper embeddings for exploration vs exploitation analysis"""
+import hashlib
+import os
+
 import numpy as np
 from sentence_transformers import SentenceTransformer
 from typing import Dict, List, Optional
@@ -7,16 +10,94 @@ from typing import Dict, List, Optional
 class EmbeddingTracker:
     """Track and compare paper embeddings to measure topic distances"""
 
-    def __init__(self, model_name: str = 'all-MiniLM-L6-v2'):
+    def __init__(self, model_name: str = 'all-MiniLM-L6-v2', cache_dir: Optional[str] = None):
+        self.model_name = model_name
         self.model = SentenceTransformer(model_name)
         self.embeddings: Dict[str, np.ndarray] = {}  # paper_id -> embedding
         self.paper_metadata: Dict[str, Dict] = {}  # paper_id -> {author_id, year}
+        self.expertise_centroids: Dict[str, np.ndarray] = {}  # agent_id -> initial expertise centroid
+        # Empirical near/far thresholds from the direction-pair distance distribution.
+        # None until compute_direction_thresholds() runs; fixed 0.33/0.66 fallback otherwise.
+        self.near_threshold: Optional[float] = None
+        self.far_threshold: Optional[float] = None
+        # Disk cache: seed-independent, keyed by (model, sha256(text)) so repeated
+        # seeds/conditions never re-encode the same abstract.
+        self.cache_dir = cache_dir
+        self._disk_cache: Dict[str, np.ndarray] = {}
+        self._disk_cache_dirty = False
+        if cache_dir:
+            os.makedirs(cache_dir, exist_ok=True)
+            self._cache_path = os.path.join(
+                cache_dir, f"emb_{model_name.replace('/', '_')}.npz")
+            if os.path.exists(self._cache_path):
+                with np.load(self._cache_path) as npz:
+                    self._disk_cache = {k: npz[k] for k in npz.files}
+
+    def _text_key(self, text: str) -> str:
+        return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+    def _encode_cached(self, texts: List[str]) -> np.ndarray:
+        """Encode texts with disk-cache lookup; one batched encode for all misses."""
+        keys = [self._text_key(t) for t in texts]
+        miss_idx = [i for i, k in enumerate(keys) if k not in self._disk_cache]
+        if miss_idx:
+            new_embs = self.model.encode([texts[i] for i in miss_idx],
+                                         convert_to_numpy=True, show_progress_bar=False)
+            for i, emb in zip(miss_idx, new_embs):
+                self._disk_cache[keys[i]] = emb
+            self._disk_cache_dirty = True
+        return np.stack([self._disk_cache[k] for k in keys])
+
+    def flush_cache(self):
+        """Persist the disk cache. Called once per year, not per paper."""
+        if self.cache_dir and self._disk_cache_dirty:
+            np.savez(self._cache_path, **self._disk_cache)
+            self._disk_cache_dirty = False
 
     def add_paper_embedding(self, paper_id: str, abstract: str, author_id: str, year: int):
         """Add embedding for a paper"""
-        embedding = self.model.encode(abstract, convert_to_numpy=True)
-        self.embeddings[paper_id] = embedding
-        self.paper_metadata[paper_id] = {'author_id': author_id, 'year': year}
+        self.add_paper_embeddings_batch([(paper_id, abstract, author_id, year)])
+
+    def add_paper_embeddings_batch(self, items: List[tuple]):
+        """Add embeddings for many papers with ONE encode call.
+
+        Args:
+            items: list of (paper_id, abstract, author_id, year)
+        """
+        items = [it for it in items if it[0] not in self.embeddings]
+        if not items:
+            return
+        embs = self._encode_cached([it[1] for it in items])
+        for (paper_id, _, author_id, year), emb in zip(items, embs):
+            self.embeddings[paper_id] = emb
+            self.paper_metadata[paper_id] = {'author_id': author_id, 'year': year}
+
+    def register_agent_expertise(self, agent_id: str, direction_texts: List[str]):
+        """Store the centroid of an agent's initial expertise directions.
+
+        Used as the career reference before the agent's first paper (plan 4.8)."""
+        if not direction_texts:
+            return
+        embs = self._encode_cached(direction_texts)
+        self.expertise_centroids[agent_id] = np.mean(embs, axis=0)
+
+    def compute_direction_thresholds(self, directions: List) -> Dict[str, float]:
+        """Compute empirical near/far thresholds from the pairwise cosine-distance
+        distribution among all research directions (plan 4.7).
+
+        Sets self.near_threshold / self.far_threshold to the 33rd / 66th
+        percentiles and returns them for the resolved-config record.
+        """
+        texts = [d.topic + " " + " ".join(d.keywords or []) for d in directions]
+        if len(texts) < 3:
+            return {'near_threshold': 0.33, 'far_threshold': 0.66}
+        embs = self._encode_cached(texts)
+        normed = embs / (np.linalg.norm(embs, axis=1, keepdims=True) + 1e-10)
+        sims = normed @ normed.T
+        dists = 1.0 - sims[np.triu_indices(len(texts), k=1)]
+        self.near_threshold = float(np.percentile(dists, 33))
+        self.far_threshold = float(np.percentile(dists, 66))
+        return {'near_threshold': self.near_threshold, 'far_threshold': self.far_threshold}
 
     def compute_distance_to_previous(self, paper_id: str, author_id: str) -> Optional[float]:
         """Compute cosine distance to author's most recent previous paper"""
@@ -91,18 +172,22 @@ class EmbeddingTracker:
     def compute_career_centroid(self, author_id: str, max_years: int = 3, current_year: int = None) -> Optional[np.ndarray]:
         """Compute the centroid embedding of an author's recent papers.
 
+        Before the first paper, falls back to the agent's initial expertise
+        centroid registered via register_agent_expertise() (plan 4.8), so
+        first-paper novelty is measured against expertise rather than 0.
+
         Args:
             author_id: Author ID
             max_years: Maximum number of years to look back
             current_year: Current year (if None, uses max year in metadata)
 
         Returns:
-            Mean embedding (centroid) or None if no papers found
+            Mean embedding (centroid), or None if neither papers nor expertise exist
         """
         if current_year is None:
             years = [m['year'] for m in self.paper_metadata.values() if m['author_id'] == author_id]
             if not years:
-                return None
+                return self.expertise_centroids.get(author_id)
             current_year = max(years)
 
         min_year = current_year - max_years
@@ -112,12 +197,9 @@ class EmbeddingTracker:
             if meta['author_id'] == author_id and min_year <= meta['year'] <= current_year
         ]
 
-        if not paper_ids:
-            return None
-
         embeddings = [self.embeddings[pid] for pid in paper_ids if pid in self.embeddings]
         if not embeddings:
-            return None
+            return self.expertise_centroids.get(author_id)
 
         return np.mean(np.stack(embeddings), axis=0)
 
@@ -141,7 +223,7 @@ class EmbeddingTracker:
         if not texts:
             return {}
 
-        dir_embeddings = self.model.encode(texts, convert_to_numpy=True)
+        dir_embeddings = self._encode_cached(texts)
         centroid_norm = centroid / (np.linalg.norm(centroid) + 1e-10)
         dir_norms = dir_embeddings / (np.linalg.norm(dir_embeddings, axis=1, keepdims=True) + 1e-10)
         similarities = dir_norms @ centroid_norm
@@ -177,10 +259,12 @@ class EmbeddingTracker:
         sim = np.dot(paper_emb, centroid) / (np.linalg.norm(paper_emb) * np.linalg.norm(centroid) + 1e-10)
         novelty_score = float(1.0 - sim)
 
-        # Bucket based on fixed thresholds (matching config quantiles)
-        if novelty_score < 0.33:
+        # Empirical thresholds when available (plan 4.7); fixed fallback otherwise
+        near = self.near_threshold if self.near_threshold is not None else 0.33
+        far = self.far_threshold if self.far_threshold is not None else 0.66
+        if novelty_score < near:
             bucket = 'near'
-        elif novelty_score < 0.66:
+        elif novelty_score < far:
             bucket = 'mid'
         else:
             bucket = 'far'
@@ -191,13 +275,20 @@ class EmbeddingTracker:
         """Serialize for checkpoint"""
         return {
             'embeddings': {k: v.tolist() for k, v in self.embeddings.items()},
-            'paper_metadata': self.paper_metadata
+            'paper_metadata': self.paper_metadata,
+            'expertise_centroids': {k: v.tolist() for k, v in self.expertise_centroids.items()},
+            'near_threshold': self.near_threshold,
+            'far_threshold': self.far_threshold,
         }
 
     @classmethod
-    def from_dict(cls, data: Dict, model_name: str = 'all-MiniLM-L6-v2'):
+    def from_dict(cls, data: Dict, model_name: str = 'all-MiniLM-L6-v2', cache_dir: Optional[str] = None):
         """Deserialize from checkpoint"""
-        tracker = cls(model_name)
+        tracker = cls(model_name, cache_dir=cache_dir)
         tracker.embeddings = {k: np.array(v) for k, v in data['embeddings'].items()}
         tracker.paper_metadata = data['paper_metadata']
+        tracker.expertise_centroids = {
+            k: np.array(v) for k, v in data.get('expertise_centroids', {}).items()}
+        tracker.near_threshold = data.get('near_threshold')
+        tracker.far_threshold = data.get('far_threshold')
         return tracker

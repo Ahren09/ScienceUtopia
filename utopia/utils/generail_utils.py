@@ -24,6 +24,87 @@ def check_cwd():
         "scienceutopia"], "Please run this file from the repository root directory (ScienceUtopia/)"
 
 
+def derive_seed(*components) -> int:
+    """Deterministically derive a 31-bit seed from arbitrary components.
+
+    Uses SHA-256 (never Python's randomized hash()) so derivation is stable
+    across processes and runs. Scheme: derive_seed(run_seed, phase, year,
+    batch_index, item_index, ...).
+    """
+    import hashlib
+    key = "|".join(str(c) for c in components)
+    digest = hashlib.sha256(key.encode("utf-8")).digest()
+    return int.from_bytes(digest[:4], "big") % (2 ** 31)
+
+
+def config_hash(config: dict) -> str:
+    """SHA-256 hex digest of a config dict (sorted-key JSON, tuples->lists)."""
+    import hashlib
+    return hashlib.sha256(
+        json.dumps(config, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def write_run_manifest(docs_dir: str, status: str, args=None, resolved_config: dict = None,
+                       extra: dict = None) -> str:
+    """Write/update outputs/docs/<experiment_id>/run_manifest.json.
+
+    Called at run start (status='running') and end (status='complete'/'failed').
+    Merges into an existing manifest so start-time fields survive the final write.
+    """
+    import subprocess
+    import sys
+
+    os.makedirs(docs_dir, exist_ok=True)
+    path = os.path.join(docs_dir, "run_manifest.json")
+    manifest = {}
+    if os.path.exists(path):
+        with open(path) as f:
+            manifest = json.load(f)
+
+    def _git(cmd):
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True, timeout=10).stdout.strip()
+        except Exception:
+            return None
+
+    manifest.update({
+        "status": status,
+        f"timestamp_{status}": datetime.now().isoformat(),
+    })
+    if "command" not in manifest:
+        manifest.update({
+            "command": " ".join(sys.argv),
+            "git_commit": _git(["git", "rev-parse", "HEAD"]),
+            "git_dirty_files": _git(["git", "status", "--short"]),
+            "python": sys.version.split()[0],
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        })
+        try:
+            import torch, vllm, transformers, sentence_transformers
+            manifest["package_versions"] = {
+                "torch": torch.__version__, "vllm": vllm.__version__,
+                "transformers": transformers.__version__,
+                "sentence_transformers": sentence_transformers.__version__,
+                "numpy": np.__version__, "pandas": pd.__version__,
+            }
+        except ImportError:
+            pass
+    if args is not None:
+        manifest["args"] = {k: v for k, v in sorted(vars(args).items())}
+    if resolved_config is not None:
+        manifest["resolved_config"] = resolved_config
+        manifest["scientific_config_hash"] = config_hash(resolved_config)
+    if extra:
+        manifest.update(extra)
+
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(manifest, f, indent=2, default=str)
+    os.replace(tmp, path)
+    return path
+
+
 def set_seed(seed: int = 42, use_torch: bool = True):
     random.seed(seed)
     np.random.seed(seed)

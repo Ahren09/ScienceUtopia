@@ -71,21 +71,57 @@ SIMULATION_CONFIG = {
         'strategy_mix': {'explorer': 0.2, 'exploiter': 0.6, 'cautious_explorer': 0.2},
         'embedding_model': 'all-MiniLM-L6-v2',
         'num_keywords': 10,
-        'min_citations_for_cd': 5,  # Minimum citations to calculate CD index
-        'near_quantile': 0.33,
+        'near_quantile': 0.33,   # empirical percentile of direction-pair distances (see EmbeddingTracker.compute_direction_thresholds)
         'far_quantile': 0.66,
         'history_window_years': 3,
+
+        # Balanced university-only population (neutral main condition)
+        'population_mode': 'university_only',
+        'num_institutions': 12,
+        'researchers_per_institution': 5,
+        'institution_strategy_mix': ['explorer', 'exploiter', 'exploiter', 'exploiter', 'cautious_explorer'],
+        'initial_funding': 100,
+        'num_conferences': 6,
+
+        # Mechanism toggles. All OFF = neutral main condition: strategy affects
+        # direction choice only; no direct score/funding/citation adjustment.
+        'review_strategy_adjustment': False,  # synthetic stress test only, never part of main results
+        'funding_intervention': False,
+        'citation_intervention': False,
+        'lambda_citation': 0.0,               # weight of log(citation potential) in candidate reranking
+        'citation_potential_clip': (0.5, 3.0),
+
+        # Legacy mechanism parameters (apply ONLY when the toggles above are on)
         'explorer_success_bias': -0.05,
         'explorer_variance': 0.25,
         'exploiter_success_bias': 0.05,
         'exploiter_variance': 0.08,
         'cautious_success_bias': 0.0,
         'cautious_variance': 0.15,
-        'novelty_penalty_in_funding': 0.15,
+        'novelty_penalty_in_funding': 0.15,   # lambda_funding for the funding-conservatism intervention
         'novelty_reward_in_long_term_citations': 0.30,
         'breakthrough_multiplier_mean': 1.8,
         'breakthrough_probability_threshold': 0.7,
+
+        # Outcome measurement
         'hit_paper_percentile': 0.95,
+        'citation_age_windows': [0, 1, 2, 3, 5],
+        'cd_age_windows': [3, 5],
+        'cd_min_denominator': 3,
+        'min_citations_for_cd': 5,  # legacy current-year CD gate (kept for backward compat)
+
+        # Scale controls (deterministic; may change between E3 and E4)
+        'funding_panel_max_apps': 25,   # max applications ranked in one funding prompt
+
+        # Prompt versions: any post-freeze edit requires a new version string
+        'prompt_versions': {
+            'direction_selection': 'v1',
+            'paper_selection': 'v1',
+            'citation_selection': 'v1',
+            'review': 'v1',
+            'funding_evaluation': 'v1',
+            'keyword_extraction': 'v1',
+        },
     },
 
     # Preferential Attachment Experiment

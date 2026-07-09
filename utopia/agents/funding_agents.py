@@ -2,7 +2,7 @@
 import logging
 import random
 from collections import Counter
-from typing import Dict, Set, List, Tuple
+from typing import Dict, Optional, Set, List, Tuple
 
 from pydantic import BaseModel
 
@@ -291,13 +291,21 @@ class FundingAgency(SimulationAgent):
     def get_funding_evaluation_prompts(
             self,
             applications: List[Dict],
-            submitted_papers_dict: Dict[str, Dict]
+            submitted_papers_dict: Dict[str, Dict],
+            panel_max_apps: Optional[int] = None,
+            panel_seed: Optional[int] = None,
     ) -> Tuple[List[str], Dict, List[Dict]]:
         """Build evaluation prompts for all programs belonging to this agency.
 
+        When a program receives more than `panel_max_apps` applications, they are
+        split into deterministic seeded panels of at most that size (one prompt
+        per panel); the funding rate is applied per panel. This is the documented
+        scale control for large populations — its fidelity vs global ranking is
+        validated by the panelization fidelity experiment before confirmatory use.
+
         Returns:
             Tuple of (prompts, response_format, metadata_list) where metadata_list
-            is parallel to prompts: [{'program_id': ..., 'apps': ...}, ...]
+            is parallel to prompts: [{'program_id': ..., 'apps': ..., 'panel_index': ...}, ...]
         """
 
         # Group applications by program
@@ -317,44 +325,78 @@ class FundingAgency(SimulationAgent):
                 application_data['applicant_id'] = author.id
                 program_to_applications[program_id].append(application_data)
 
+        # Deterministic panelization for programs exceeding the panel cap
+        program_panels = {}
+        for program_id, apps in program_to_applications.items():
+            if panel_max_apps and len(apps) > panel_max_apps:
+                import math as _math
+                from utopia.utils.generail_utils import derive_seed
+                rng = random.Random(derive_seed(panel_seed if panel_seed is not None else 0,
+                                                'funding_panels', program_id))
+                shuffled = list(apps)
+                rng.shuffle(shuffled)
+                n_panels = _math.ceil(len(shuffled) / panel_max_apps)
+                program_panels[program_id] = [shuffled[i::n_panels] for i in range(n_panels)]
+            else:
+                program_panels[program_id] = [apps]
+
         batch_prompts = []
         metadata_list = []
 
-        for program_id, apps in program_to_applications.items():
+        for program_id, panels in program_panels.items():
             if program_id not in self.funding_programs:
                 continue
 
             program = self.funding_programs[program_id]
-            logger.info(f"Preparing funding eval prompt for {program_id}")
+            logger.info(f"Preparing funding eval prompt(s) for {program_id} ({len(panels)} panel(s))")
+            for panel_index, apps in enumerate(panels):
+                batch_prompts.append(
+                    self._build_program_prompt(program, apps, submitted_papers_dict))
+                metadata_list.append({'program_id': program_id, 'apps': apps,
+                                      'panel_index': panel_index})
 
-            # Build applications text
-            applications_text = ""
-            for i, app in enumerate(apps):
-                author = app.get('author')
-                expertise_topics = [rd.topic if isinstance(rd, ResearchDirection) else str(rd)
-                                    for rd in (author.expertise if author and hasattr(author, 'expertise') else [])]
+        response_format = {
+            'type': 'json_schema',
+            'json_object': {
+                'name': 'FundingEvaluationResponse',
+                'strict': True,
+                'schema': FundingEvaluationResponse.model_json_schema()
+            }
+        }
 
-                accepted_papers = [paper for paper in app['relevant_projects'] if paper['status'] == 'accept']
-                rejected_papers = [paper for paper in app['relevant_projects'] if paper['status'] == 'reject']
+        return batch_prompts, response_format, metadata_list
 
-                if len(accepted_papers) == 0 and len(rejected_papers) == 0:
-                    past_performance = "The agent has no research projects completed yet."
-                else:
-                    past_performance = f"""The agent has completed {len(accepted_papers) + len(rejected_papers)} research projects, with {len(accepted_papers)} accepted papers and {len(rejected_papers)} rejected papers.
+    @staticmethod
+    def _build_program_prompt(program: 'FundingProgram', apps: List[Dict],
+                              submitted_papers_dict: Dict[str, Dict]) -> str:
+        """Build one ranking prompt for a program (or one panel of it)."""
+        applications_text = ""
+        for i, app in enumerate(apps):
+            author = app.get('author')
+            expertise_topics = [rd.topic if isinstance(rd, ResearchDirection) else str(rd)
+                                for rd in (author.expertise if author and hasattr(author, 'expertise') else [])]
+
+            accepted_papers = [paper for paper in app['relevant_projects'] if paper['status'] == 'accept']
+            rejected_papers = [paper for paper in app['relevant_projects'] if paper['status'] == 'reject']
+
+            if len(accepted_papers) == 0 and len(rejected_papers) == 0:
+                past_performance = "The agent has no research projects completed yet."
+            else:
+                past_performance = f"""The agent has completed {len(accepted_papers) + len(rejected_papers)} research projects, with {len(accepted_papers)} accepted papers and {len(rejected_papers)} rejected papers.
 
 """
 
-                    if len(accepted_papers) > 0:
-                        past_performance += "### Recent accepted papers:\n"
-                        for paper in accepted_papers:
-                            past_performance += f" - {submitted_papers_dict[paper['arxiv_id']]['title']}\n"
+                if len(accepted_papers) > 0:
+                    past_performance += "### Recent accepted papers:\n"
+                    for paper in accepted_papers:
+                        past_performance += f" - {submitted_papers_dict[paper['arxiv_id']]['title']}\n"
 
-                    if len(rejected_papers) > 0:
-                        past_performance += "### Recent rejected papers:\n"
-                        for paper in rejected_papers:
-                            past_performance += f" - {submitted_papers_dict[paper['arxiv_id']]['title']}\n"
+                if len(rejected_papers) > 0:
+                    past_performance += "### Recent rejected papers:\n"
+                    for paper in rejected_papers:
+                        past_performance += f" - {submitted_papers_dict[paper['arxiv_id']]['title']}\n"
 
-                applications_text += f"""### Application {i}
+            applications_text += f"""### Application {i}
 Applicant ID: {app['applicant_id']}
 Research Proposal: {app.get('research_proposal', 'No proposal provided')}
 Expertise: {', '.join(expertise_topics)}
@@ -364,9 +406,9 @@ Past Performance:
 
 """
 
-            focus_topics = [rd.topic for rd in program.research_directions]
+        focus_topics = [rd.topic for rd in program.research_directions]
 
-            prompt = f"""You are a funding agency evaluating applications for {program.name}.
+        prompt = f"""You are a funding agency evaluating applications for {program.name}.
 
 ## Program Details
 Program Focus Areas: {', '.join(focus_topics)}
@@ -383,8 +425,8 @@ Based on the following criteria, provide a complete ranking of all applications:
 ## Applications to Evaluate
 {applications_text}
 """
-            instruction = f"MUST BE an integer between 0 and {len(apps) - 1}."
-            prompt += f"""
+        instruction = f"MUST BE an integer between 0 and {len(apps) - 1}."
+        prompt += f"""
 ## Response Format
 Respond in JSON format with all applications ranked from most preferred (rank 1) to least preferred. An example response is shown below (DO NOT directly copy the exact response):
 ```json
@@ -407,43 +449,41 @@ Respond in JSON format with all applications ranked from most preferred (rank 1)
 }}
 ```
 """
-
-            batch_prompts.append(prompt)
-            metadata_list.append({'program_id': program_id, 'apps': apps})
-
-        response_format = {
-            'type': 'json_schema',
-            'json_object': {
-                'name': 'FundingEvaluationResponse',
-                'strict': True,
-                'schema': FundingEvaluationResponse.model_json_schema()
-            }
-        }
-
-        return batch_prompts, response_format, metadata_list
+        return prompt
 
     @staticmethod
     def process_funding_evaluation_results(
             batch_results: List[Tuple[Dict, List[Dict]]],
             metadata_list: List[Dict],
-            funding_programs: Dict[str, 'FundingProgram']
+            funding_programs: Dict[str, 'FundingProgram'],
+            novelty_penalties: Optional[Dict[str, float]] = None,
+            lambda_funding: float = 0.0,
     ) -> Dict[str, List[Dict]]:
-        """Process batch LLM results into winners per program.
+        """Process batch LLM results into winners per program (or per panel).
+
+        Funding-conservatism intervention (plan 4.4/6.2): when lambda_funding > 0,
+        each application's LLM rank is converted to a normalized raw score
+        (1 = best, 0 = worst), penalized by lambda_funding * novelty_percentile,
+        and winners are selected on the ADJUSTED score BEFORE the funding-rate
+        cut. Both scores are stored on each application. lambda_funding == 0
+        (neutral condition) reproduces the original rank-order selection exactly.
 
         Args:
             batch_results: List of (result_dict, message_history) from generate_batch / generate.
-            metadata_list: Parallel list of {'program_id', 'apps'} dicts.
+            metadata_list: Parallel list of {'program_id', 'apps', 'panel_index'} dicts.
             funding_programs: Combined dict of all funding programs across agencies.
+            novelty_penalties: applicant_id -> recent-novelty percentile in [0, 1].
+            lambda_funding: penalty coefficient (0 = off).
 
         Returns:
-            Dict[program_id, List[Dict]] — ranked winner lists per program.
+            Dict[program_id, List[Dict]] — winner lists per program (panels merged).
         """
         winners_all_programs = {}
         for idx, (result, _message_history) in enumerate(batch_results):
             program_id = metadata_list[idx]['program_id']
             apps = metadata_list[idx]['apps']
             program = funding_programs[program_id]
-            
+
             if result is None:
                 logger.warning(f"No response from LLM for program {program_id}")
                 continue
@@ -474,8 +514,24 @@ Respond in JSON format with all applications ranked from most preferred (rank 1)
 
             # Sort by rank (rank 1 = most preferred)
             ranked_apps_sorted = sorted(ranked_apps, key=lambda x: x.get('rank', float('inf')))
-            num_winners = max(1, int(len(ranked_apps_sorted) * program.funding_rate))
-            winners_all_programs[program_id] = ranked_apps_sorted[:num_winners]
+
+            # Normalized raw score from rank: 1 (best) .. 0 (worst)
+            n = len(ranked_apps_sorted)
+            for pos, app in enumerate(ranked_apps_sorted):
+                raw = 1.0 - (pos / (n - 1)) if n > 1 else 1.0
+                penalty = (novelty_penalties or {}).get(app['applicant_id'], 0.0)
+                app['normalized_raw_score'] = raw
+                app['novelty_penalty'] = lambda_funding * penalty
+                app['adjusted_score'] = raw - lambda_funding * penalty
+
+            if lambda_funding > 0:
+                # Stable sort keeps LLM rank order among equal adjusted scores
+                ranked_apps_sorted = sorted(
+                    ranked_apps_sorted, key=lambda x: -x['adjusted_score'])
+
+            num_winners = max(1, int(n * program.funding_rate))
+            winners_all_programs.setdefault(program_id, []).extend(
+                ranked_apps_sorted[:num_winners])
 
         return winners_all_programs
 

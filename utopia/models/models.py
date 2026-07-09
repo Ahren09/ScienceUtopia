@@ -5,6 +5,7 @@ import math
 import os
 import re
 import sys
+import time
 from io import BytesIO
 from typing import List, Optional, Union, Dict, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -437,7 +438,8 @@ class VLLMModel(BaseLLM):
         temperature: float = 0.7,
         system_prompt: Optional[str] = "This is a simulation of an academic ecosystem, where researchers choose research directions and submit papers, reviewers conduct peer reviews of papers, and funding agencies allocate fundings.",
         max_tokens: int = SIMULATION_CONFIG['llm']['max_tokens'],
-        desc: Optional[str] = None
+        desc: Optional[str] = None,
+        seed_ctx: Optional[tuple] = None,  # accepted for API parity with VLLMServerModel; unused in-process
     ) -> List[Tuple[Dict, List[Dict]]]:
         """Process ALL prompts in a single vLLM call - no for-loop over prompts
 
@@ -533,11 +535,23 @@ class VLLMServerModel(BaseLLM):
         model_name: str,
         base_url: str = "http://localhost:8000/v1",
         max_concurrent_requests: int = 32,
+        run_seed: Optional[int] = None,
     ):
         super().__init__(model_name)
         self.base_url = base_url
         self.max_concurrent_requests = max_concurrent_requests
         self.enable_thinking = SIMULATION_CONFIG['llm']['enable_thinking']
+        # Run seed: when set, every request gets a deterministic per-request seed
+        # derived from (run_seed, seed_ctx..., item_index, attempt).
+        self.run_seed = run_seed
+        # Cumulative call statistics for the run manifest and fallback-rate gates
+        self.call_stats = {
+            'n_prompts': 0,
+            'n_first_attempt_success': 0,
+            'n_retries': 0,
+            'n_failures': 0,
+            'elapsed_seconds': 0.0,
+        }
 
         # vLLM server doesn't need a real API key
         self.client = OpenAI(base_url=base_url, api_key="EMPTY")
@@ -545,6 +559,12 @@ class VLLMServerModel(BaseLLM):
         # Test connection (warning only, not fatal)
         self.client.models.list()
         logger.info(f"Connected to vLLM server at {base_url} (model: {model_name})")
+
+    def _request_seed(self, seed_ctx: Optional[tuple], idx: int, attempt: int) -> Optional[int]:
+        if self.run_seed is None:
+            return None
+        from utopia.utils.generail_utils import derive_seed
+        return derive_seed(self.run_seed, *(seed_ctx or ('noctx',)), idx, attempt)
         
     def _build_extra_body(self, response_format: Optional[Dict] = None) -> dict:
         """Translate response_format to vLLM guided decoding extra_body"""
@@ -565,6 +585,7 @@ class VLLMServerModel(BaseLLM):
         response_format=None,
         message_history: Optional[List[Dict]] = None,
         max_tokens: int = 2048,
+        seed_ctx: Optional[tuple] = None,
     ) -> Tuple[Dict, List[Dict]]:
         """Generate response via the external vLLM server.
 
@@ -587,6 +608,9 @@ class VLLMServerModel(BaseLLM):
         extra_body = self._build_extra_body(response_format)
         if self.enable_thinking:
             extra_body['chat_template_kwargs'] = {"enable_thinking": True}
+        request_seed = self._request_seed(seed_ctx, 0, 0)
+        if request_seed is not None:
+            extra_body['seed'] = request_seed
 
         response = self.client.chat.completions.create(
             model=self.model_name,
@@ -615,10 +639,13 @@ class VLLMServerModel(BaseLLM):
         system_prompt: Optional[str] = "This is a simulation of an academic ecosystem, where researchers choose research directions and submit papers, reviewers conduct peer reviews of papers, and funding agencies allocate fundings.",
         max_tokens: int = SIMULATION_CONFIG['llm']['max_tokens'],
         desc: Optional[str] = None,
+        seed_ctx: Optional[tuple] = None,
     ) -> List[Tuple[Dict, List[Dict]]]:
         """Process prompts concurrently via the external vLLM server.
 
         Uses ThreadPoolExecutor — the vLLM server handles continuous batching internally.
+        When run_seed is set, each request carries a deterministic seed derived from
+        (run_seed, *seed_ctx, item_index, attempt).
 
         Returns:
             List of (parsed_json_dict, message_history) tuples, one per prompt.
@@ -627,15 +654,15 @@ class VLLMServerModel(BaseLLM):
         if not prompts:
             return []
 
-        extra_body = self._build_extra_body(response_format)
+        base_extra_body = self._build_extra_body(response_format)
         if self.enable_thinking:
-            extra_body['chat_template_kwargs'] = {"enable_thinking": True}
+            base_extra_body['chat_template_kwargs'] = {"enable_thinking": True}
 
         max_retries = 3
 
         def _call_single(idx_prompt):
             idx, prompt = idx_prompt
-            
+
             msgs = []
             if system_prompt:
                 msgs.append({"role": "system", "content": system_prompt})
@@ -644,8 +671,13 @@ class VLLMServerModel(BaseLLM):
             success = False
             response_text = ""
             response_json = None
+            n_retries = 0
             for attempt in range(max_retries):
                 try:
+                    extra_body = dict(base_extra_body)
+                    request_seed = self._request_seed(seed_ctx, idx, attempt)
+                    if request_seed is not None:
+                        extra_body['seed'] = request_seed
                     resp = self.client.chat.completions.create(
                         model=self.model_name,
                         messages=msgs,
@@ -660,29 +692,38 @@ class VLLMServerModel(BaseLLM):
                     success = True
                     break
                 except Exception as e:
+                    n_retries += 1
                     if attempt < max_retries - 1:
                         logger.warning(f"Prompt {idx} attempt {attempt + 1}/{max_retries} failed: {e}. Retrying...")
                     else:
                         logger.error(f"Prompt {idx} failed after {max_retries} attempts: {e}")
 
             if not success:
-                return idx, (None, msgs)
+                return idx, (None, msgs), n_retries, False
 
             msgs.append({
                 "role": "assistant",
                 "content": [{"type": "text", "text": response_text}]
             })
-            return idx, (response_json, msgs)
+            return idx, (response_json, msgs), n_retries, True
 
         label = desc or f"batch of {len(prompts)} prompts"
         logger.info(f"[vLLM Server] Generating {label} ...")
 
+        start_time = time.time()
         results = [None] * len(prompts)
         with ThreadPoolExecutor(max_workers=self.max_concurrent_requests) as executor:
             futures = {executor.submit(_call_single, (i, p)): i for i, p in enumerate(prompts)}
             for future in tqdm(as_completed(futures), total=len(prompts), desc=label):
-                idx, result = future.result()
+                idx, result, n_retries, success = future.result()
                 results[idx] = result
+                self.call_stats['n_prompts'] += 1
+                self.call_stats['n_retries'] += n_retries
+                if success and n_retries == 0:
+                    self.call_stats['n_first_attempt_success'] += 1
+                if not success:
+                    self.call_stats['n_failures'] += 1
+        self.call_stats['elapsed_seconds'] += time.time() - start_time
 
         logger.info(f"Batch generation complete: {len(results)} responses")
         return results

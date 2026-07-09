@@ -3,7 +3,7 @@ import os
 import sys
 
 
-def parse_arguments():
+def parse_arguments(argv=None):
     parser = argparse.ArgumentParser(
         description="Run Academic Society Ecosystem Simulation"
     )
@@ -147,27 +147,131 @@ def parse_arguments():
              '(default: cross_institute)'
     )
 
-    args = parser.parse_args()
+    # Reproducible experiment control (exploration experiment stages)
+    parser.add_argument(
+        '--seed',
+        type=int,
+        default=42,
+        help='Run seed. All other seeds (population, per-request vLLM seeds) are derived from it.'
+    )
+    parser.add_argument(
+        '--experiment_stage',
+        type=str,
+        default=None,
+        choices=['smoke', 'pilot', 'scalecheck', 'calibration', 'confirmatory', 'manyworld', 'mechanism'],
+        help='Experiment stage. When set, canonical outputs/{logs,checkpoints,visual,docs}/<experiment_id>/ '
+             'paths are used and an experiment_id is derived. When absent, legacy layout is preserved.'
+    )
+    parser.add_argument(
+        '--population_mode',
+        type=str,
+        default='default',
+        choices=['default', 'university_only'],
+        help='Population construction: "default" (legacy mixed university+industry) or '
+             '"university_only" (balanced equal-funding institutions for the exploration experiment)'
+    )
+    parser.add_argument(
+        '--num_institutions',
+        type=int,
+        default=None,
+        help='Number of institutions in university_only mode (default: config exploration_experiment.num_institutions)'
+    )
+    parser.add_argument(
+        '--researchers_per_institution',
+        type=int,
+        default=None,
+        help='Researchers per institution in university_only mode (default: 5)'
+    )
+    parser.add_argument(
+        '--initial_funding',
+        type=float,
+        default=None,
+        help='Equal initial funding per researcher in university_only mode (default: config value)'
+    )
+    parser.add_argument(
+        '--num_conferences',
+        type=int,
+        default=None,
+        help='Number of conferences to instantiate (default: legacy behavior)'
+    )
+    parser.add_argument(
+        '--funding_intervention',
+        action='store_true',
+        default=False,
+        help='Enable the funding-conservatism intervention (novelty penalty applied BEFORE winner selection). '
+             'Off = neutral condition.'
+    )
+    parser.add_argument(
+        '--citation_intervention',
+        action='store_true',
+        default=False,
+        help='Enable the citation risk-return intervention (citation-potential reranking of candidate papers). '
+             'Off = neutral condition.'
+    )
+
+    args = parser.parse_args(argv)
 
     # Set default experiment name based on model name
     if args.experiment_name == 'default':
         model_short = args.model.split('/')[-1]
         args.experiment_name = f'default_{model_short}'
 
+    if args.experiment_stage:
+        # Canonical layout: one experiment_id across outputs/{logs,checkpoints,visual,docs}
+        from utopia.config import SIMULATION_CONFIG
+        exp_config = SIMULATION_CONFIG['exploration_experiment']
+        if args.num_institutions is None:
+            args.num_institutions = exp_config['num_institutions']
+        if args.researchers_per_institution is None:
+            args.researchers_per_institution = exp_config['researchers_per_institution']
+        if args.initial_funding is None:
+            args.initial_funding = exp_config['initial_funding']
+        if args.num_conferences is None:
+            args.num_conferences = exp_config['num_conferences']
 
+        model_tag = args.model.split('/')[-1].lower().replace('-', '_').replace('.', '_')
+        if args.funding_intervention or args.citation_intervention:
+            mechanism = (f"fund{'015' if args.funding_intervention else '0'}_"
+                         f"cite{'on' if args.citation_intervention else 'off'}")
+        else:
+            mechanism = 'neutral'
+        n_researchers = args.num_institutions * args.researchers_per_institution
+        args.experiment_id = (
+            f"explore_{args.experiment_stage}_{model_tag}_{mechanism}_"
+            f"i{args.num_institutions}_n{n_researchers}_y{args.num_years}_seed{args.seed}"
+        )
+        base = args.output_dir  # repository-relative 'outputs'
+        args.log_dir = os.path.join(base, 'logs', args.experiment_id)
+        args.checkpoint_dir = os.path.join(base, 'checkpoints', args.experiment_id)
+        args.visual_dir = os.path.join(base, 'visual', args.experiment_id)
+        args.docs_dir = os.path.join(base, 'docs', args.experiment_id)
+        args.data_cache_dir = os.path.join('data', 'cache')
+        # Existing runner code writes checkpoints/reports to args.output_dir
+        args.output_dir = args.checkpoint_dir
+        for d in (args.log_dir, args.checkpoint_dir, args.visual_dir, args.docs_dir,
+                  args.data_cache_dir):
+            os.makedirs(d, exist_ok=True)
+        return args
+
+    # Legacy layout (experiment_stage absent): unchanged behavior
     if args.debug:
         args.output_dir = os.path.join(args.output_dir, 'debug', args.experiment_name)
-        
+
     elif args.experiment_name:
         args.output_dir = os.path.join(args.output_dir, args.experiment_name)
-    
+
     else:
         raise ValueError("Please specify the `experiment_name` or enable debug mode.")
-        
+
     args.visual_dir = os.path.join(args.output_dir, 'visual')
-    
+    args.log_dir = args.output_dir
+    args.docs_dir = args.output_dir
+    args.checkpoint_dir = args.output_dir
+    args.data_cache_dir = os.path.join('data', 'cache')
+    args.experiment_id = args.experiment_name
+
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(args.visual_dir, exist_ok=True)
-    
-    
+
+
     return args

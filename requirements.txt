@@ -9,6 +9,20 @@ pymupdf4llm
 seaborn
 # Common Requirements
 numpy
+pandas
+scipy
+scikit-learn
+pydantic
+networkx
+sentence-transformers
+langchain-core
+pyarrow
+torch
+vllm
+google-generativeai
+Pillow
+plotly
+umap-learn
 transformers
 datasets
 tiktoken

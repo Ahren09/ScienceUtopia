@@ -204,7 +204,24 @@ Below are the candidate directions you can choose from. Please note that project
         else:
             prompt += f"* Direction {i + 1}: {direction}\n\n"
 
-    prompt += f"""## Your Task
+    strategy = getattr(agent, 'exploration_strategy', 'balanced')
+    if strategy != 'balanced':
+        # Strategy-filtered candidates: the ONLY valid choices are the listed
+        # directions. Do not re-anchor the agent to its core expertise here —
+        # that would contradict the strategy manipulation (plan 4.1/8.4).
+        prompt += f"""## Your Task
+Select exactly ONE research direction from the candidate directions listed above. Then, give a VERY DETAILED description of the research project using around 5 sentences. Mention the main techniques you will use.
+
+## Strategy Constraint
+Your research strategy is: {strategy.upper()}.
+You must justify the distance of your chosen direction from your prior work: explain whether this direction is CLOSE, MODERATE, or FAR from your past research, and why it fits your strategy.
+
+## Considerations
+- Longer projects (3-4 years) require stable funding
+- Only the candidate directions listed above are valid choices
+"""
+    else:
+        prompt += f"""## Your Task
 First, select one research direction that best aligns with your expertise, current situation, and long-term goals. Then, give a VERY DETAILED description of the research project using around 5 sentences. Mention the main techniques you will use.
 
 Propose the directions based on your expertise:
@@ -215,15 +232,6 @@ Propose the directions based on your expertise:
 - Longer projects (3-4 years) require stable funding
 - Past successes suggest continuing in related areas
 - Past failures might indicate need for pivoting or building stronger foundation
-"""
-
-    # Add strategy-specific constraint for exploration experiment
-    if hasattr(agent, 'exploration_strategy') and agent.exploration_strategy != 'balanced':
-        prompt += f"""
-## Strategy Constraint
-You must justify the distance of your chosen direction from your prior work.
-- Explain whether this direction is CLOSE, MODERATE, or FAR from your past research.
-- Your research strategy is: {agent.exploration_strategy.upper()}
 """
 
     prompt += """
@@ -255,7 +263,9 @@ def create_research_directions_batch(
         year: int,
         paper_tracker: PaperTracker,
         llm,  # LLM instance with generate_batch method
-        average_funding_level: float = None
+        average_funding_level: float = None,
+        candidate_map: Optional[Dict[str, List[ResearchDirection]]] = None,
+        fallback_counter: Optional[Dict] = None,
 ) -> Dict[str, Dict]:
     """Assign research directions for all agents at once using batched LLM calls
 
@@ -268,6 +278,12 @@ def create_research_directions_batch(
         paper_tracker: PaperTracker for retrieving past papers
         llm: LLM instance (must have generate_batch method)
         average_funding_level: Average funding level of all agents
+        candidate_map: agent_id -> explicit candidate ResearchDirection list
+            (exploration experiment). The prompt shows EXACTLY these candidates
+            and the response is validated against EXACTLY their topics (plan 4.1).
+            When None, legacy behavior (agent.expertise + related topics) applies.
+        fallback_counter: optional dict updated in place with
+            n_agents / n_parse_fallback / n_validation_fallback.
 
     Returns:
         Dictionary mapping agent_id to direction dict with 'direction', 'detailed_focus', 'reason'
@@ -281,18 +297,32 @@ def create_research_directions_batch(
     direction_response_format = None
 
     for agent in agents:
+        candidates = (candidate_map or {}).get(agent.id)
+        strict_candidates = candidates is not None
         prompt, response_format, core_expertise, related_expertise = build_direction_prompt(
             agent=agent,
             year=year,
             paper_tracker=paper_tracker,
+            candidate_directions=candidates,
             average_funding_level=average_funding_level
         )
+        if candidates is None:
+            candidates = getattr(agent, '_filtered_candidates', None) or agent.expertise
+        # Exactly the topics shown in the prompt
+        candidate_topics = [d.topic if isinstance(d, ResearchDirection) else str(d)
+                            for d in candidates]
+        # Legacy (non-strict) mode additionally allows related-expertise topics
+        allowed_topics = set(candidate_topics)
+        if not strict_candidates:
+            allowed_topics.update(core_expertise)
+            allowed_topics.update(related_expertise)
         batch_prompts.append(prompt)
         batch_metadata.append({
             'agent': agent,
             'core_expertise': core_expertise,
             'related_expertise': related_expertise,
-            'candidate_directions': core_expertise + related_expertise,
+            'candidate_topics': candidate_topics,
+            'allowed_topics': allowed_topics,
         })
 
         if direction_response_format is None:
@@ -304,39 +334,49 @@ def create_research_directions_batch(
         batch_prompts,
         temperature=0.7,
         response_format=direction_response_format,
-        desc=f"{len(batch_prompts)} research directions"
+        desc=f"{len(batch_prompts)} research directions",
+        seed_ctx=('phase1_directions', year),
     )
 
     # Step 3: Process results
+    if fallback_counter is not None:
+        fallback_counter.setdefault('n_agents', 0)
+        fallback_counter.setdefault('n_parse_fallback', 0)
+        fallback_counter.setdefault('n_validation_fallback', 0)
     directions = {}
     for i, (selection, message_history) in enumerate(batch_results):
         meta = batch_metadata[i]
         agent = meta['agent']
-        candidate_directions = meta['candidate_directions']
-        related_expertise = meta['related_expertise']
+        candidate_topics = meta['candidate_topics']
+        allowed_topics = meta['allowed_topics']
+        if fallback_counter is not None:
+            fallback_counter['n_agents'] += 1
+        # Fallback stays within the strategy-valid candidate set (plan 8.4)
+        fallback_topic = candidate_topics[0] if candidate_topics else 'artificial_intelligence'
 
         # Handle failed JSON parse
         if selection is None:
             logger.warning(f"Failed to parse direction response for {agent.id}, using fallback")
-            # Use first core expertise as fallback
-            fallback_topic = meta['core_expertise'][0] if meta['core_expertise'] else 'artificial_intelligence'
+            if fallback_counter is not None:
+                fallback_counter['n_parse_fallback'] += 1
             selection = {
                 'topic': fallback_topic,
                 'detailed_focus': f"Research in {fallback_topic}",
                 'reason': "Fallback due to parsing error"
             }
 
-        # Validate response
+        # Validate response against exactly the topics shown to the model
         try:
             assert all(field in selection for field in {'topic', 'detailed_focus', 'reason'}), \
                 f"Missing fields in response for {agent.id}: {list(selection.keys())}"
 
-            assert selection['topic'] in candidate_directions or selection['topic'] in related_expertise, \
-                f"Invalid topic {selection['topic']} for {agent.id}"
+            assert selection['topic'] in allowed_topics, \
+                f"Invalid topic {selection['topic']} for {agent.id}; allowed: {sorted(allowed_topics)}"
 
         except AssertionError as e:
             logger.warning(f"Invalid direction from {agent.id}: {e}, using fallback")
-            fallback_topic = meta['core_expertise'][0] if meta['core_expertise'] else 'artificial_intelligence'
+            if fallback_counter is not None:
+                fallback_counter['n_validation_fallback'] += 1
             selection = {
                 'topic': fallback_topic,
                 'detailed_focus': f"Research in {fallback_topic}",

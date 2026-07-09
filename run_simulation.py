@@ -65,10 +65,83 @@ from utopia.data.rag import RAG, RAGConfig
 from utopia.data.tracker import CitationTracker, AgentTracker, FundingTracker
 from utopia.metrics.tracker import calculate_gini_coefficient, calculate_conference_score_metrics
 from utopia.models.models import GPT, BaseLLM, VLLMModel, VLLMServerModel, Gemini
-from utopia.utils.generail_utils import project_setup
+from utopia.utils.generail_utils import project_setup, set_seed, derive_seed, write_run_manifest
 
 
 logger = logging.getLogger(__name__)
+
+
+def check_citation_integrity(paper_tracker, citation_tracker) -> List[str]:
+    """Core citation-graph integrity rules (plan 11.4); returns failure messages.
+
+    Module-level so unit tests can exercise it on hand-built trackers.
+    """
+    failures = []
+    papers = paper_tracker.papers_by_id
+
+    def _first_year(paper):
+        # ArchivedPaper.year moves forward on resubmission; the temporal rule
+        # must use the FIRST submission year (a paper is citable from then on).
+        years = [r.get('year') for r in getattr(paper, 'review_history', []) or []
+                 if r.get('year') is not None]
+        return min(years + [paper.year])
+
+    for cited_id, citers in citation_tracker.citations.items():
+        if cited_id not in papers:
+            failures.append(f"citation target {cited_id} not in paper tracker")
+            continue
+        cited_year = _first_year(papers[cited_id])
+        for citer in citers:
+            if citer == cited_id:
+                failures.append(f"self-loop citation on {cited_id}")
+            if citer in papers and papers[citer].year < cited_year:
+                failures.append(f"future citation: {citer} (y{papers[citer].year}) cites "
+                                f"{cited_id} (first submitted y{cited_year})")
+    for pid in papers:
+        count = citation_tracker.get_citation_count(pid)
+        in_degree = len(citation_tracker.get_papers_citing(pid))
+        if count != in_degree or not isinstance(count, int):
+            failures.append(f"citation count mismatch for {pid}: count={count}, in_degree={in_degree}")
+    return failures
+
+
+def build_population_blueprint(num_institutions: int, researchers_per_institution: int,
+                               seed: int, num_expertise: int = 3) -> List[Dict]:
+    """Build a deterministic balanced university-only population blueprint.
+
+    Within every institution the strategy mix is exactly the configured list
+    (default 1 explorer / 3 exploiters / 1 cautious_explorer), shuffled with a
+    seeded RNG so assignment is random but reproducible (plan 4.2). Expertise
+    directions are sampled with the same RNG. Pure function — unit-testable
+    without any Simulation or LLM.
+
+    Returns:
+        List of rows: {institution, researcher_name, strategy, expertise_topics,
+        expertise_indices, initial_funding_placeholder}
+    """
+    exp_config = SIMULATION_CONFIG['exploration_experiment']
+    strategy_mix = list(exp_config['institution_strategy_mix'])
+    assert len(strategy_mix) == researchers_per_institution, (
+        f"institution_strategy_mix has {len(strategy_mix)} entries but "
+        f"researchers_per_institution={researchers_per_institution}")
+
+    rng = random.Random(derive_seed(seed, 'population'))
+    blueprint = []
+    for inst_idx in range(num_institutions):
+        institution = f"institution_{inst_idx:04d}"
+        strategies = list(strategy_mix)
+        rng.shuffle(strategies)
+        for r_idx, strategy in enumerate(strategies):
+            expertise_indices = rng.sample(
+                range(len(AVAILABLE_DIRECTIONS)), min(num_expertise, len(AVAILABLE_DIRECTIONS)))
+            blueprint.append({
+                'institution': institution,
+                'researcher_name': f"{institution}_researcher_{r_idx}",
+                'strategy': strategy,
+                'expertise_indices': expertise_indices,
+                'expertise_topics': [AVAILABLE_DIRECTIONS[i].topic for i in expertise_indices],
+            })
+    return blueprint
 
 
 class Simulation:
@@ -154,7 +227,13 @@ class Simulation:
 
         # Exploration experiment: paper novelty scores cache
         self._paper_novelty_scores = {}  # paper_id -> (novelty_score, bucket)
-        self._breakthrough_papers = {}  # paper_id -> citation_potential_multiplier
+        # Latent citation potential; metadata only — NEVER multiplied into
+        # observed citation counts (plan 4.5). Used solely for candidate
+        # reranking in the citation intervention.
+        self._citation_potential_multipliers = {}  # paper_id -> multiplier
+        self._pending_paper_metadata = []  # (paper_dict, author_id, year) queue for batch processing
+        self._direction_records = {}  # (agent_id, year) -> {'topic', 'distance', 'switched'}
+        self._direction_fallback_stats = {}  # year -> fallback counter dict
 
         # Preferential attachment experiment trackers (lazily initialized)
         self.collaboration_tracker = None
@@ -171,6 +250,9 @@ class Simulation:
         Creates multiple researchers mapped to universities and companies.
         """
         logger.info("Initializing agent population...")
+
+        if getattr(self.args, 'population_mode', 'default') == 'university_only':
+            return self._initialize_university_only_population()
 
         rich_universities = [
             "MIT", "Stanford", "Berkeley", "CMU", "GeorgiaTech",
@@ -355,10 +437,16 @@ class Simulation:
             logger.info(f"Added {freelancer.id}")
         """
 
-        # Add funding agents
-        # NSF: Foundational scientific advancement (patient, lower thresholds)
-        # DARPA: Application-driven projects (demanding, higher thresholds)
+        self._add_funding_agencies()
 
+        logger.info(f"Total agents initialized: {len(self.ecosystem.agent_population)}")
+
+    def _add_funding_agencies(self):
+        """Add the funding agencies shared by all population modes.
+
+        NSF: foundational scientific advancement (patient, lower thresholds).
+        DARPA: application-driven projects (demanding, higher thresholds).
+        """
         self.ecosystem.add_agent(FundingAgency(
             agency_name="NSF",
             default_funding_rate=0.23,  # NSF has a funding rate between [0.2, 0.25]
@@ -370,6 +458,53 @@ class Simulation:
             default_funding_rate=0.1,  # DARPA has a funding rate between [0.05, 0.15]
             llm=self.llm
         ))
+
+    def _initialize_university_only_population(self):
+        """Balanced university-only population for the exploration experiment (plan 4.2).
+
+        Equal initial funding, synthetic institutions, and exactly the configured
+        within-institution strategy mix, all derived deterministically from the
+        run seed via build_population_blueprint(). The blueprint is written to
+        the checkpoint directory as population_blueprint.csv for audit/balance checks.
+        """
+        num_institutions = getattr(self.args, 'num_institutions', None) or \
+            SIMULATION_CONFIG['exploration_experiment']['num_institutions']
+        per_institution = getattr(self.args, 'researchers_per_institution', None) or \
+            SIMULATION_CONFIG['exploration_experiment']['researchers_per_institution']
+        initial_funding = getattr(self.args, 'initial_funding', None) or \
+            SIMULATION_CONFIG['exploration_experiment']['initial_funding']
+        run_seed = getattr(self.args, 'seed', 42)
+
+        blueprint = build_population_blueprint(num_institutions, per_institution, run_seed)
+
+        for row in blueprint:
+            researcher = UniversityResearcher(
+                researcher_name=row['researcher_name'],
+                university_name=row['institution'],
+                funding_level=initial_funding,
+                expertise=[AVAILABLE_DIRECTIONS[i] for i in row['expertise_indices']],
+                llm=self.llm,
+                generate_research_proposal=True,
+                exploration_strategy=row['strategy'],
+            )
+            self.ecosystem.add_agent(researcher)
+
+        # Within-institution conflicts of interest
+        by_institution = defaultdict(set)
+        for row in blueprint:
+            by_institution[row['institution']].add(row['researcher_name'])
+        for institution, names in by_institution.items():
+            for name in names:
+                self.ecosystem.get_agent_by_id(name).add_conflict_of_interest(names - {name})
+
+        # Persist blueprint for audit and balance checks
+        blueprint_path = os.path.join(self.output_dir, 'population_blueprint.csv')
+        pd.DataFrame(blueprint).to_csv(blueprint_path, index=False)
+        logger.info(f"University-only population: {len(blueprint)} researchers at "
+                    f"{num_institutions} institutions (equal funding {initial_funding}); "
+                    f"blueprint saved to {blueprint_path}")
+
+        self._add_funding_agencies()
 
         logger.info(f"Total agents initialized: {len(self.ecosystem.agent_population)}")
 
@@ -384,11 +519,29 @@ class Simulation:
         if not self.is_exploration_experiment:
             return
 
+        cache_root = getattr(self.args, 'data_cache_dir', os.path.join('data', 'cache'))
+
         if self.embedding_tracker is None:
             from utopia.metrics.embedding_tracker import EmbeddingTracker
             exp_config = SIMULATION_CONFIG['exploration_experiment']
-            self.embedding_tracker = EmbeddingTracker(model_name=exp_config['embedding_model'])
+            self.embedding_tracker = EmbeddingTracker(
+                model_name=exp_config['embedding_model'],
+                cache_dir=os.path.join(cache_root, 'embeddings'))
             logger.info("Initialized EmbeddingTracker")
+
+        # Empirical near/far thresholds from the direction-pair distance
+        # distribution (plan 4.7); computed once, then frozen in checkpoints.
+        if self.embedding_tracker.near_threshold is None:
+            thresholds = self.embedding_tracker.compute_direction_thresholds(AVAILABLE_DIRECTIONS)
+            logger.info(f"Empirical novelty thresholds: {thresholds}")
+
+        # Expertise centroids as pre-first-paper career reference (plan 4.8)
+        for agent in self.ecosystem.agent_population.values():
+            if (isinstance(agent, (UniversityResearcher, IndustryResearcher))
+                    and agent.id not in self.embedding_tracker.expertise_centroids
+                    and getattr(agent, 'expertise', None)):
+                texts = [d.topic + " " + " ".join(d.keywords or []) for d in agent.expertise]
+                self.embedding_tracker.register_agent_expertise(agent.id, texts)
 
         if self.cd_calculator is None:
             from utopia.metrics.cd_index import CDIndexCalculator
@@ -402,7 +555,9 @@ class Simulation:
 
         if self.keyword_extractor is None:
             from utopia.metrics.keyword_extractor import KeywordExtractor
-            self.keyword_extractor = KeywordExtractor()
+            self.keyword_extractor = KeywordExtractor(
+                cache_dir=os.path.join(cache_root, 'keywords'),
+                model_id=getattr(self.llm, 'model_name', 'unknown'))
             logger.info("Initialized KeywordExtractor")
 
     def _parse_intention(self, result_json, direction_dict: Dict) -> str:
@@ -418,48 +573,50 @@ class Simulation:
         return " ".join(direction_dict['direction'].keywords)
 
     def _record_paper_metadata(self, paper_dict: Dict, author_id: str, year: int):
-        """Record keywords and embeddings for experiment tracking
+        """Enqueue a paper for batched metadata processing (plan 4.6).
 
-        Args:
-            paper_dict: Paper dictionary with 'id', 'abstract', etc.
-            author_id: Author ID
-            year: Current year
+        The actual keyword extraction and embedding happen once per year in
+        _record_paper_metadata_batch() — never one LLM/encode call per paper.
         """
         if not self.is_exploration_experiment:
             return
-
-        # Guard against empty abstract
         abstract = paper_dict.get('abstract', '')
         if not abstract or not abstract.strip():
             return
+        self._pending_paper_metadata.append((paper_dict, author_id, year))
 
-        # Lazy initialize trackers on first use
+    def _record_paper_metadata_batch(self, year: int):
+        """Process all enqueued papers with batched keywords + embeddings + novelty."""
+        if not self.is_exploration_experiment or not self._pending_paper_metadata:
+            return
+
         self._initialize_experiment_trackers()
-
         exp_config = SIMULATION_CONFIG['exploration_experiment']
+        pending = self._pending_paper_metadata
+        self._pending_paper_metadata = []
 
-        # Extract keywords (now returns dict)
-        if self.keyword_extractor is not None:
-            kw_result = self.keyword_extractor.extract_keywords_llm(
-                abstract=abstract,
-                llm=self.llm,
-                n_keywords=exp_config['num_keywords']
-            )
-            paper_dict['keywords'] = kw_result.get('keywords', [])
-            paper_dict['keywords_in_abstract'] = kw_result.get('keywords_in_abstract', [])
-            paper_dict['keywords_not_in_abstract'] = kw_result.get('keywords_not_in_abstract', [])
+        # Batched keyword extraction (LLM, cached by paper_id)
+        kw_results = self.keyword_extractor.extract_keywords_batch(
+            self.llm,
+            [(p['id'], p.get('abstract', '')) for p, _, _ in pending],
+            n_keywords=exp_config['num_keywords'],
+        )
+        n_fallback = sum(1 for r in kw_results.values() if r.get('provenance') == 'fallback')
+        if n_fallback:
+            logger.warning(f"Keyword extraction fell back for {n_fallback}/{len(pending)} papers")
 
-        # Add embedding
-        if self.embedding_tracker is not None:
-            self.embedding_tracker.add_paper_embedding(
-                paper_id=paper_dict['id'],
-                abstract=abstract,
-                author_id=author_id,
-                year=year
-            )
-            logger.debug(f"Added embedding for {paper_dict['id']}")
+        # Batched embedding (one encode call, disk-cached)
+        self.embedding_tracker.add_paper_embeddings_batch(
+            [(p['id'], p.get('abstract', ''), author_id, yr) for p, author_id, yr in pending])
+        self.embedding_tracker.flush_cache()
 
-            # Compute and store novelty score
+        for paper_dict, author_id, yr in pending:
+            kw = kw_results.get(paper_dict['id'], {})
+            paper_dict['keywords'] = kw.get('keywords', [])
+            paper_dict['keywords_in_abstract'] = kw.get('keywords_in_abstract', [])
+            paper_dict['keywords_not_in_abstract'] = kw.get('keywords_not_in_abstract', [])
+            paper_dict['keyword_provenance'] = kw.get('provenance', 'missing')
+
             novelty = self.embedding_tracker.compute_novelty_score(
                 paper_dict['id'], author_id,
                 history_window_years=exp_config.get('history_window_years', 3)
@@ -472,9 +629,19 @@ class Simulation:
                 paper_dict['novelty_score'] = 0.0
                 paper_dict['career_distance_bucket'] = 'unknown'
 
-            # Store exploration strategy on paper
             agent = self.ecosystem.get_agent_by_id(author_id)
             paper_dict['exploration_strategy'] = getattr(agent, 'exploration_strategy', 'balanced')
+
+            # Papers already archived before metadata was computed need an update
+            archived = self.paper_tracker.papers_by_id.get(paper_dict['id'])
+            if archived is not None:
+                for field in ('keywords', 'novelty_score', 'career_distance_bucket',
+                              'exploration_strategy', 'keyword_provenance'):
+                    if hasattr(archived, field):
+                        setattr(archived, field, paper_dict.get(field))
+
+        logger.info(f"Year {year}: batched metadata for {len(pending)} papers "
+                    f"({n_fallback} keyword fallbacks)")
 
     def _collect_exploration_metrics(self, year: int):
         """Collect exploration vs exploitation metrics at end of year
@@ -495,7 +662,9 @@ class Simulation:
         paper_ids_this_year = [pid for pid, _ in papers_this_year]
 
         if not paper_ids_this_year:
-            logger.info(f"Year {year}: No papers to collect exploration metrics for")
+            logger.info(f"Year {year}: No new papers; still collecting paper-age panel")
+            self._collect_paper_age_panel(year)
+            self.exploration_metrics.export_tables(getattr(self.args, 'docs_dir', self.output_dir))
             return
 
         distances = self.embedding_tracker.compute_distances_batch(papers_this_year)
@@ -523,17 +692,17 @@ class Simulation:
             for paper in conf.decisions.get('accept', []):
                 accepted_paper_ids.add(paper['id'])
 
-        # Collect all citation counts for accepted papers this year
+        # Collect all citation counts for accepted papers this year.
+        # Observed counts are ALWAYS the citation-graph in-degree — the latent
+        # citation-potential multiplier is metadata and is never applied here
+        # (plan 4.5).
         all_citation_counts = []
         paper_citation_map = {}
         for pid in paper_ids_this_year:
             if pid in accepted_paper_ids:
                 count = len(self.citation_tracker.get_citations_to_paper(pid))
-                # Apply breakthrough multiplier for effective citations
-                multiplier = self._breakthrough_papers.get(pid, 1.0)
-                effective_count = count * multiplier
-                all_citation_counts.append(effective_count)
-                paper_citation_map[pid] = effective_count
+                all_citation_counts.append(count)
+                paper_citation_map[pid] = count
 
         # Compute hit paper threshold
         hit_percentile = exp_config.get('hit_paper_percentile', 0.95)
@@ -623,13 +792,14 @@ class Simulation:
                     metric='top10_citation_share', value=top10_count / total_top10
                 )
 
-            # Record per-agent stats
+            # Record per-agent stats + structured agent_year rows
             for a in agents:
                 agent_papers_yr = [pid for pid, aid in papers_this_year if aid == a.id]
                 agent_accepted_yr = [pid for pid in agent_papers_yr if pid in accepted_paper_ids]
                 agent_citations = [paper_citation_map.get(pid, 0) for pid in agent_accepted_yr]
+                dir_record = self._direction_records.get((a.id, year), {})
 
-                self.exploration_metrics.record_agent_stats(a.id, year, {
+                stats = {
                     'strategy': strategy,
                     'num_papers': len(agent_papers_yr),
                     'num_accepted': len(agent_accepted_yr),
@@ -637,9 +807,165 @@ class Simulation:
                     'funding': getattr(a, 'resources', 0),
                     'total_citations': sum(agent_citations),
                     'hit_papers': sum(1 for c in agent_citations if c >= hit_threshold),
+                }
+                self.exploration_metrics.record_agent_stats(a.id, year, stats)
+                self.exploration_metrics.add_row('agent_year', {
+                    'agent_id': a.id, 'year': year,
+                    'institution': getattr(a, 'university_name', None) or getattr(a, 'company_name', None),
+                    'is_active': getattr(a, 'is_active', True),
+                    'direction_topic': dir_record.get('topic'),
+                    'direction_distance': dir_record.get('distance'),
+                    'topic_switched': dir_record.get('switched'),
+                    'avg_career_distance': self.exploration_metrics.get_author_avg_distance(a.id, year),
+                    **stats,
                 })
 
+        # Structured paper rows for this year's papers
+        for pid, aid in papers_this_year:
+            paper = self.paper_tracker.papers_by_id[pid]
+            novelty = self._paper_novelty_scores.get(pid)
+            agent = self.ecosystem.get_agent_by_id(aid)
+            last_review = paper.review_history[-1] if paper.review_history else {}
+            self.exploration_metrics.add_row('paper', {
+                'paper_id': pid, 'author_id': aid, 'year': year,
+                'strategy': getattr(agent, 'exploration_strategy', 'balanced') if agent else None,
+                'institution': (getattr(agent, 'university_name', None)
+                                or getattr(agent, 'company_name', None)) if agent else None,
+                'accepted': pid in accepted_paper_ids,
+                'review_score': last_review.get('score'),
+                'conference': getattr(paper, 'conference', None),
+                'novelty_score': novelty[0] if novelty else None,
+                'distance_bucket': novelty[1] if novelty else None,
+                'career_distance': distances.get(pid),
+                'keyword_provenance': getattr(paper, 'keyword_provenance', None),
+                'citation_potential_multiplier': self._citation_potential_multipliers.get(pid),
+            })
+
+        # Ecosystem-year row (diversity, inequality, population)
+        chosen_topics = [r['topic'] for (aid, y), r in self._direction_records.items() if y == year]
+        topic_counts = Counter(chosen_topics)
+        if topic_counts:
+            probs = np.array(list(topic_counts.values()), dtype=float)
+            probs /= probs.sum()
+            entropy = float(-(probs * np.log(probs)).sum())
+            norm_entropy = entropy / np.log(len(AVAILABLE_DIRECTIONS))
+        else:
+            entropy, norm_entropy = None, None
+        active_researchers = [a for a in self.ecosystem.agent_population.values()
+                              if isinstance(a, (UniversityResearcher, IndustryResearcher))
+                              and getattr(a, 'is_active', True)]
+        all_funding = [a.resources for a in active_researchers if getattr(a, 'resources', None) is not None]
+        cumulative_citation_counts = [len(v) for v in self.citation_tracker.citations.values()]
+        self.exploration_metrics.add_row('ecosystem_year', {
+            'year': year,
+            'topic_entropy': entropy,
+            'topic_entropy_normalized': norm_entropy,
+            'occupied_directions': len(topic_counts),
+            'num_active_researchers': len(active_researchers),
+            'num_submissions': len(paper_ids_this_year),
+            'num_accepted': len([p for p in paper_ids_this_year if p in accepted_paper_ids]),
+            'funding_gini': calculate_gini_coefficient(all_funding) if all_funding else None,
+            'citation_gini': (calculate_gini_coefficient(cumulative_citation_counts)
+                              if cumulative_citation_counts else None),
+            'direction_fallback_stats': json.dumps(self._direction_fallback_stats.get(year, {})),
+        })
+
+        # Strategy-year rows from the aggregate metric dict
+        for strategy in exp_config['strategies']:
+            metrics_dict = dict(self.exploration_metrics.strategy_metrics[strategy].get(year, {}))
+            if metrics_dict:
+                self.exploration_metrics.add_row('strategy_year', {
+                    'strategy': strategy, 'year': year, **metrics_dict})
+
+        # Paper-age panel + annual CD recomputation for ALL prior accepted papers
+        self._collect_paper_age_panel(year)
+
+        # Persist structured tables (small; atomic rewrite per year)
+        self.exploration_metrics.export_tables(getattr(self.args, 'docs_dir', self.output_dir))
+
         logger.info(f"Year {year}: Collected exploration metrics for {len(paper_ids_this_year)} papers")
+
+    def _collect_paper_age_panel(self, year: int):
+        """Append paper-age outcomes for every accepted paper each year (plan 4.10).
+
+        Records cumulative citations (graph in-degree), time to first citation,
+        and the corrected CD index (plan 4.9) at the paper's current age, so the
+        analysis can compare papers at fixed ages and CD windows.
+        """
+        exp_config = SIMULATION_CONFIG['exploration_experiment']
+        cd_min_denominator = exp_config['cd_min_denominator']
+        age_windows = set(exp_config['citation_age_windows'])
+
+        for pid, paper in self.paper_tracker.papers_by_id.items():
+            if paper.status != 'accept' or paper.year > year:
+                continue
+            age = year - paper.year
+            if age not in age_windows:
+                continue
+            citing = self.citation_tracker.get_papers_citing(pid)
+            citing_years = [self.paper_tracker.papers_by_id[c].year
+                            for c in citing if c in self.paper_tracker.papers_by_id]
+            time_to_first = (min(citing_years) - paper.year) if citing_years else None
+            cd_result = self.cd_calculator.calculate_cd_index(
+                pid, cutoff_year=year, min_denominator=cd_min_denominator)
+            aid = paper.all_author_ids[0]
+            agent = self.ecosystem.get_agent_by_id(aid)
+            if cd_result is not None:
+                self.exploration_metrics.record_cd_index(pid, year, cd_result['cd'])
+            self.exploration_metrics.add_row('paper_age', {
+                'paper_id': pid, 'author_id': aid,
+                'strategy': getattr(agent, 'exploration_strategy', 'balanced') if agent else None,
+                'institution': (getattr(agent, 'university_name', None)
+                                or getattr(agent, 'company_name', None)) if agent else None,
+                'publication_year': paper.year,
+                'observation_year': year,
+                'age': age,
+                'citations': len(citing),
+                'time_to_first_citation': time_to_first,
+                'cd': cd_result['cd'] if cd_result else None,
+                'cd_denominator': cd_result['denominator'] if cd_result else None,
+                'cd_n_disruptive': cd_result['n_disruptive'] if cd_result else None,
+                'cd_n_consolidating': cd_result['n_consolidating'] if cd_result else None,
+                'novelty_score': (self._paper_novelty_scores.get(pid) or (None,))[0],
+            })
+
+    def _run_integrity_checks(self, year: int) -> Dict:
+        """Graph and temporal integrity checks, written per year (plan 11.4).
+
+        Any failure is recorded (and loudly logged) rather than silently ignored.
+        """
+        checks = {'year': year, 'passed': True, 'failures': []}
+        failures = check_citation_integrity(self.paper_tracker, self.citation_tracker)
+
+        # No duplicate paper submissions across conferences in the same year
+        seen = set()
+        for conf in self.conference_system.conferences:
+            for paper in conf.submitted_papers:
+                key = (paper['id'], year)
+                if key in seen:
+                    failures.append(f"paper {paper['id']} submitted to multiple conferences in year {year}")
+                seen.add(key)
+
+        if failures:
+            checks['passed'] = False
+            checks['failures'] = failures
+            for msg in failures:
+                logger.error(f"[Integrity] {msg}")
+
+        checks['n_papers'] = len(self.paper_tracker.papers_by_id)
+        checks['n_citation_edges'] = sum(len(v) for v in self.citation_tracker.citations.values())
+
+        docs_dir = getattr(self.args, 'docs_dir', self.output_dir)
+        os.makedirs(docs_dir, exist_ok=True)
+        path = os.path.join(docs_dir, 'integrity_checks.json')
+        existing = []
+        if os.path.exists(path):
+            with open(path) as f:
+                existing = json.load(f)
+        existing = [c for c in existing if c.get('year') != year] + [checks]
+        with open(path, 'w') as f:
+            json.dump(existing, f, indent=2)
+        return checks
 
     # ==================== Preferential Attachment Experiment ====================
 
@@ -775,7 +1101,8 @@ class Simulation:
             if batch_prompts:
                 batch_results = self.llm.generate_batch(
                     batch_prompts, response_format=collab_response_format,
-                    desc=f"{len(batch_prompts)} collaboration decisions"
+                    desc=f"{len(batch_prompts)} collaboration decisions",
+                    seed_ctx=('phase15_collab', year),
                 )
                 for i, (result, _) in enumerate(batch_results):
                     meta = batch_metadata[i]
@@ -986,7 +1313,7 @@ class Simulation:
                 if not batch_prompts:
                     break
 
-                batch_results = self.llm.generate_batch(batch_prompts, response_format=resubmission_response_format, desc=f"{len(batch_prompts)} resubmission decisions (attempt {attempt+1}/{MAX_RESUBMISSION_RETRIES})")
+                batch_results = self.llm.generate_batch(batch_prompts, response_format=resubmission_response_format, desc=f"{len(batch_prompts)} resubmission decisions (attempt {attempt+1}/{MAX_RESUBMISSION_RETRIES})", seed_ctx=('phase0_resubmit', year, attempt))
 
                 agents_needing_retry = []
 
@@ -1141,31 +1468,60 @@ class Simulation:
         # Check if LLM supports batching
         supports_batching = hasattr(self.llm, 'generate_batch')
 
-        # For exploration experiment: pre-filter candidate directions per agent
+        # For exploration experiment: pre-filter candidate directions per agent.
+        # Candidates are passed EXPLICITLY so the prompt and validation use the
+        # same set (plan 4.1) — no hidden agent attribute.
+        candidate_map = None
         if self.is_exploration_experiment and authors_with_directions_pending:
             self._initialize_experiment_trackers()
             exp_config = SIMULATION_CONFIG['exploration_experiment']
+            candidate_map = {}
             for agent in authors_with_directions_pending:
-                filtered = get_strategy_filtered_candidate_directions(
+                candidate_map[agent.id] = get_strategy_filtered_candidate_directions(
                     agent, AVAILABLE_DIRECTIONS, self.embedding_tracker, year, exp_config
                 )
-                agent._filtered_candidates = filtered
 
         if supports_batching and authors_with_directions_pending:
 
+            fallback_counter = {}
             directions = create_research_directions_batch(
                 agents=authors_with_directions_pending,
                 year=year,
                 paper_tracker=self.paper_tracker,
                 llm=self.llm,
-                average_funding_level=average_funding_level
+                average_funding_level=average_funding_level,
+                candidate_map=candidate_map,
+                fallback_counter=fallback_counter,
             )
+            self._direction_fallback_stats[year] = fallback_counter
             # Update agent project timelines
             for agent in authors_with_directions_pending:
                 direction = directions[agent.id]
                 agent.project_start_year = year
                 agent.project_end_year = (year - 1) + direction['direction'].years
                 agent.newest_direction = direction
+
+            # Record chosen-direction distance and topic-switch indicator (plan 5.4)
+            if self.is_exploration_experiment:
+                exp_config = SIMULATION_CONFIG['exploration_experiment']
+                for agent in authors_with_directions_pending:
+                    chosen = directions[agent.id]['direction']
+                    centroid = self.embedding_tracker.compute_career_centroid(
+                        agent.id, max_years=exp_config['history_window_years'],
+                        current_year=year - 1)
+                    distance = None
+                    if centroid is not None:
+                        dist_map = self.embedding_tracker.compute_direction_distances(
+                            centroid, [chosen])
+                        distance = dist_map.get(chosen.topic)
+                    prev = next((self._direction_records[k] for k in
+                                 [(agent.id, y) for y in range(year - 1, 0, -1)]
+                                 if k in self._direction_records), None)
+                    self._direction_records[(agent.id, year)] = {
+                        'topic': chosen.topic,
+                        'distance': distance,
+                        'switched': bool(prev and prev['topic'] != chosen.topic),
+                    }
         else:
             # ==================== SEQUENTIAL PATH (GPT/non-batch) ====================
             directions = {}
@@ -1282,7 +1638,8 @@ class Simulation:
             intention_results = self.llm.generate_batch(
                 intention_prompts, max_tokens=SIMULATION_CONFIG['llm']['max_tokens'],
                 response_format=intention_response_format,
-                desc=f"Generating {len(intention_prompts)} intentions"
+                desc=f"Generating {len(intention_prompts)} intentions",
+                seed_ctx=('phase2_intentions', year),
             )
             for agent, (result_json, _) in zip(active_authors, intention_results):
                 intention = self._parse_intention(result_json, directions[agent.id])
@@ -1372,7 +1729,7 @@ class Simulation:
                 if not batch_prompts:
                     break
 
-                batch_results = self.llm.generate_batch(batch_prompts, max_tokens=SIMULATION_CONFIG['llm']['max_tokens'], temperature=0.7, response_format=paper_submission_response_format, desc=f"{len(batch_prompts)} paper submissions (attempt {attempt+1}/{MAX_SUBMISSION_RETRIES})")
+                batch_results = self.llm.generate_batch(batch_prompts, max_tokens=SIMULATION_CONFIG['llm']['max_tokens'], temperature=0.7, response_format=paper_submission_response_format, desc=f"{len(batch_prompts)} paper submissions (attempt {attempt+1}/{MAX_SUBMISSION_RETRIES})", seed_ctx=('phase2_submissions', year, attempt))
 
                 agents_needing_fallback = []
 
@@ -1680,7 +2037,9 @@ class Simulation:
                     agent = self.ecosystem.get_agent_by_id(self._get_lead_author_id(submitted_paper))
                     candidate_papers = self._build_candidate_papers(
                         self.rag.documents,
-                        topk_indices_citation_accepted[i][:SIMULATION_CONFIG['citation']['num_candidate_papers']]
+                        self._rerank_citation_candidates(
+                            topk_indices_citation_accepted[i],
+                            SIMULATION_CONFIG['citation']['num_candidate_papers'])
                     )
 
                     assert set([cp['id'] for cp in candidate_papers]) <= accepted_papers_arxiv_ids, \
@@ -1708,7 +2067,8 @@ class Simulation:
 
                     batch_results = self.llm.generate_batch(
                         batch_prompts, response_format=citation_response_format,
-                        desc=f"{len(batch_prompts)} regular citations (attempt {attempt+1}/{MAX_CITATION_RETRIES})"
+                        desc=f"{len(batch_prompts)} regular citations (attempt {attempt+1}/{MAX_CITATION_RETRIES})",
+                        seed_ctx=('phase2_citations_regular', year, attempt),
                     )
 
                     items_needing_retry = []
@@ -1762,7 +2122,9 @@ class Simulation:
                         agent = self.ecosystem.get_agent_by_id(self._get_lead_author_id(submitted_paper))
                         candidate_papers = self._build_candidate_papers(
                             self.rag.documents,
-                            topk_indices_citation_both[i][:SIMULATION_CONFIG['citation']['num_candidate_papers']]
+                            self._rerank_citation_candidates(
+                                topk_indices_citation_both[i],
+                                SIMULATION_CONFIG['citation']['num_candidate_papers'])
                         )
 
                         citing_institution = getattr(agent, 'university_name', None) or getattr(agent, 'company_name', None)
@@ -1785,7 +2147,8 @@ class Simulation:
 
                     batch_results = self.llm.generate_batch(
                         batch_prompts, response_format=citation_response_format,
-                        desc=f"{len(batch_prompts)} extended citations (attempt {attempt+1}/{MAX_CITATION_RETRIES})"
+                        desc=f"{len(batch_prompts)} extended citations (attempt {attempt+1}/{MAX_CITATION_RETRIES})",
+                        seed_ctx=('phase2_citations_extended', year, attempt),
                     )
 
                     items_needing_retry = []
@@ -1853,7 +2216,8 @@ class Simulation:
 
                     batch_results = self.llm.generate_batch(
                         batch_prompts, response_format=self_citation_response_format,
-                        desc=f"{len(batch_prompts)} self-citations (attempt {attempt+1}/{MAX_CITATION_RETRIES})"
+                        desc=f"{len(batch_prompts)} self-citations (attempt {attempt+1}/{MAX_CITATION_RETRIES})",
+                        seed_ctx=('phase2_citations_self', year, attempt),
                     )
 
                     items_needing_retry = []
@@ -1905,7 +2269,9 @@ class Simulation:
                     agent = self.ecosystem.get_agent_by_id(self._get_lead_author_id(submitted_paper))
                     candidate_papers = self._build_candidate_papers(
                         self.rag.documents,
-                        topk_indices_citation_accepted[i][:SIMULATION_CONFIG['citation']['num_candidate_papers']]
+                        self._rerank_citation_candidates(
+                            topk_indices_citation_accepted[i],
+                            SIMULATION_CONFIG['citation']['num_candidate_papers'])
                     )
 
                     assert set([candidate_paper['id'] for candidate_paper in
@@ -1948,7 +2314,9 @@ class Simulation:
                         # Get candidates from all papers, including rejected papers.
                         candidate_papers = self._build_candidate_papers(
                             self.rag.documents,
-                            topk_indices_citation_both[i][:SIMULATION_CONFIG['citation']['num_candidate_papers']]
+                            self._rerank_citation_candidates(
+                                topk_indices_citation_both[i],
+                                SIMULATION_CONFIG['citation']['num_candidate_papers'])
                         )
 
                         prompt, response_format = agent.get_citation_prompt(
@@ -2118,7 +2486,7 @@ class Simulation:
 
             # Step 2: Single batch call for ALL prompts
             if batch_prompts:
-                batch_results = self.llm.generate_batch(batch_prompts, temperature=0.7, response_format=peer_review_response_format, desc=f"{len(batch_prompts)} peer reviews")
+                batch_results = self.llm.generate_batch(batch_prompts, temperature=0.7, response_format=peer_review_response_format, desc=f"{len(batch_prompts)} peer reviews", seed_ctx=('phase3_reviews', year))
 
                 # Step 3: Process results
                 for i, (review_json, message_history) in enumerate(batch_results):
@@ -2466,7 +2834,8 @@ class Simulation:
                         batch_results = self.llm.generate_batch(
                             batch_prompts, temperature=0.7,
                             response_format=funding_response_format,
-                            desc=f"{len(batch_prompts)} funding applications (attempt {attempt+1}/{MAX_FUNDING_RETRIES})"
+                            desc=f"{len(batch_prompts)} funding applications (attempt {attempt+1}/{MAX_FUNDING_RETRIES})",
+                            seed_ctx=('phase5_funding_apps', year, attempt),
                         )
                     except Exception as e:
                         logger.warning(f"Batch funding generation failed on attempt {attempt+1}: {e}")
@@ -2567,10 +2936,16 @@ class Simulation:
         all_eval_metadata = []
         eval_response_format = None
 
+        # Deterministic panelization keeps funding-ranking prompts bounded at scale;
+        # fidelity vs global ranking is validated before confirmatory use.
+        panel_max_apps = (SIMULATION_CONFIG['exploration_experiment']['funding_panel_max_apps']
+                          if self.is_exploration_experiment else None)
         for funding_agent in funding_agencies:
             all_funding_programs_dict.update(funding_agent.funding_programs)
             funding_proposal_eval_prompts, resp_fmt, eval_metadata = funding_agent.get_funding_evaluation_prompts(
-                university_applications, submitted_papers_dict=submitted_papers_dict
+                university_applications, submitted_papers_dict=submitted_papers_dict,
+                panel_max_apps=panel_max_apps,
+                panel_seed=derive_seed(getattr(self.args, 'seed', 42), 'funding_panels', year),
             )
             all_funding_proposal_eval_prompts.extend(funding_proposal_eval_prompts)
             all_eval_metadata.extend(eval_metadata)
@@ -2590,7 +2965,8 @@ class Simulation:
                 if hasattr(self.llm, 'generate_batch'):
                     eval_results = self.llm.generate_batch(
                         all_funding_proposal_eval_prompts, response_format=eval_response_format,
-                        desc=f"{len(all_funding_proposal_eval_prompts)} funding evaluations (attempt {attempt+1}/{MAX_FUNDING_EVAL_RETRIES})"
+                        desc=f"{len(all_funding_proposal_eval_prompts)} funding evaluations (attempt {attempt+1}/{MAX_FUNDING_EVAL_RETRIES})",
+                        seed_ctx=('phase5_funding_eval', year, attempt),
                     )
                 else:
                     eval_results = []
@@ -2623,13 +2999,21 @@ class Simulation:
                 all_funding_proposal_eval_prompts = retry_prompts
                 all_eval_metadata = retry_metadata
 
-            # Step 3: Process all results (valid + any final failures with fallback)
-            all_funding_winners_dict = FundingAgency.process_funding_evaluation_results(
-                final_eval_results, final_eval_metadata, all_funding_programs_dict
-            )
+            # Step 3: Process all results (valid + any final failures with fallback).
+            # Funding-conservatism intervention: novelty penalties are applied to
+            # scores BEFORE winner selection (plan 4.4); neutral mode passes none.
+            novelty_penalties = None
+            lambda_funding = 0.0
+            if self.is_exploration_experiment and getattr(self.args, 'funding_intervention', False):
+                applicant_ids = list({app['applicant_id']
+                                      for meta in final_eval_metadata for app in meta['apps']})
+                novelty_penalties = self._compute_recent_novelty_percentiles(applicant_ids)
+                lambda_funding = SIMULATION_CONFIG['exploration_experiment']['novelty_penalty_in_funding']
 
-            # Apply funding conservatism for exploration experiment
-            self._apply_funding_conservatism(all_funding_winners_dict, year)
+            all_funding_winners_dict = FundingAgency.process_funding_evaluation_results(
+                final_eval_results, final_eval_metadata, all_funding_programs_dict,
+                novelty_penalties=novelty_penalties, lambda_funding=lambda_funding,
+            )
 
             for program_id, winners in all_funding_winners_dict.items():
                 winners_list.extend([agent['applicant_id'] for agent in winners])
@@ -2703,16 +3087,18 @@ class Simulation:
         year_results['conference_statistics'] = self.conference_system.get_all_statistics()
 
     def _apply_strategy_quality_adjustment(self, year: int):
-        """Apply strategy-dependent quality adjustment to review scores.
+        """SYNTHETIC STRESS TEST ONLY — never part of the main (neutral) results.
 
-        Adds noise based on exploration strategy: explorers have higher variance
-        but slight negative bias, exploiters have low variance and slight positive bias.
-        Only active for exploration experiment.
+        Adds strategy-dependent bias/variance noise directly to review scores.
+        Disabled by default (config review_strategy_adjustment=False) because it
+        manufactures the expected outcome (plan 4.3/6.4).
         """
         if not self.is_exploration_experiment:
             return
 
         exp_config = SIMULATION_CONFIG['exploration_experiment']
+        if not exp_config.get('review_strategy_adjustment', False):
+            return
         bias_map = {
             'explorer': (exp_config['explorer_success_bias'], exp_config['explorer_variance']),
             'exploiter': (exp_config['exploiter_success_bias'], exp_config['exploiter_variance']),
@@ -2734,70 +3120,79 @@ class Simulation:
                     adjustment = np.random.normal(bias, variance)
                     review['overall_score'] = max(1, min(10, review['overall_score'] + adjustment))
 
-    def _apply_citation_breakthrough_bonus(self, year: int):
-        """Mark high-novelty accepted papers as potential breakthroughs.
+    def _assign_citation_potential(self, year: int):
+        """Assign a deterministic latent citation-potential multiplier to each
+        newly accepted paper (plan 6.3).
 
-        Stores multiplier in self._breakthrough_papers for use in metrics.
-        Only active for exploration experiment.
+        Stored as metadata ONLY — observed citation counts always equal graph
+        in-degree. The multiplier affects outcomes solely by reranking citation
+        candidates when the citation intervention is enabled; in neutral runs
+        (lambda_citation=0) it is inert bookkeeping.
         """
         if not self.is_exploration_experiment:
             return
 
         exp_config = SIMULATION_CONFIG['exploration_experiment']
-        threshold = exp_config['breakthrough_probability_threshold']
-        multiplier_mean = exp_config['breakthrough_multiplier_mean']
+        clip_lo, clip_hi = exp_config['citation_potential_clip']
+        run_seed = getattr(self.args, 'seed', 42)
 
         for conf in self.conference_system.conferences:
             for paper in conf.decisions.get('accept', []):
+                if paper['id'] in self._citation_potential_multipliers:
+                    continue
                 novelty_data = self._paper_novelty_scores.get(paper['id'])
-                if novelty_data is None:
-                    continue
+                q = novelty_data[0] if novelty_data else 0.0
+                # Deterministic seeded lognormal: mean and variance both grow
+                # modestly with novelty (high novelty = high risk AND high potential)
+                rng = random.Random(derive_seed(run_seed, 'citepot', paper['id']))
+                multiplier = float(np.clip(
+                    np.exp(rng.gauss(0.15 * q, 0.10 + 0.40 * q)), clip_lo, clip_hi))
+                self._citation_potential_multipliers[paper['id']] = multiplier
 
-                novelty_score = novelty_data[0]
-                if novelty_score > threshold:
-                    # Probability of breakthrough proportional to novelty
-                    if random.random() < novelty_score:
-                        self._breakthrough_papers[paper['id']] = multiplier_mean
-                        logger.info(f"Breakthrough paper: {paper['id']} (novelty={novelty_score:.3f}, multiplier={multiplier_mean})")
+    def _compute_recent_novelty_percentiles(self, applicant_ids: List[str]) -> Dict[str, float]:
+        """Recent-novelty percentile per applicant for the funding-conservatism
+        intervention (plan 6.2). Percentiles are computed among the given
+        applicants; applicants with no scored papers get 0.0."""
+        if self.embedding_tracker is None:
+            return {}
+        by_author = defaultdict(list)
+        for pid, meta in self.embedding_tracker.paper_metadata.items():
+            if pid in self._paper_novelty_scores:
+                by_author[meta['author_id']].append(self._paper_novelty_scores[pid][0])
+        avg_novelty = {aid: float(np.mean(by_author[aid]))
+                       for aid in applicant_ids if by_author.get(aid)}
+        if not avg_novelty:
+            return {aid: 0.0 for aid in applicant_ids}
+        values = np.array(sorted(avg_novelty.values()))
+        return {aid: float(np.searchsorted(values, avg_novelty[aid], side='right') / len(values))
+                if aid in avg_novelty else 0.0
+                for aid in applicant_ids}
 
-    def _apply_funding_conservatism(self, all_funding_winners_dict: Dict, year: int):
-        """Re-rank funding winners to penalize high-novelty researchers.
+    def _rerank_citation_candidates(self, indices, k: int):
+        """Select k citation candidates from semantically ranked indices.
 
-        Reduces effective scores for researchers with high average novelty,
-        modeling real-world conservatism in funding decisions.
-        Only active for exploration experiment.
+        Neutral mode: top-k by semantic rank (unchanged legacy behavior).
+        Citation intervention: rerank the top-2k by
+        semantic_rank_score + lambda_citation * log(citation_potential_multiplier),
+        keeping semantic relevance dominant; the LLM still makes the final choice.
         """
-        if not self.is_exploration_experiment:
-            return
-
+        indices = list(indices)
+        if (not self.is_exploration_experiment
+                or not getattr(self.args, 'citation_intervention', False)):
+            return indices[:k]
         exp_config = SIMULATION_CONFIG['exploration_experiment']
-        penalty_weight = exp_config['novelty_penalty_in_funding']
-
-        for program_id, winners in all_funding_winners_dict.items():
-            for winner in winners:
-                agent_id = winner.get('applicant_id')
-                if not agent_id:
-                    continue
-
-                # Get average novelty from recent papers
-                agent_papers = [
-                    pid for pid, meta in self.embedding_tracker.paper_metadata.items()
-                    if meta['author_id'] == agent_id
-                ] if self.embedding_tracker else []
-
-                if not agent_papers:
-                    continue
-
-                novelty_scores = [
-                    self._paper_novelty_scores[pid][0]
-                    for pid in agent_papers
-                    if pid in self._paper_novelty_scores
-                ]
-
-                if novelty_scores:
-                    avg_novelty = np.mean(novelty_scores)
-                    # Reduce effective score (stored as penalty for downstream use)
-                    winner['novelty_penalty'] = penalty_weight * avg_novelty
+        lam = exp_config.get('lambda_citation', 0.0)
+        if lam <= 0:
+            return indices[:k]
+        pool = indices[:2 * k]
+        scored = []
+        for rank, idx in enumerate(pool):
+            sem_score = 1.0 - rank / max(len(pool) - 1, 1)
+            paper_id = self.rag.documents[idx].metadata['id']
+            mult = self._citation_potential_multipliers.get(paper_id, 1.0)
+            scored.append((sem_score + lam * np.log(mult), idx))
+        scored.sort(key=lambda x: -x[0])
+        return [idx for _, idx in scored[:k]]
 
     def run_one_round(self, year: int) -> Dict:
         """Run simulation for one year - orchestrates all phases
@@ -2826,6 +3221,8 @@ class Simulation:
         submissions_list = self._run_phase_2_submit_papers(
             year, directions, active_authors, resubmissions_list, year_results
         )
+        # Batched metadata (keywords + embeddings + novelty) for all new papers this year
+        self._record_paper_metadata_batch(year)
         self.wandb_logger.log_phase(year, 2, year_results, self)
 
         # Charge annual costs
@@ -2842,14 +3239,18 @@ class Simulation:
         self._run_phase_4_acceptance_decisions(year, year_results)
         self.wandb_logger.log_phase(year, 4, year_results, self)
 
-        # Apply citation breakthrough bonus for high-novelty accepted papers
-        self._apply_citation_breakthrough_bonus(year)
+        # Assign latent citation-potential metadata to newly accepted papers
+        self._assign_citation_potential(year)
 
         # Phase 5: Update funding
         self._run_phase_5_update_funding(year, submissions_list, year_results)
 
         # Collect exploration metrics (if enabled)
         self._collect_exploration_metrics(year)
+
+        # Graph/temporal integrity checks, written per year (exploration experiment)
+        if self.is_exploration_experiment:
+            self._run_integrity_checks(year)
 
         # Collect preferential attachment metrics (if enabled)
         self._collect_preferential_attachment_metrics(year)
@@ -2865,6 +3266,14 @@ class Simulation:
         logger.info("Starting Academic Ecosystem Simulation")
         logger.info(f"Configuration: {self.num_years} years")
 
+        docs_dir = getattr(self.args, 'docs_dir', self.output_dir)
+        write_run_manifest(
+            docs_dir, status='running', args=self.args,
+            resolved_config=SIMULATION_CONFIG,
+            extra={'experiment_id': getattr(self.args, 'experiment_id', self.experiment_name),
+                   'model_id': getattr(self.llm, 'model_name', 'unknown'),
+                   'run_seed': getattr(self.args, 'seed', None)})
+
         start_year = 1
         checkpoint_loaded = False
         loaded_year = None
@@ -2874,7 +3283,7 @@ class Simulation:
             # Try to find the most recent checkpoint
             for year in range(self.num_years, 0, -1):
                 checkpoint_path = os.path.join(self.output_dir, f"checkpoint_year_{year}.json")
-                if os.path.exists(checkpoint_path):
+                if os.path.exists(checkpoint_path) or os.path.exists(checkpoint_path + '.gz'):
                     logger.info(f"Found checkpoint at year {year}, attempting to load...")
                     if self.load_checkpoint(year):
                         start_year = year + 1
@@ -2903,9 +3312,10 @@ class Simulation:
             ]
 
             # Select conferences proportionally to agent expertise
+            num_conferences = getattr(self.args, 'num_conferences', None) or (1 if self.debug else 10)
             selected_conferences = select_conferences_for_simulation(
                 agents=research_agents,
-                num_conferences=1 if self.debug else 10
+                num_conferences=num_conferences
             )
 
             # Create conference system with selected conferences
@@ -2945,6 +3355,13 @@ class Simulation:
         self._generate_final_report()
         self.wandb_logger.finish()
 
+        write_run_manifest(
+            docs_dir, status='complete',
+            extra={'llm_call_stats': getattr(self.llm, 'call_stats', None),
+                   'direction_fallback_stats': {str(k): v for k, v in
+                                                self._direction_fallback_stats.items()},
+                   'years_completed': self.num_years})
+
         logger.info("\nSimulation completed!")
         logger.info(f"Results saved to: {self.output_dir}")
 
@@ -2979,7 +3396,11 @@ class Simulation:
                 'embedding_tracker': self.embedding_tracker.to_dict() if self.embedding_tracker else None,
                 'exploration_metrics': self.exploration_metrics.to_dict() if self.exploration_metrics else None,
                 'paper_novelty_scores': {k: list(v) for k, v in self._paper_novelty_scores.items()},
-                'breakthrough_papers': self._breakthrough_papers,
+                'citation_potential_multipliers': self._citation_potential_multipliers,
+                'direction_records': {f"{aid}|{y}": rec for (aid, y), rec in
+                                      self._direction_records.items()},
+                'direction_fallback_stats': {str(k): v for k, v in
+                                             self._direction_fallback_stats.items()},
             }
 
         # Save preferential attachment experiment trackers if enabled
@@ -2991,8 +3412,15 @@ class Simulation:
                 'collaboration_pairs': {str(k): v for k, v in self._collaboration_pairs.items()},
             }
 
-        with open(checkpoint_path, 'w') as f:
-            json.dump(checkpoint_data, f, indent=2)
+        # Large-stage runs write gzipped checkpoints (~10x smaller; plan scale rule)
+        if getattr(self.args, 'experiment_stage', None) in ('calibration', 'confirmatory', 'manyworld', 'mechanism'):
+            import gzip
+            checkpoint_path += '.gz'
+            with gzip.open(checkpoint_path, 'wt') as f:
+                json.dump(checkpoint_data, f)
+        else:
+            with open(checkpoint_path, 'w') as f:
+                json.dump(checkpoint_data, f, indent=2)
 
         logger.info(f"Checkpoint saved for year {year}: {checkpoint_path}")
 
@@ -3007,12 +3435,16 @@ class Simulation:
         """
         checkpoint_path = os.path.join(self.output_dir, f"checkpoint_year_{year}.json")
 
-        if not os.path.exists(checkpoint_path):
-            logger.warning(f"Checkpoint not found: {checkpoint_path}")
+        if os.path.exists(checkpoint_path):
+            with open(checkpoint_path, 'r') as f:
+                checkpoint_data = json.load(f)
+        elif os.path.exists(checkpoint_path + '.gz'):
+            import gzip
+            with gzip.open(checkpoint_path + '.gz', 'rt') as f:
+                checkpoint_data = json.load(f)
+        else:
+            logger.warning(f"Checkpoint not found: {checkpoint_path}(.gz)")
             return False
-
-        with open(checkpoint_path, 'r') as f:
-            checkpoint_data = json.load(f)
 
         self.current_year = checkpoint_data['year']
 
@@ -3060,7 +3492,12 @@ class Simulation:
 
             if exp_data.get('embedding_tracker'):
                 from utopia.metrics.embedding_tracker import EmbeddingTracker
-                self.embedding_tracker = EmbeddingTracker.from_dict(exp_data['embedding_tracker'])
+                self.embedding_tracker = EmbeddingTracker.from_dict(
+                    exp_data['embedding_tracker'],
+                    model_name=SIMULATION_CONFIG['exploration_experiment']['embedding_model'],
+                    cache_dir=os.path.join(
+                        getattr(self.args, 'data_cache_dir', os.path.join('data', 'cache')),
+                        'embeddings'))
                 logger.info(f"  Loaded EmbeddingTracker with {len(self.embedding_tracker.embeddings)} embeddings")
 
             if exp_data.get('exploration_metrics'):
@@ -3068,13 +3505,18 @@ class Simulation:
                 self.exploration_metrics = ExplorationMetrics.from_dict(exp_data['exploration_metrics'])
                 logger.info(f"  Loaded ExplorationMetrics")
 
-            # Restore paper novelty scores and breakthrough papers
+            # Restore paper novelty scores and citation potential metadata
             if exp_data.get('paper_novelty_scores'):
                 self._paper_novelty_scores = {k: tuple(v) for k, v in exp_data['paper_novelty_scores'].items()}
                 logger.info(f"  Loaded {len(self._paper_novelty_scores)} paper novelty scores")
-            if exp_data.get('breakthrough_papers'):
-                self._breakthrough_papers = exp_data['breakthrough_papers']
-                logger.info(f"  Loaded {len(self._breakthrough_papers)} breakthrough papers")
+            # 'breakthrough_papers' is the pre-rename key from old checkpoints
+            self._citation_potential_multipliers = exp_data.get(
+                'citation_potential_multipliers', exp_data.get('breakthrough_papers', {}))
+            self._direction_records = {
+                (k.rsplit('|', 1)[0], int(k.rsplit('|', 1)[1])): rec
+                for k, rec in exp_data.get('direction_records', {}).items()}
+            self._direction_fallback_stats = {
+                int(k): v for k, v in exp_data.get('direction_fallback_stats', {}).items()}
 
             # CD calculator will be lazily initialized when needed
             self.cd_calculator = None
@@ -3122,6 +3564,10 @@ def main():
 
     args = parse_arguments()
 
+    # Single run seed: Python/NumPy/torch state plus all derived per-request seeds
+    set_seed(args.seed)
+    logger.info(f"Run seed: {args.seed}")
+
     # Auto-select LLM based on model name
     t0 = time.time()
     if "gpt" in args.model:
@@ -3137,6 +3583,7 @@ def main():
             model_name=args.model,
             base_url=args.vllm_url,
             max_concurrent_requests=args.batch_size,
+            run_seed=args.seed,
         )
     else:
         # Any non-OpenAI model uses vLLM (e.g., "Qwen/Qwen3-8B", "meta-llama/Llama-3-8B")

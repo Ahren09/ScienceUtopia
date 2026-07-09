@@ -1,8 +1,16 @@
 """Track exploration vs exploitation metrics"""
+import logging
+import os
 from collections import defaultdict
 from typing import Dict, List, Optional
 
 import numpy as np
+import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+# Structured analysis tables written per year (plan 8.9). Keys = filenames.
+TABLE_NAMES = ('agent_year', 'paper', 'paper_age', 'strategy_year', 'ecosystem_year')
 
 
 class ExplorationMetrics:
@@ -13,6 +21,26 @@ class ExplorationMetrics:
         self.cd_indices: Dict[str, Dict[int, float]] = defaultdict(dict)  # paper_id -> year -> cd_score
         self.strategy_metrics: Dict[str, Dict[int, Dict[str, float]]] = defaultdict(lambda: defaultdict(dict))  # strategy -> year -> metric -> value
         self.agent_stats: Dict[str, Dict[int, Dict]] = defaultdict(lambda: defaultdict(dict))  # agent_id -> year -> stats_dict
+        # Flat row stores for analysis tables; one list of dicts per table
+        self.rows: Dict[str, List[Dict]] = {name: [] for name in TABLE_NAMES}
+
+    def add_row(self, table: str, row: Dict):
+        """Append one structured record to a named analysis table."""
+        self.rows[table].append(row)
+
+    def export_tables(self, out_dir: str):
+        """Write all analysis tables as Parquet (CSV fallback). Atomic rewrite
+        each year — tables are small relative to checkpoints."""
+        os.makedirs(out_dir, exist_ok=True)
+        for name, rows in self.rows.items():
+            if not rows:
+                continue
+            df = pd.DataFrame(rows)
+            try:
+                df.to_parquet(os.path.join(out_dir, f'{name}.parquet'), index=False)
+            except Exception as e:  # pyarrow missing or type issue
+                logger.warning(f"Parquet export failed for {name} ({e}); writing CSV")
+                df.to_csv(os.path.join(out_dir, f'{name}.csv'), index=False)
 
     def record_topic_distance(self, author_id: str, year: int, distance: float):
         """Record topic distance for an author in a given year"""
@@ -43,6 +71,7 @@ class ExplorationMetrics:
             'cd_indices': {k: dict(v) for k, v in self.cd_indices.items()},
             'strategy_metrics': {k: {y: dict(m) for y, m in v.items()} for k, v in self.strategy_metrics.items()},
             'agent_stats': {k: {str(y): dict(s) for y, s in v.items()} for k, v in self.agent_stats.items()},
+            'rows': self.rows,
         }
 
     @classmethod
@@ -61,4 +90,6 @@ class ExplorationMetrics:
                 k: defaultdict(dict, {int(y): s for y, s in v.items()})
                 for k, v in data['agent_stats'].items()
             })
+        for name in TABLE_NAMES:
+            metrics.rows[name] = data.get('rows', {}).get(name, [])
         return metrics
