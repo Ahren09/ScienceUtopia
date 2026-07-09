@@ -68,9 +68,24 @@ SIMULATION_CONFIG = {
     # Exploration vs Exploitation Experiment
     'exploration_experiment': {
         'strategies': ['explorer', 'exploiter', 'cautious_explorer'],
+        'strategy_mix': {'explorer': 0.2, 'exploiter': 0.6, 'cautious_explorer': 0.2},
         'embedding_model': 'all-MiniLM-L6-v2',
         'num_keywords': 10,
         'min_citations_for_cd': 5,  # Minimum citations to calculate CD index
+        'near_quantile': 0.33,
+        'far_quantile': 0.66,
+        'history_window_years': 3,
+        'explorer_success_bias': -0.05,
+        'explorer_variance': 0.25,
+        'exploiter_success_bias': 0.05,
+        'exploiter_variance': 0.08,
+        'cautious_success_bias': 0.0,
+        'cautious_variance': 0.15,
+        'novelty_penalty_in_funding': 0.15,
+        'novelty_reward_in_long_term_citations': 0.30,
+        'breakthrough_multiplier_mean': 1.8,
+        'breakthrough_probability_threshold': 0.7,
+        'hit_paper_percentile': 0.95,
     },
 
     # Preferential Attachment Experiment

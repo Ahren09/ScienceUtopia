@@ -106,7 +106,8 @@ def build_direction_prompt(
         Tuple of (prompt, response_format, core_expertise, related_expertise)
     """
     if not candidate_directions:
-        candidate_directions = agent.expertise
+        # Use filtered candidates from exploration experiment if available
+        candidate_directions = getattr(agent, '_filtered_candidates', None) or agent.expertise
         
     core_expertise = []
     related_expertise = set()
@@ -214,6 +215,15 @@ Propose the directions based on your expertise:
 - Longer projects (3-4 years) require stable funding
 - Past successes suggest continuing in related areas
 - Past failures might indicate need for pivoting or building stronger foundation
+"""
+
+    # Add strategy-specific constraint for exploration experiment
+    if hasattr(agent, 'exploration_strategy') and agent.exploration_strategy != 'balanced':
+        prompt += f"""
+## Strategy Constraint
+You must justify the distance of your chosen direction from your prior work.
+- Explain whether this direction is CLOSE, MODERATE, or FAR from your past research.
+- Your research strategy is: {agent.exploration_strategy.upper()}
 """
 
     prompt += """
@@ -422,6 +432,82 @@ def assign_directions_individual(
         "detailed_focus": selection['detailed_focus'],
         "reason": selection['reason'],
     }
+
+
+def get_strategy_filtered_candidate_directions(
+    agent, all_directions, embedding_tracker, year, config
+):
+    """Filter candidate directions based on agent's exploration strategy.
+
+    Uses embedding distances from career centroid to partition directions
+    into near/mid/far buckets, then selects appropriate candidates.
+
+    Args:
+        agent: Agent with exploration_strategy attribute
+        all_directions: List of all ResearchDirection objects
+        embedding_tracker: EmbeddingTracker instance (may be None)
+        year: Current simulation year
+        config: exploration_experiment config dict
+
+    Returns:
+        List of ResearchDirection objects appropriate for the agent's strategy
+    """
+    strategy = getattr(agent, 'exploration_strategy', 'balanced')
+    if strategy == 'balanced':
+        return agent.expertise
+
+    near_q = config.get('near_quantile', 0.33)
+    far_q = config.get('far_quantile', 0.66)
+    history_window = config.get('history_window_years', 3)
+
+    # Try embedding-based filtering if tracker is available
+    centroid = None
+    if embedding_tracker is not None:
+        centroid = embedding_tracker.compute_career_centroid(
+            agent.id, max_years=history_window, current_year=year - 1
+        )
+
+    if centroid is not None:
+        # Compute distances from centroid to all directions
+        dist_map = embedding_tracker.compute_direction_distances(centroid, all_directions)
+        if dist_map:
+            sorted_dirs = sorted(all_directions, key=lambda d: dist_map.get(d.topic, 0.5))
+            n = len(sorted_dirs)
+            near_idx = max(1, int(n * near_q))
+            far_idx = max(near_idx + 1, int(n * far_q))
+
+            near = sorted_dirs[:near_idx]
+            mid = sorted_dirs[near_idx:far_idx]
+            far = sorted_dirs[far_idx:]
+
+            if strategy == 'exploiter':
+                candidates = near if len(near) >= 2 else near + mid
+            elif strategy == 'cautious_explorer':
+                candidates = mid if len(mid) >= 2 else near + mid
+            else:  # explorer
+                candidates = far if len(far) >= 2 else mid + far
+
+            return candidates if candidates else agent.expertise
+
+    # Heuristic fallback: use expertise topic names
+    expertise_topics = {d.topic for d in agent.expertise}
+    all_topics = {d.topic for d in all_directions}
+
+    if strategy == 'exploiter':
+        # Stay within expertise
+        return agent.expertise
+    elif strategy == 'cautious_explorer':
+        # Expertise + related topics
+        related_topics = set()
+        for d in agent.expertise:
+            related_topics.update(d.related_topics or [])
+        candidate_topics = expertise_topics | related_topics
+        candidates = [d for d in all_directions if d.topic in candidate_topics]
+        return candidates if len(candidates) >= 2 else agent.expertise
+    else:  # explorer
+        # Everything outside expertise
+        candidates = [d for d in all_directions if d.topic not in expertise_topics]
+        return candidates if len(candidates) >= 2 else all_directions
 
 
 AVAILABLE_DIRECTIONS = [

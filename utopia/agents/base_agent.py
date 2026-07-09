@@ -967,22 +967,28 @@ Respond in JSON format with the numeric ids (integers) of the candidate papers y
             prompt += "\n## Your Research Strategy\n"
 
             if self.exploration_strategy == 'explorer':
-                prompt += """You are an EXPLORER. Your strategy is to venture into new research territories:
-- Aim for topics DISTANT from your past work to discover breakthrough opportunities
-- Prioritize novel directions that expand your research portfolio, compared with your past work
-- Be willing to take risks on unfamiliar but promising areas
+                prompt += """You are an EXPLORER. You MUST follow these rules strictly:
+- You MUST choose topics DISTANT from your recent work
+- Accept lower short-term success for breakthrough potential
+- When in doubt, choose the riskier, more novel option
+- In your response, EXPLICITLY state how far this is from your past work
+- Avoid incremental improvements — seek paradigm shifts and cross-domain innovation
 """
             elif self.exploration_strategy == 'exploiter':
-                prompt += """You are an EXPLOITER. Your strategy is to build on proven success:
-- Choose topics CLOSELY RELATED to your successful past work
-- Maximize impact by deepening expertise in familiar areas compared with your past work
-- Prioritize incremental advances in established directions
+                prompt += """You are an EXPLOITER. You MUST follow these rules strictly:
+- You MUST choose topics CLOSE to your prior accepted work
+- Reuse familiar methods and framing when possible
+- When in doubt, choose the safer, incremental option
+- In your response, EXPLICITLY state how this builds on your past work
+- Focus on deepening expertise and maximizing citation impact in known areas
 """
             elif self.exploration_strategy == 'cautious_explorer':
-                prompt += """You are a CAUTIOUS EXPLORER. Your strategy balances novelty with safety:
-- Choose topics at MODERATE DISTANCE from your past work
-- Blend familiar techniques with new application areas
-- Take measured risks while maintaining connection to expertise
+                prompt += """You are a CAUTIOUS EXPLORER. You MUST follow these rules strictly:
+- You MUST choose topics ADJACENT to your past work (not too close, not too far)
+- Combine one familiar component with one new component
+- Avoid both extreme conservatism and extreme novelty
+- In your response, EXPLICITLY state which part is familiar and which is new
+- Seek moderate-risk directions that bridge established and emerging areas
 """
 
         return prompt

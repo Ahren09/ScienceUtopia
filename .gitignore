@@ -23,7 +23,7 @@ eggs/
 .eggs/
 lib/
 lib64/
-outputs/
+outputs
 parts/
 sdist/
 var/

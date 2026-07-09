@@ -1,6 +1,8 @@
 """Track exploration vs exploitation metrics"""
 from collections import defaultdict
-from typing import Dict, Optional
+from typing import Dict, List, Optional
+
+import numpy as np
 
 
 class ExplorationMetrics:
@@ -10,6 +12,7 @@ class ExplorationMetrics:
         self.topic_distances: Dict[str, Dict[int, list]] = defaultdict(lambda: defaultdict(list))  # author_id -> year -> [distances]
         self.cd_indices: Dict[str, Dict[int, float]] = defaultdict(dict)  # paper_id -> year -> cd_score
         self.strategy_metrics: Dict[str, Dict[int, Dict[str, float]]] = defaultdict(lambda: defaultdict(dict))  # strategy -> year -> metric -> value
+        self.agent_stats: Dict[str, Dict[int, Dict]] = defaultdict(lambda: defaultdict(dict))  # agent_id -> year -> stats_dict
 
     def record_topic_distance(self, author_id: str, year: int, distance: float):
         """Record topic distance for an author in a given year"""
@@ -24,6 +27,10 @@ class ExplorationMetrics:
         """Record aggregate metric for a strategy"""
         self.strategy_metrics[strategy][year][metric] = value
 
+    def record_agent_stats(self, agent_id: str, year: int, stats_dict: Dict):
+        """Record per-agent yearly stats (acceptance_rate, funding, citations, etc.)"""
+        self.agent_stats[agent_id][year] = stats_dict
+
     def get_author_avg_distance(self, author_id: str, year: int) -> Optional[float]:
         """Get average topic distance for author in a year"""
         distances = self.topic_distances[author_id].get(year, [])
@@ -34,7 +41,8 @@ class ExplorationMetrics:
         return {
             'topic_distances': {k: dict(v) for k, v in self.topic_distances.items()},
             'cd_indices': {k: dict(v) for k, v in self.cd_indices.items()},
-            'strategy_metrics': {k: {y: dict(m) for y, m in v.items()} for k, v in self.strategy_metrics.items()}
+            'strategy_metrics': {k: {y: dict(m) for y, m in v.items()} for k, v in self.strategy_metrics.items()},
+            'agent_stats': {k: {str(y): dict(s) for y, s in v.items()} for k, v in self.agent_stats.items()},
         }
 
     @classmethod
@@ -48,4 +56,9 @@ class ExplorationMetrics:
         metrics.strategy_metrics = defaultdict(lambda: defaultdict(dict), {
             k: defaultdict(dict, v) for k, v in data['strategy_metrics'].items()
         })
+        if 'agent_stats' in data:
+            metrics.agent_stats = defaultdict(lambda: defaultdict(dict), {
+                k: defaultdict(dict, {int(y): s for y, s in v.items()})
+                for k, v in data['agent_stats'].items()
+            })
         return metrics

@@ -49,6 +49,7 @@ from utopia.agents.funding_agents import (
 from utopia.agents.research_direction import (
     assign_directions_individual,
     create_research_directions_batch,
+    get_strategy_filtered_candidate_directions,
     AVAILABLE_DIRECTIONS
 )
 from utopia.agents.researcher_agents import (
@@ -151,6 +152,10 @@ class Simulation:
         self.exploration_metrics = None
         self.keyword_extractor = None
 
+        # Exploration experiment: paper novelty scores cache
+        self._paper_novelty_scores = {}  # paper_id -> (novelty_score, bucket)
+        self._breakthrough_papers = {}  # paper_id -> citation_potential_multiplier
+
         # Preferential attachment experiment trackers (lazily initialized)
         self.collaboration_tracker = None
         self.network_metrics = None
@@ -206,7 +211,12 @@ class Simulation:
             researcher_names = []
 
             for i in range(num_researchers):
-                expertise = [AVAILABLE_DIRECTIONS[0]] if self.debug else random.sample(AVAILABLE_DIRECTIONS, 3)
+                if self.is_exploration_experiment:
+                    expertise = random.sample(AVAILABLE_DIRECTIONS, min(3, len(AVAILABLE_DIRECTIONS)))
+                elif self.debug:
+                    expertise = [AVAILABLE_DIRECTIONS[0]]
+                else:
+                    expertise = random.sample(AVAILABLE_DIRECTIONS, 3)
                 # researcher_name = f"university_researcher_{counter}"
                 researcher_name = f"{university}_researcher_{i}"
 
@@ -214,8 +224,13 @@ class Simulation:
 
                 # Assign exploration strategy if experiment is enabled
                 if self.is_exploration_experiment:
-                    # 50% explorer, 50% exploiter
-                    exploration_strategy = "explorer" if counter % 2 == 0 else "exploiter"
+                    bucket = counter % 10
+                    if bucket < 2:        # 0,1 -> 20%
+                        exploration_strategy = "explorer"
+                    elif bucket < 8:      # 2-7 -> 60%
+                        exploration_strategy = "exploiter"
+                    else:                 # 8,9 -> 20%
+                        exploration_strategy = "cautious_explorer"
                 else:
                     exploration_strategy = "balanced"
 
@@ -286,15 +301,34 @@ class Simulation:
             funding_level = 320 if company in rich_companies else 160
 
             for i in range(num_researchers):
-                expertise = random.sample(AVAILABLE_DIRECTIONS, 3) if self.debug else [AVAILABLE_DIRECTIONS[0]]
+                if self.is_exploration_experiment:
+                    expertise = random.sample(AVAILABLE_DIRECTIONS, min(3, len(AVAILABLE_DIRECTIONS)))
+                elif self.debug:
+                    expertise = [AVAILABLE_DIRECTIONS[0]]
+                else:
+                    expertise = random.sample(AVAILABLE_DIRECTIONS, 3)
                 researcher_name = f"{company}_researcher_{i}"
+
+                # Assign exploration strategy for industry researchers too
+                if self.is_exploration_experiment:
+                    bucket = counter % 10
+                    if bucket < 2:
+                        exploration_strategy = "explorer"
+                    elif bucket < 8:
+                        exploration_strategy = "exploiter"
+                    else:
+                        exploration_strategy = "cautious_explorer"
+                else:
+                    exploration_strategy = "balanced"
+
                 researcher = IndustryResearcher(
                     researcher_name=researcher_name,
                     company_name=company,
                     funding_level=funding_level,
                     expertise=expertise,
                     llm=self.llm,
-                    funding_mode=self.industry_funding_mode
+                    funding_mode=self.industry_funding_mode,
+                    exploration_strategy=exploration_strategy,
                 )
                 self.ecosystem.add_agent(researcher)
                 logger.info(f"Added {researcher.id} from {company} (funding mode: {self.industry_funding_mode})")
@@ -394,29 +428,53 @@ class Simulation:
         if not self.is_exploration_experiment:
             return
 
+        # Guard against empty abstract
+        abstract = paper_dict.get('abstract', '')
+        if not abstract or not abstract.strip():
+            return
+
         # Lazy initialize trackers on first use
         self._initialize_experiment_trackers()
 
         exp_config = SIMULATION_CONFIG['exploration_experiment']
 
-        # Extract keywords
+        # Extract keywords (now returns dict)
         if self.keyword_extractor is not None:
-            keywords = self.keyword_extractor.extract_keywords_llm(
-                abstract=paper_dict['abstract'],
+            kw_result = self.keyword_extractor.extract_keywords_llm(
+                abstract=abstract,
                 llm=self.llm,
                 n_keywords=exp_config['num_keywords']
             )
-            paper_dict['keywords'] = keywords
+            paper_dict['keywords'] = kw_result.get('keywords', [])
+            paper_dict['keywords_in_abstract'] = kw_result.get('keywords_in_abstract', [])
+            paper_dict['keywords_not_in_abstract'] = kw_result.get('keywords_not_in_abstract', [])
 
         # Add embedding
         if self.embedding_tracker is not None:
             self.embedding_tracker.add_paper_embedding(
                 paper_id=paper_dict['id'],
-                abstract=paper_dict['abstract'],
+                abstract=abstract,
                 author_id=author_id,
                 year=year
             )
             logger.debug(f"Added embedding for {paper_dict['id']}")
+
+            # Compute and store novelty score
+            novelty = self.embedding_tracker.compute_novelty_score(
+                paper_dict['id'], author_id,
+                history_window_years=exp_config.get('history_window_years', 3)
+            )
+            if novelty is not None:
+                paper_dict['novelty_score'] = novelty[0]
+                paper_dict['career_distance_bucket'] = novelty[1]
+                self._paper_novelty_scores[paper_dict['id']] = novelty
+            else:
+                paper_dict['novelty_score'] = 0.0
+                paper_dict['career_distance_bucket'] = 'unknown'
+
+            # Store exploration strategy on paper
+            agent = self.ecosystem.get_agent_by_id(author_id)
+            paper_dict['exploration_strategy'] = getattr(agent, 'exploration_strategy', 'balanced')
 
     def _collect_exploration_metrics(self, year: int):
         """Collect exploration vs exploitation metrics at end of year
@@ -435,6 +493,10 @@ class Simulation:
         papers_this_year = [(p.id, p.all_author_ids[0]) for p in self.paper_tracker.papers_by_id.values()
                             if p.year == year]
         paper_ids_this_year = [pid for pid, _ in papers_this_year]
+
+        if not paper_ids_this_year:
+            logger.info(f"Year {year}: No papers to collect exploration metrics for")
+            return
 
         distances = self.embedding_tracker.compute_distances_batch(papers_this_year)
         for paper_id, author_id in papers_this_year:
@@ -455,28 +517,127 @@ class Simulation:
                     cd_score=cd_score
                 )
 
+        # Build lookup structures for per-strategy metrics
+        accepted_paper_ids = set()
+        for conf in self.conference_system.conferences:
+            for paper in conf.decisions.get('accept', []):
+                accepted_paper_ids.add(paper['id'])
+
+        # Collect all citation counts for accepted papers this year
+        all_citation_counts = []
+        paper_citation_map = {}
+        for pid in paper_ids_this_year:
+            if pid in accepted_paper_ids:
+                count = len(self.citation_tracker.get_citations_to_paper(pid))
+                # Apply breakthrough multiplier for effective citations
+                multiplier = self._breakthrough_papers.get(pid, 1.0)
+                effective_count = count * multiplier
+                all_citation_counts.append(effective_count)
+                paper_citation_map[pid] = effective_count
+
+        # Compute hit paper threshold
+        hit_percentile = exp_config.get('hit_paper_percentile', 0.95)
+        hit_threshold = np.percentile(all_citation_counts, hit_percentile * 100) if all_citation_counts else float('inf')
+
+        # Top-10% citation threshold
+        top10_threshold = np.percentile(all_citation_counts, 90) if all_citation_counts else float('inf')
+
         # Aggregate metrics by strategy
         for strategy in exp_config['strategies']:
             agents = [a for a in self.ecosystem.agent_population.values()
-                     if isinstance(a, UniversityResearcher)
-                     and hasattr(a, 'exploration_strategy') and a.exploration_strategy == strategy]
+                     if (isinstance(a, (UniversityResearcher, IndustryResearcher))
+                         and hasattr(a, 'exploration_strategy')
+                         and a.exploration_strategy == strategy)]
 
-            if agents:
-                distances = []
-                for a in agents:
-                    avg_dist = self.exploration_metrics.get_author_avg_distance(a.id, year)
-                    if avg_dist is not None:
-                        distances.append(avg_dist)
+            if not agents:
+                continue
 
-                if distances:
-                    avg_distance = np.mean(distances)
+            # Topic distances
+            topic_distances = []
+            for a in agents:
+                avg_dist = self.exploration_metrics.get_author_avg_distance(a.id, year)
+                if avg_dist is not None:
+                    topic_distances.append(avg_dist)
 
+            if topic_distances:
+                self.exploration_metrics.record_strategy_metric(
+                    strategy=strategy, year=year,
+                    metric='avg_topic_distance', value=float(np.mean(topic_distances))
+                )
+
+            # Per-strategy acceptance rate
+            strategy_agent_ids = {a.id for a in agents}
+            strategy_papers = [pid for pid, aid in papers_this_year if aid in strategy_agent_ids]
+            strategy_accepted = [pid for pid in strategy_papers if pid in accepted_paper_ids]
+            if strategy_papers:
+                acc_rate = len(strategy_accepted) / len(strategy_papers)
+                self.exploration_metrics.record_strategy_metric(
+                    strategy=strategy, year=year,
+                    metric='avg_acceptance_rate', value=acc_rate
+                )
+
+            # Per-strategy funding
+            strategy_funding = [a.resources for a in agents if hasattr(a, 'resources')]
+            if strategy_funding:
+                self.exploration_metrics.record_strategy_metric(
+                    strategy=strategy, year=year,
+                    metric='avg_funding', value=float(np.mean(strategy_funding))
+                )
+
+            # Per-strategy citations
+            strategy_citations = [paper_citation_map[pid] for pid in strategy_accepted if pid in paper_citation_map]
+            if strategy_citations:
+                self.exploration_metrics.record_strategy_metric(
+                    strategy=strategy, year=year,
+                    metric='avg_citations', value=float(np.mean(strategy_citations))
+                )
+                self.exploration_metrics.record_strategy_metric(
+                    strategy=strategy, year=year,
+                    metric='median_citations', value=float(np.median(strategy_citations))
+                )
+
+                # Citation Gini
+                sorted_cites = sorted(strategy_citations)
+                n = len(sorted_cites)
+                if n > 0 and sum(sorted_cites) > 0:
+                    gini = (2 * np.sum((np.arange(1, n + 1) * sorted_cites)) / (n * np.sum(sorted_cites))) - (n + 1) / n
                     self.exploration_metrics.record_strategy_metric(
-                        strategy=strategy,
-                        year=year,
-                        metric='avg_topic_distance',
-                        value=avg_distance
+                        strategy=strategy, year=year,
+                        metric='citation_gini', value=float(gini)
                     )
+
+            # Hit paper rate (citations > 95th percentile)
+            hit_count = sum(1 for c in strategy_citations if c >= hit_threshold) if strategy_citations else 0
+            if strategy_accepted:
+                self.exploration_metrics.record_strategy_metric(
+                    strategy=strategy, year=year,
+                    metric='hit_paper_rate', value=hit_count / len(strategy_accepted)
+                )
+
+            # Top-10% citation share
+            top10_count = sum(1 for c in strategy_citations if c >= top10_threshold) if strategy_citations else 0
+            total_top10 = sum(1 for c in all_citation_counts if c >= top10_threshold) if all_citation_counts else 0
+            if total_top10 > 0:
+                self.exploration_metrics.record_strategy_metric(
+                    strategy=strategy, year=year,
+                    metric='top10_citation_share', value=top10_count / total_top10
+                )
+
+            # Record per-agent stats
+            for a in agents:
+                agent_papers_yr = [pid for pid, aid in papers_this_year if aid == a.id]
+                agent_accepted_yr = [pid for pid in agent_papers_yr if pid in accepted_paper_ids]
+                agent_citations = [paper_citation_map.get(pid, 0) for pid in agent_accepted_yr]
+
+                self.exploration_metrics.record_agent_stats(a.id, year, {
+                    'strategy': strategy,
+                    'num_papers': len(agent_papers_yr),
+                    'num_accepted': len(agent_accepted_yr),
+                    'acceptance_rate': len(agent_accepted_yr) / len(agent_papers_yr) if agent_papers_yr else 0,
+                    'funding': getattr(a, 'resources', 0),
+                    'total_citations': sum(agent_citations),
+                    'hit_papers': sum(1 for c in agent_citations if c >= hit_threshold),
+                })
 
         logger.info(f"Year {year}: Collected exploration metrics for {len(paper_ids_this_year)} papers")
 
@@ -980,8 +1141,18 @@ class Simulation:
         # Check if LLM supports batching
         supports_batching = hasattr(self.llm, 'generate_batch')
 
+        # For exploration experiment: pre-filter candidate directions per agent
+        if self.is_exploration_experiment and authors_with_directions_pending:
+            self._initialize_experiment_trackers()
+            exp_config = SIMULATION_CONFIG['exploration_experiment']
+            for agent in authors_with_directions_pending:
+                filtered = get_strategy_filtered_candidate_directions(
+                    agent, AVAILABLE_DIRECTIONS, self.embedding_tracker, year, exp_config
+                )
+                agent._filtered_candidates = filtered
+
         if supports_batching and authors_with_directions_pending:
-            
+
             directions = create_research_directions_batch(
                 agents=authors_with_directions_pending,
                 year=year,
@@ -2456,6 +2627,10 @@ class Simulation:
             all_funding_winners_dict = FundingAgency.process_funding_evaluation_results(
                 final_eval_results, final_eval_metadata, all_funding_programs_dict
             )
+
+            # Apply funding conservatism for exploration experiment
+            self._apply_funding_conservatism(all_funding_winners_dict, year)
+
             for program_id, winners in all_funding_winners_dict.items():
                 winners_list.extend([agent['applicant_id'] for agent in winners])
 
@@ -2527,6 +2702,103 @@ class Simulation:
         # Get conference statistics
         year_results['conference_statistics'] = self.conference_system.get_all_statistics()
 
+    def _apply_strategy_quality_adjustment(self, year: int):
+        """Apply strategy-dependent quality adjustment to review scores.
+
+        Adds noise based on exploration strategy: explorers have higher variance
+        but slight negative bias, exploiters have low variance and slight positive bias.
+        Only active for exploration experiment.
+        """
+        if not self.is_exploration_experiment:
+            return
+
+        exp_config = SIMULATION_CONFIG['exploration_experiment']
+        bias_map = {
+            'explorer': (exp_config['explorer_success_bias'], exp_config['explorer_variance']),
+            'exploiter': (exp_config['exploiter_success_bias'], exp_config['exploiter_variance']),
+            'cautious_explorer': (exp_config['cautious_success_bias'], exp_config['cautious_variance']),
+        }
+
+        for conference in self.conference_system.conferences:
+            for paper in conference.submitted_papers:
+                lead_id = self._get_lead_author_id(paper)
+                agent = self.ecosystem.get_agent_by_id(lead_id)
+                strategy = getattr(agent, 'exploration_strategy', 'balanced')
+
+                if strategy not in bias_map:
+                    continue
+
+                bias, variance = bias_map[strategy]
+                reviews = conference.reviews.get(paper['id'], [])
+                for review in reviews:
+                    adjustment = np.random.normal(bias, variance)
+                    review['overall_score'] = max(1, min(10, review['overall_score'] + adjustment))
+
+    def _apply_citation_breakthrough_bonus(self, year: int):
+        """Mark high-novelty accepted papers as potential breakthroughs.
+
+        Stores multiplier in self._breakthrough_papers for use in metrics.
+        Only active for exploration experiment.
+        """
+        if not self.is_exploration_experiment:
+            return
+
+        exp_config = SIMULATION_CONFIG['exploration_experiment']
+        threshold = exp_config['breakthrough_probability_threshold']
+        multiplier_mean = exp_config['breakthrough_multiplier_mean']
+
+        for conf in self.conference_system.conferences:
+            for paper in conf.decisions.get('accept', []):
+                novelty_data = self._paper_novelty_scores.get(paper['id'])
+                if novelty_data is None:
+                    continue
+
+                novelty_score = novelty_data[0]
+                if novelty_score > threshold:
+                    # Probability of breakthrough proportional to novelty
+                    if random.random() < novelty_score:
+                        self._breakthrough_papers[paper['id']] = multiplier_mean
+                        logger.info(f"Breakthrough paper: {paper['id']} (novelty={novelty_score:.3f}, multiplier={multiplier_mean})")
+
+    def _apply_funding_conservatism(self, all_funding_winners_dict: Dict, year: int):
+        """Re-rank funding winners to penalize high-novelty researchers.
+
+        Reduces effective scores for researchers with high average novelty,
+        modeling real-world conservatism in funding decisions.
+        Only active for exploration experiment.
+        """
+        if not self.is_exploration_experiment:
+            return
+
+        exp_config = SIMULATION_CONFIG['exploration_experiment']
+        penalty_weight = exp_config['novelty_penalty_in_funding']
+
+        for program_id, winners in all_funding_winners_dict.items():
+            for winner in winners:
+                agent_id = winner.get('applicant_id')
+                if not agent_id:
+                    continue
+
+                # Get average novelty from recent papers
+                agent_papers = [
+                    pid for pid, meta in self.embedding_tracker.paper_metadata.items()
+                    if meta['author_id'] == agent_id
+                ] if self.embedding_tracker else []
+
+                if not agent_papers:
+                    continue
+
+                novelty_scores = [
+                    self._paper_novelty_scores[pid][0]
+                    for pid in agent_papers
+                    if pid in self._paper_novelty_scores
+                ]
+
+                if novelty_scores:
+                    avg_novelty = np.mean(novelty_scores)
+                    # Reduce effective score (stored as penalty for downstream use)
+                    winner['novelty_penalty'] = penalty_weight * avg_novelty
+
     def run_one_round(self, year: int) -> Dict:
         """Run simulation for one year - orchestrates all phases
 
@@ -2563,9 +2835,15 @@ class Simulation:
         average_scores = self._run_phase_3_peer_review(year, year_results)
         self.wandb_logger.log_phase(year, 3, year_results, self)
 
+        # Apply strategy-dependent quality adjustment (between review and acceptance)
+        self._apply_strategy_quality_adjustment(year)
+
         # Phase 4: Make acceptance decisions
         self._run_phase_4_acceptance_decisions(year, year_results)
         self.wandb_logger.log_phase(year, 4, year_results, self)
+
+        # Apply citation breakthrough bonus for high-novelty accepted papers
+        self._apply_citation_breakthrough_bonus(year)
 
         # Phase 5: Update funding
         self._run_phase_5_update_funding(year, submissions_list, year_results)
@@ -2700,6 +2978,8 @@ class Simulation:
                 'enabled': True,
                 'embedding_tracker': self.embedding_tracker.to_dict() if self.embedding_tracker else None,
                 'exploration_metrics': self.exploration_metrics.to_dict() if self.exploration_metrics else None,
+                'paper_novelty_scores': {k: list(v) for k, v in self._paper_novelty_scores.items()},
+                'breakthrough_papers': self._breakthrough_papers,
             }
 
         # Save preferential attachment experiment trackers if enabled
@@ -2787,6 +3067,14 @@ class Simulation:
                 from utopia.metrics.exploration_metrics import ExplorationMetrics
                 self.exploration_metrics = ExplorationMetrics.from_dict(exp_data['exploration_metrics'])
                 logger.info(f"  Loaded ExplorationMetrics")
+
+            # Restore paper novelty scores and breakthrough papers
+            if exp_data.get('paper_novelty_scores'):
+                self._paper_novelty_scores = {k: tuple(v) for k, v in exp_data['paper_novelty_scores'].items()}
+                logger.info(f"  Loaded {len(self._paper_novelty_scores)} paper novelty scores")
+            if exp_data.get('breakthrough_papers'):
+                self._breakthrough_papers = exp_data['breakthrough_papers']
+                logger.info(f"  Loaded {len(self._breakthrough_papers)} breakthrough papers")
 
             # CD calculator will be lazily initialized when needed
             self.cd_calculator = None
