@@ -452,12 +452,114 @@ Respond in JSON format with all applications ranked from most preferred (rank 1)
         return prompt
 
     @staticmethod
+    def normalize_ranked_applications(ranked_apps, apps):
+        """Normalize a possibly malformed LLM ranking into a complete,
+        deterministic per-application ranking.
+
+        The unit is the APPLICATION: `application_id` == index into `apps`,
+        with expected `applicant_id = apps[application_id]['applicant_id']`.
+        Multiple applications from the same applicant are legitimate and
+        preserved — deduplication is by application_id, never applicant_id.
+
+        Per returned entry:
+        - non-dict entries are rejected;
+        - a valid in-range int application_id with missing applicant_id
+          recovers the applicant from the input application;
+        - a missing application_id with a present applicant_id is inferred
+          only when that applicant has exactly one application in this panel
+          (otherwise ambiguous -> rejected);
+        - inconsistent id pairs and out-of-range application_ids are rejected;
+        - duplicates keep the best valid rank, then earliest response position.
+
+        Every expected application absent after the above is appended to a
+        fallback tail using its REAL input application_id, flagged
+        `imputed_tail: True`, with ranks after all valid entries.
+
+        Returns (normalized, rejects): `normalized` has exactly len(apps)
+        entries whose application_ids are a permutation of 0..len(apps)-1;
+        `rejects` records each dropped entry with its reason. Never raises on
+        malformed input.
+        """
+        n = len(apps)
+        expected = {i: apps[i]['applicant_id'] for i in range(n)}
+        indices_by_applicant = {}
+        for i in range(n):
+            indices_by_applicant.setdefault(expected[i], []).append(i)
+
+        rejects = []
+        kept = {}  # application_id -> (sort_key, response_pos, entry)
+        for pos, entry in enumerate(ranked_apps or []):
+            if not isinstance(entry, dict):
+                rejects.append({'response_pos': pos, 'reason': 'non_dict_entry'})
+                continue
+            app_id = entry.get('application_id')
+            applicant_id = entry.get('applicant_id')
+            if isinstance(app_id, bool) or not isinstance(app_id, int):
+                app_id = None
+            if app_id is not None and not (0 <= app_id < n):
+                rejects.append({'response_pos': pos, 'reason': 'application_id_out_of_range',
+                                'application_id': entry.get('application_id')})
+                continue
+            if app_id is None:
+                candidates = indices_by_applicant.get(applicant_id, [])
+                if len(candidates) == 1:
+                    app_id = candidates[0]
+                else:
+                    reason = ('ambiguous_applicant_multiple_applications' if candidates
+                              else 'no_valid_identifier')
+                    rejects.append({'response_pos': pos, 'reason': reason,
+                                    'applicant_id': applicant_id})
+                    continue
+            elif applicant_id is not None and applicant_id != expected[app_id]:
+                rejects.append({'response_pos': pos, 'reason': 'inconsistent_ids',
+                                'application_id': app_id, 'applicant_id': applicant_id})
+                continue
+
+            norm = dict(entry)
+            norm['application_id'] = app_id
+            norm['applicant_id'] = expected[app_id]
+            rank = norm.get('rank')
+            valid_rank = isinstance(rank, (int, float)) and not isinstance(rank, bool)
+            sort_key = (rank if valid_rank else float('inf'), pos)
+            prev = kept.get(app_id)
+            if prev is None or sort_key < prev[0]:
+                if prev is not None:
+                    rejects.append({'response_pos': prev[1],
+                                    'reason': 'duplicate_application_id',
+                                    'application_id': app_id})
+                kept[app_id] = (sort_key, pos, norm)
+            else:
+                rejects.append({'response_pos': pos,
+                                'reason': 'duplicate_application_id',
+                                'application_id': app_id})
+
+        # Valid entries in original response order (downstream sorts by rank;
+        # the stable sort makes this order the deterministic tie-break).
+        normalized = [rec[2] for rec in sorted(kept.values(), key=lambda rec: rec[1])]
+        valid_ranks = [rec[2]['rank'] for rec in kept.values()
+                       if isinstance(rec[2].get('rank'), (int, float))
+                       and not isinstance(rec[2].get('rank'), bool)]
+        tail_rank = max(valid_ranks, default=0)
+        for app_id in range(n):
+            if app_id not in kept:
+                tail_rank += 1
+                normalized.append({
+                    'application_id': app_id,
+                    'applicant_id': expected[app_id],
+                    'rank': tail_rank,
+                    'reason': '',
+                    'imputed_tail': True,
+                })
+        return normalized, rejects
+
+    @staticmethod
     def process_funding_evaluation_results(
             batch_results: List[Tuple[Dict, List[Dict]]],
             metadata_list: List[Dict],
             funding_programs: Dict[str, 'FundingProgram'],
             novelty_penalties: Optional[Dict[str, float]] = None,
             lambda_funding: float = 0.0,
+            application_log: Optional[List[Dict]] = None,
     ) -> Dict[str, List[Dict]]:
         """Process batch LLM results into winners per program (or per panel).
 
@@ -485,32 +587,30 @@ Respond in JSON format with all applications ranked from most preferred (rank 1)
             program = funding_programs[program_id]
 
             if result is None:
-                logger.warning(f"No response from LLM for program {program_id}")
-                continue
+                # Deterministic strategy-blind safety net: rank in panel order
+                # (already a seeded shuffle) so persistent parse failures never
+                # zero out a program-year. Flagged for the provenance audit.
+                logger.warning(f"No response from LLM for program {program_id}; "
+                               f"using flagged panel-order fallback ranking")
+                ranked_apps = [{'application_id': i, 'applicant_id': app['applicant_id'],
+                                'rank': i + 1, 'reason': 'fallback_ranking',
+                                'fallback_ranking': True}
+                               for i, app in enumerate(apps)]
             elif isinstance(result, list):
                 ranked_apps = result
             else:
                 ranked_apps = result.get('ranked_applications', [])
 
-            # Validate all applicant IDs are present
-            ranked_applicant_ids = {app['applicant_id'] for app in ranked_apps}
-            expected_applicant_ids = {app['applicant_id'] for app in apps}
-
-            if ranked_applicant_ids != expected_applicant_ids:
-                logger.debug(f"Ranked applicant IDs (length: {len(ranked_applicant_ids)}): {ranked_applicant_ids}")
-                logger.debug(f"Expected applicant IDs (length: {len(expected_applicant_ids)}): {expected_applicant_ids}")
-                # Keep only ranked apps whose applicant_id is valid
-                ranked_apps = [app for app in ranked_apps if app['applicant_id'] in expected_applicant_ids]
-
-                # Append missing applicant IDs at the end with fallback ranking
-                matched_ids = {app['applicant_id'] for app in ranked_apps}
-                for missing_id in expected_applicant_ids - matched_ids:
-                    ranked_apps.append({
-                        'application_id': -1,
-                        'applicant_id': missing_id,
-                        'rank': len(ranked_apps) + 1,
-                        'reason': ""
-                    })
+            # Normalize the LLM ranking into a complete per-application
+            # ranking (recover/reject malformed entries, impute a fallback
+            # tail); tolerates arbitrary malformed structured output.
+            ranked_apps, rejects = FundingAgency.normalize_ranked_applications(
+                ranked_apps, apps)
+            if rejects:
+                logger.warning(
+                    f"Program {program_id}: rejected {len(rejects)} malformed "
+                    f"ranking entries: "
+                    f"{sorted({r['reason'] for r in rejects})}")
 
             # Sort by rank (rank 1 = most preferred)
             ranked_apps_sorted = sorted(ranked_apps, key=lambda x: x.get('rank', float('inf')))
@@ -533,6 +633,29 @@ Respond in JSON format with all applications ranked from most preferred (rank 1)
             winners_all_programs.setdefault(program_id, []).extend(
                 ranked_apps_sorted[:num_winners])
 
+            # Matthew-RD audit log: persist the FULL pre-decision ranking
+            # (winners AND losers) so the funding cutoff is reconstructable.
+            # `position` is the final selection order actually used for the
+            # funding-rate cut; funded == (position <= num_winners) exactly.
+            if application_log is not None:
+                for pos, app in enumerate(ranked_apps_sorted):
+                    application_log.append({
+                        'program_id': program_id,
+                        'panel_index': metadata_list[idx]['panel_index'],
+                        'applicant_id': app['applicant_id'],
+                        'llm_rank': app.get('rank'),
+                        'position': pos + 1,
+                        'normalized_raw_score': app['normalized_raw_score'],
+                        'adjusted_score': app['adjusted_score'],
+                        'novelty_penalty': app['novelty_penalty'],
+                        'fallback_ranking': bool(app.get('fallback_ranking', False)),
+                        'imputed_tail': bool(app.get('imputed_tail', False)),
+                        'n_panel': n,
+                        'funding_rate': program.funding_rate,
+                        'num_winners': num_winners,
+                        'funded': pos < num_winners,
+                    })
+
         return winners_all_programs
 
     @staticmethod
@@ -542,6 +665,8 @@ Respond in JSON format with all applications ranked from most preferred (rank 1)
             return False
         ranked_apps = result if isinstance(result, list) else result.get('ranked_applications', [])
         if not ranked_apps:
+            return False
+        if not all(isinstance(app, dict) for app in ranked_apps):
             return False
 
         # Check all expected applicant_ids are present

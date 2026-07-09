@@ -551,10 +551,18 @@ class VLLMServerModel(BaseLLM):
             'n_retries': 0,
             'n_failures': 0,
             'elapsed_seconds': 0.0,
+            'prompt_tokens': 0,
+            'completion_tokens': 0,
         }
 
-        # vLLM server doesn't need a real API key
-        self.client = OpenAI(base_url=base_url, api_key="EMPTY")
+        # Local vLLM servers need no key ("EMPTY"); remote deployments (e.g. Modal)
+        # set VLLM_API_KEY. Generous timeout + retries tolerate autoscale cold starts.
+        self.client = OpenAI(
+            base_url=base_url,
+            api_key=os.environ.get("VLLM_API_KEY", "EMPTY"),
+            timeout=600.0,
+            max_retries=5,
+        )
 
         # Test connection (warning only, not fatal)
         self.client.models.list()
@@ -672,6 +680,7 @@ class VLLMServerModel(BaseLLM):
             response_text = ""
             response_json = None
             n_retries = 0
+            tokens = (0, 0)  # (prompt, completion) — accumulated by the main thread
             for attempt in range(max_retries):
                 try:
                     extra_body = dict(base_extra_body)
@@ -686,6 +695,8 @@ class VLLMServerModel(BaseLLM):
                         extra_body=extra_body if extra_body else None,
                     )
                     response_text = resp.choices[0].message.content.strip()
+                    if getattr(resp, 'usage', None):
+                        tokens = (resp.usage.prompt_tokens or 0, resp.usage.completion_tokens or 0)
                     response_json = parse_json_response(response_text)
                     if response_json is None and response_format is not None:
                         raise ValueError("Parsed JSON is None but structured output was expected")
@@ -699,13 +710,13 @@ class VLLMServerModel(BaseLLM):
                         logger.error(f"Prompt {idx} failed after {max_retries} attempts: {e}")
 
             if not success:
-                return idx, (None, msgs), n_retries, False
+                return idx, (None, msgs), n_retries, False, tokens
 
             msgs.append({
                 "role": "assistant",
                 "content": [{"type": "text", "text": response_text}]
             })
-            return idx, (response_json, msgs), n_retries, True
+            return idx, (response_json, msgs), n_retries, True, tokens
 
         label = desc or f"batch of {len(prompts)} prompts"
         logger.info(f"[vLLM Server] Generating {label} ...")
@@ -715,10 +726,12 @@ class VLLMServerModel(BaseLLM):
         with ThreadPoolExecutor(max_workers=self.max_concurrent_requests) as executor:
             futures = {executor.submit(_call_single, (i, p)): i for i, p in enumerate(prompts)}
             for future in tqdm(as_completed(futures), total=len(prompts), desc=label):
-                idx, result, n_retries, success = future.result()
+                idx, result, n_retries, success, tokens = future.result()
                 results[idx] = result
                 self.call_stats['n_prompts'] += 1
                 self.call_stats['n_retries'] += n_retries
+                self.call_stats['prompt_tokens'] += tokens[0]
+                self.call_stats['completion_tokens'] += tokens[1]
                 if success and n_retries == 0:
                     self.call_stats['n_first_attempt_success'] += 1
                 if not success:

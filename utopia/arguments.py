@@ -146,6 +146,16 @@ def parse_arguments(argv=None):
              '"intra_institute" (same institution only) or "cross_institute" (different institutions only) '
              '(default: cross_institute)'
     )
+    parser.add_argument(
+        '--collaboration_network_growth_mode',
+        type=str,
+        default='legacy',
+        choices=['legacy', 'expanding'],
+        help='Collaboration formation mode for the preferential_attachment experiment. '
+             '"legacy" (default) preserves the original behavior exactly; "expanding" assigns each '
+             'agent-year a deterministic 70/30 new-tie/repeat-tie proposal channel so the network '
+             'grows instead of locking into permanent dyads (prereg_v1_1_source_fix)'
+    )
 
     # Reproducible experiment control (exploration experiment stages)
     parser.add_argument(
@@ -158,7 +168,7 @@ def parse_arguments(argv=None):
         '--experiment_stage',
         type=str,
         default=None,
-        choices=['smoke', 'pilot', 'scalecheck', 'calibration', 'confirmatory', 'manyworld', 'mechanism'],
+        choices=['smoke', 'pilot', 'scalecheck', 'calibration', 'confirmatory', 'manyworld', 'mechanism', 'matthew_rd', 'matthew_rd_cost'],
         help='Experiment stage. When set, canonical outputs/{logs,checkpoints,visual,docs}/<experiment_id>/ '
              'paths are used and an experiment_id is derived. When absent, legacy layout is preserved.'
     )
@@ -195,6 +205,47 @@ def parse_arguments(argv=None):
         help='Number of conferences to instantiate (default: legacy behavior)'
     )
     parser.add_argument(
+        '--acceptance_rate_schedule',
+        type=str,
+        default=None,
+        help='Comma-separated per-year acceptance rates applied to ALL conferences, one per '
+             'simulated year (values > 1 are percentages, e.g. "28,26,24.5,..."). Overrides the '
+             'fixed config acceptance rate. Default: None (fixed rate for all years).'
+    )
+    parser.add_argument(
+        '--strategy_mix',
+        type=str,
+        default=None,
+        help='Within-institution strategy composition as counts "explorer,exploiter,cautious", '
+             'e.g. "1,3,1" (default) or "3,1,1" (explorer-heavy). Must sum to researchers_per_institution. '
+             'Used by the E4b composition intervention; appends _mixEXC to the experiment_id.'
+    )
+    parser.add_argument(
+        '--funding_panel_max_apps',
+        type=int,
+        default=None,
+        help='Override funding panel size (config default 25). 0 disables panelization '
+             '(global ranking). Used by the panelization fidelity experiment; appends '
+             '_panelN to the experiment_id when set.'
+    )
+    parser.add_argument(
+        '--funding_application_cost',
+        type=int,
+        default=0,
+        help='Resource units deducted per GRANT APPLICATION at submission time, before '
+             'the funding result is known, for winners and losers alike (matthew_rd_cost '
+             'intervention). 0 (default) reproduces existing behavior exactly. Does NOT '
+             'affect paper resubmission mechanics.'
+    )
+    parser.add_argument(
+        '--log_funding_applications',
+        action='store_true',
+        default=False,
+        help='Persist the full pre-decision funding ranking (winners AND losers, per panel) '
+             'to funding_applications_year_<y>.jsonl in the run output dir. Required by the '
+             'Matthew-RD experiment; no effect on funding decisions.'
+    )
+    parser.add_argument(
         '--funding_intervention',
         action='store_true',
         default=False,
@@ -216,6 +267,18 @@ def parse_arguments(argv=None):
         model_short = args.model.split('/')[-1]
         args.experiment_name = f'default_{model_short}'
 
+    # Parse per-year acceptance-rate schedule into a list of fractions
+    if args.acceptance_rate_schedule is not None:
+        rates = [float(r) for r in args.acceptance_rate_schedule.split(',')]
+        rates = [r / 100 if r > 1 else r for r in rates]
+        if len(rates) != args.num_years:
+            raise ValueError(
+                f'--acceptance_rate_schedule has {len(rates)} entries but --num_years is '
+                f'{args.num_years}; provide exactly one rate per simulated year.')
+        if not all(0 < r <= 1 for r in rates):
+            raise ValueError(f'Acceptance rates must be in (0, 1] after parsing, got {rates}')
+        args.acceptance_rate_schedule = rates
+
     if args.experiment_stage:
         # Canonical layout: one experiment_id across outputs/{logs,checkpoints,visual,docs}
         from utopia.config import SIMULATION_CONFIG
@@ -235,17 +298,36 @@ def parse_arguments(argv=None):
                          f"cite{'on' if args.citation_intervention else 'off'}")
         else:
             mechanism = 'neutral'
+        # Composition override (E4b): counts "e,x,c" -> explicit strategy list
+        args.strategy_mix_list = None
+        mix_tag = ''
+        if args.strategy_mix:
+            counts = [int(c) for c in args.strategy_mix.split(',')]
+            assert len(counts) == 3 and sum(counts) == args.researchers_per_institution, (
+                f"--strategy_mix must be 3 counts summing to {args.researchers_per_institution}, "
+                f"got {args.strategy_mix}")
+            args.strategy_mix_list = (['explorer'] * counts[0] + ['exploiter'] * counts[1]
+                                      + ['cautious_explorer'] * counts[2])
+            mix_tag = f"_mix{counts[0]}{counts[1]}{counts[2]}"
+        if args.funding_panel_max_apps is not None:
+            mix_tag += f"_panel{args.funding_panel_max_apps}"
+        if args.funding_application_cost:
+            mix_tag += f"_cost{args.funding_application_cost}"
+
         n_researchers = args.num_institutions * args.researchers_per_institution
         args.experiment_id = (
             f"explore_{args.experiment_stage}_{model_tag}_{mechanism}_"
-            f"i{args.num_institutions}_n{n_researchers}_y{args.num_years}_seed{args.seed}"
+            f"i{args.num_institutions}_n{n_researchers}_y{args.num_years}_seed{args.seed}{mix_tag}"
         )
         base = args.output_dir  # repository-relative 'outputs'
         args.log_dir = os.path.join(base, 'logs', args.experiment_id)
         args.checkpoint_dir = os.path.join(base, 'checkpoints', args.experiment_id)
         args.visual_dir = os.path.join(base, 'visual', args.experiment_id)
         args.docs_dir = os.path.join(base, 'docs', args.experiment_id)
-        args.data_cache_dir = os.path.join('data', 'cache')
+        # Env override lets concurrent runs use disjoint cache dirs (the npz/json
+        # caches use non-atomic whole-file flushes and are single-writer only).
+        args.data_cache_dir = os.environ.get('UTOPIA_DATA_CACHE_DIR',
+                                             os.path.join('data', 'cache'))
         # Existing runner code writes checkpoints/reports to args.output_dir
         args.output_dir = args.checkpoint_dir
         for d in (args.log_dir, args.checkpoint_dir, args.visual_dir, args.docs_dir,

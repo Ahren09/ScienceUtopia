@@ -16,6 +16,7 @@ extensions
 # Distribution / packaging
 .Python
 build/
+data
 develop-eggs/
 dist/
 downloads/
@@ -207,3 +208,4 @@ huggingface/
 experiments
 MultiAgentResearch.md
 ScienceUtopia_260209.md
+Science Utopia.pdf

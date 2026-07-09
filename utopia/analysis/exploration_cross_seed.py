@@ -18,6 +18,7 @@ import glob
 import json
 import os
 from collections import defaultdict
+from typing import Dict
 
 import numpy as np
 import pandas as pd
@@ -37,6 +38,8 @@ def discover_runs(prefix: str, outputs_dir: str = 'outputs'):
     """
     runs = []
     for docs_dir in sorted(glob.glob(os.path.join(outputs_dir, 'docs', prefix + '*'))):
+        if 'invalidated' in os.path.basename(docs_dir):
+            continue  # archived pre-commit runs are never analyzed
         manifest_path = os.path.join(docs_dir, 'run_manifest.json')
         if not os.path.exists(manifest_path):
             continue
@@ -117,7 +120,10 @@ def researcher_level(agent_year: pd.DataFrame) -> pd.DataFrame:
 
 
 def within_institution_contrasts(researchers: pd.DataFrame, outcome: str) -> pd.DataFrame:
-    """Strategy contrasts computed within each (seed, institution) block."""
+    """Strategy contrasts computed within each (seed, institution) block.
+
+    Includes the pairwise contrasts and the H-CE planned contrast
+    cautious − (explorer + exploiter)/2."""
     rows = []
     for (seed, inst), block in researchers.groupby(['seed', 'institution']):
         means = block.groupby('strategy')[outcome].mean()
@@ -125,7 +131,31 @@ def within_institution_contrasts(researchers: pd.DataFrame, outcome: str) -> pd.
             if a in means.index and b in means.index and pd.notna(means[a]) and pd.notna(means[b]):
                 rows.append({'seed': seed, 'institution': inst, 'outcome': outcome,
                              'contrast': f'{a}-{b}', 'diff': means[a] - means[b]})
+        if all(s in means.index and pd.notna(means[s]) for s in STRATEGIES):
+            rows.append({'seed': seed, 'institution': inst, 'outcome': outcome,
+                         'contrast': 'cautious-mean(explorer,exploiter)',
+                         'diff': means['cautious_explorer']
+                                 - (means['explorer'] + means['exploiter']) / 2})
     return pd.DataFrame(rows)
+
+
+def load_funding_received(experiment_id: str, year: int, outputs_dir: str = 'outputs') -> Dict[str, float]:
+    """Cumulative funding RECEIVED (flow) per researcher from the year-Y checkpoint's
+    funding_success_history — the frozen H-CE endpoint (not year-end resources)."""
+    import gzip
+    base = os.path.join(outputs_dir, 'checkpoints', experiment_id, f'checkpoint_year_{year}.json')
+    if os.path.exists(base):
+        with open(base) as f:
+            ck = json.load(f)
+    else:
+        with gzip.open(base + '.gz', 'rt') as f:
+            ck = json.load(f)
+    out = {}
+    for a in ck['ecosystem_data']['agents']:
+        hist = a.get('funding_success_history') or {}
+        total = sum(r['amount'] for recs in hist.values() for r in recs)
+        out[a['id']] = float(total)
+    return out
 
 
 def hierarchical_bootstrap(contrasts: pd.DataFrame, n_boot=10000, seed=0):
@@ -274,7 +304,11 @@ def power_analysis(researchers: pd.DataFrame, out_dir: str,
         if col is None:
             continue
         contrasts = within_institution_contrasts(researchers, col)
-        base = contrasts[contrasts.contrast == 'explorer-exploiter']['diff'].dropna().values
+        # H-CE planned contrast powered on the funding endpoint
+        contrast_name = ('cautious-mean(explorer,exploiter)'
+                         if outcome in ('cumulative_funding_received', 'final_funding')
+                         else 'explorer-exploiter')
+        base = contrasts[contrasts.contrast == contrast_name]['diff'].dropna().values
         if len(base) < 10:
             rows.append({'outcome': outcome, 'note': 'insufficient calibration blocks'})
             continue
@@ -293,7 +327,7 @@ def power_analysis(researchers: pd.DataFrame, out_dir: str,
                          'scale': n_inst, 'target_effect': target,
                          'block_sd': block_sd, 'power': hits / n_sim})
         # world-level: seed-mean contrast variance
-        seed_means = contrasts[contrasts.contrast == 'explorer-exploiter'] \
+        seed_means = contrasts[contrasts.contrast == contrast_name] \
             .groupby('seed')['diff'].mean().values
         if len(seed_means) >= 2:
             world_sd = float(np.std(seed_means, ddof=1))
@@ -428,6 +462,9 @@ def main():
     parser.add_argument('--out_dir', type=str, required=True)
     parser.add_argument('--outputs_dir', type=str, default='outputs')
     parser.add_argument('--power_analysis', action='store_true')
+    parser.add_argument('--funding_horizon_year', type=int, default=None,
+                        help='Merge cumulative funding received at this horizon from checkpoints '
+                             '(activates the frozen H-CE endpoint)')
     parser.add_argument('--n_boot', type=int, default=10000)
     args = parser.parse_args()
 
@@ -446,7 +483,22 @@ def main():
     ecosystem = load_table(valid, 'ecosystem_year')
     researchers = researcher_level(agent_year)
     researchers['log1p_citations'] = np.log1p(researchers['total_citations'])
-    researchers['ever_hit'] = (researchers['hit_papers'] > 0).astype(float)
+    # Frozen H4 endpoint: within-seed top-decile citation stock (ITT)
+    researchers['ever_hit'] = (researchers['total_citations'] >= researchers.groupby('seed')
+                               ['total_citations'].transform(lambda x: x.quantile(0.9))).astype(float)
+    # Frozen H-CE endpoint: cumulative funding RECEIVED (flow) from checkpoints
+    if args.funding_horizon_year:
+        fund = {}
+        for r in valid:
+            try:
+                fr = load_funding_received(r['experiment_id'], args.funding_horizon_year,
+                                           args.outputs_dir)
+                for aid, v in fr.items():
+                    fund[(r['seed'], aid)] = v
+            except FileNotFoundError:
+                pass
+        researchers['cumulative_funding_received'] = [
+            fund.get((s, a), np.nan) for s, a in zip(researchers.seed, researchers.agent_id)]
 
     # Manipulation + balance
     manip = manipulation_check(researchers)
@@ -467,9 +519,11 @@ def main():
     ).reset_index()
     agg.to_csv(os.path.join(args.out_dir, 'aggregate_results.csv'), index=False)
 
-    # Primary contrasts with hierarchical bootstrap
-    primary_outcomes = ['mean_career_distance', 'acceptance_rate', 'final_funding',
-                        'log1p_citations', 'ever_hit']
+    # Primary contrasts with hierarchical bootstrap (frozen endpoints when
+    # funding_horizon_year is set; legacy final_funding otherwise)
+    primary_outcomes = ['mean_career_distance', 'acceptance_rate', 'log1p_citations', 'ever_hit']
+    primary_outcomes.append('cumulative_funding_received' if args.funding_horizon_year
+                            else 'final_funding')
     contrast_frames = [within_institution_contrasts(researchers, o) for o in primary_outcomes]
     contrasts = pd.concat([c for c in contrast_frames if len(c)], ignore_index=True)
     tests = hierarchical_bootstrap(contrasts, n_boot=args.n_boot)

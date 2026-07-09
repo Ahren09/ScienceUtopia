@@ -106,7 +106,8 @@ def check_citation_integrity(paper_tracker, citation_tracker) -> List[str]:
 
 
 def build_population_blueprint(num_institutions: int, researchers_per_institution: int,
-                               seed: int, num_expertise: int = 3) -> List[Dict]:
+                               seed: int, num_expertise: int = 3,
+                               strategy_mix: List[str] = None) -> List[Dict]:
     """Build a deterministic balanced university-only population blueprint.
 
     Within every institution the strategy mix is exactly the configured list
@@ -120,7 +121,10 @@ def build_population_blueprint(num_institutions: int, researchers_per_institutio
         expertise_indices, initial_funding_placeholder}
     """
     exp_config = SIMULATION_CONFIG['exploration_experiment']
-    strategy_mix = list(exp_config['institution_strategy_mix'])
+    # E4b composition intervention passes an explicit mix; the seeded RNG stream
+    # is identical regardless of mix, so paired seeds share the same blueprint
+    # base (institutions, expertise) and differ ONLY in strategy labels.
+    strategy_mix = list(strategy_mix or exp_config['institution_strategy_mix'])
     assert len(strategy_mix) == researchers_per_institution, (
         f"institution_strategy_mix has {len(strategy_mix)} entries but "
         f"researchers_per_institution={researchers_per_institution}")
@@ -142,6 +146,51 @@ def build_population_blueprint(num_institutions: int, researchers_per_institutio
                 'expertise_topics': [AVAILABLE_DIRECTIONS[i].topic for i in expertise_indices],
             })
     return blueprint
+
+
+def charge_application_costs(university_applications: List[Dict], app_cost: int,
+                             year: int) -> List[Dict]:
+    """Matthew-RD cost intervention: charge the frozen GRANT-APPLICATION cost
+    at submission time, BEFORE the funding result is known, to winners and
+    losers alike, once per application (incl. multiple same-year apps).
+
+    Feasibility rule (mirrors the paper-writing minimum-funding gate): an agent
+    that cannot pay withdraws the application — no charge, no debt, no negative
+    balances. app_cost <= 0 (the default) returns immediately with the
+    applications unmodified, reproducing pre-intervention behavior exactly.
+    Paper resubmission mechanics are untouched.
+
+    Mutates `university_applications` in place (withdrawn apps removed) and
+    returns per-application financial event records.
+    """
+    events = []
+    if app_cost <= 0:
+        return events
+    for apps_dict in university_applications:
+        for program_id in list(apps_dict.keys()):
+            app_data = apps_dict[program_id]
+            if not app_data.get('submit'):
+                continue
+            agent = app_data['author']
+            pre_balance = agent.resources
+            if pre_balance < app_cost:
+                del apps_dict[program_id]
+                events.append({
+                    'year': year, 'applicant_id': agent.id,
+                    'program_id': program_id, 'pre_balance': pre_balance,
+                    'cost_charged': 0, 'post_cost_balance': pre_balance,
+                    'withdrawn_unaffordable': True,
+                })
+                continue
+            agent.update_resources(delta=-app_cost)
+            events.append({
+                'year': year, 'applicant_id': agent.id,
+                'program_id': program_id, 'pre_balance': pre_balance,
+                'cost_charged': app_cost,
+                'post_cost_balance': agent.resources,
+                'withdrawn_unaffordable': False,
+            })
+    return events
 
 
 class Simulation:
@@ -186,8 +235,9 @@ class Simulation:
         self.experiment_name = kwargs.get('experiment_name', 'default')
         self.collaboration_mode = kwargs.get('collaboration_mode',
                                               SIMULATION_CONFIG['preferential_attachment_experiment']['collaboration_mode'])
+        self.collaboration_network_growth_mode = kwargs.get('collaboration_network_growth_mode', 'legacy')
 
-        assert self.experiment_name.startswith('default') or self.experiment_name in ['exploration_vs_exploitation', 'preferential_attachment'], f"Invalid experiment name: {self.experiment_name}"
+        assert self.experiment_name.startswith(('default', 'acl-acceptance-rates', 'acl_schedule_smoke')) or self.experiment_name in ['exploration_vs_exploitation', 'preferential_attachment'], f"Invalid experiment name: {self.experiment_name}"
 
         # Store args for backward compatibility with existing code
         if args is None:
@@ -475,7 +525,9 @@ class Simulation:
             SIMULATION_CONFIG['exploration_experiment']['initial_funding']
         run_seed = getattr(self.args, 'seed', 42)
 
-        blueprint = build_population_blueprint(num_institutions, per_institution, run_seed)
+        blueprint = build_population_blueprint(
+            num_institutions, per_institution, run_seed,
+            strategy_mix=getattr(self.args, 'strategy_mix_list', None))
 
         for row in blueprint:
             researcher = UniversityResearcher(
@@ -1015,68 +1067,76 @@ class Simulation:
         agent_candidates = {}  # agent_id -> [(candidate_id, score, candidate_info_dict)]
 
         active_author_ids = set(a.id for a in active_authors)
-        for agent in active_authors:
-            topics_a = agent_topics.get(agent.id, set())
-            if not topics_a:
-                continue
-
-            inst_a = _get_institution(agent)
-            recent_papers_a = self.paper_tracker.get_papers_by_author(agent.id)
-            recent_topics_a = set()
-            for p in sorted(recent_papers_a, key=lambda x: x.year, reverse=True)[:3]:
-                recent_topics_a.update(p.topics)
-
-            scored = []
-            for other in active_authors:
-                if other.id == agent.id:
-                    continue
-                inst_b = _get_institution(other)
-
-                # Filter by collaboration mode
-                if collaboration_mode == 'intra_institute' and inst_a != inst_b:
-                    continue
-                if collaboration_mode == 'cross_institute' and inst_a == inst_b:
+        # growth_ctx is non-None only in the default-off 'expanding' mode
+        # (prereg_v1_1_source_fix); 'legacy' keeps the original path untouched.
+        growth_ctx = None
+        if self.collaboration_network_growth_mode == 'expanding':
+            agent_candidates, growth_ctx = self._expanding_candidate_selection(
+                year, active_authors, agent_topics, _get_institution,
+                collaboration_mode, pa_config)
+        else:
+            for agent in active_authors:
+                topics_a = agent_topics.get(agent.id, set())
+                if not topics_a:
                     continue
 
-                topics_b = agent_topics.get(other.id, set())
-                union = topics_a | topics_b
-                if not union:
-                    continue
+                inst_a = _get_institution(agent)
+                recent_papers_a = self.paper_tracker.get_papers_by_author(agent.id)
+                recent_topics_a = set()
+                for p in sorted(recent_papers_a, key=lambda x: x.year, reverse=True)[:3]:
+                    recent_topics_a.update(p.topics)
 
-                # Topic overlap (Jaccard): weight 0.4
-                topic_score = len(topics_a & topics_b) / len(union)
+                scored = []
+                for other in active_authors:
+                    if other.id == agent.id:
+                        continue
+                    inst_b = _get_institution(other)
 
-                # Recent publication overlap: weight 0.4
-                recent_papers_b = self.paper_tracker.get_papers_by_author(other.id)
-                recent_topics_b = set()
-                for p in sorted(recent_papers_b, key=lambda x: x.year, reverse=True)[:3]:
-                    recent_topics_b.update(p.topics)
-                pub_union = recent_topics_a | recent_topics_b
-                pub_score = len(recent_topics_a & recent_topics_b) / len(pub_union) if pub_union else 0.0
+                    # Filter by collaboration mode
+                    if collaboration_mode == 'intra_institute' and inst_a != inst_b:
+                        continue
+                    if collaboration_mode == 'cross_institute' and inst_a == inst_b:
+                        continue
 
-                # Network proximity bonus: weight 0.2
-                net_score = 0.0
-                if self.collaboration_tracker.graph.has_node(agent.id) and self.collaboration_tracker.graph.has_node(other.id):
-                    dist = self.collaboration_tracker.get_network_distance(agent.id, other.id)
-                    if dist == 1:
-                        net_score = 1.0
-                    elif dist == 2:
-                        net_score = 0.5
+                    topics_b = agent_topics.get(other.id, set())
+                    union = topics_a | topics_b
+                    if not union:
+                        continue
 
-                final_score = 0.4 * topic_score + 0.4 * pub_score + 0.2 * net_score
-                if final_score > pa_config['min_similarity_threshold']:
-                    expertise_b = [e.topic if hasattr(e, 'topic') else str(e) for e in getattr(other, 'expertise', [])]
-                    recent_paper_titles = [p.title for p in sorted(recent_papers_b, key=lambda x: x.year, reverse=True)[:3]]
-                    scored.append((other.id, final_score, {
-                        'id': other.id,
-                        'institution': inst_b or 'Unknown',
-                        'expertise': expertise_b,
-                        'recent_papers': '; '.join(recent_paper_titles) if recent_paper_titles else 'None',
-                        'score': final_score,
-                    }))
+                    # Topic overlap (Jaccard): weight 0.4
+                    topic_score = len(topics_a & topics_b) / len(union)
 
-            scored.sort(key=lambda x: x[1], reverse=True)
-            agent_candidates[agent.id] = scored[:top_k]
+                    # Recent publication overlap: weight 0.4
+                    recent_papers_b = self.paper_tracker.get_papers_by_author(other.id)
+                    recent_topics_b = set()
+                    for p in sorted(recent_papers_b, key=lambda x: x.year, reverse=True)[:3]:
+                        recent_topics_b.update(p.topics)
+                    pub_union = recent_topics_a | recent_topics_b
+                    pub_score = len(recent_topics_a & recent_topics_b) / len(pub_union) if pub_union else 0.0
+
+                    # Network proximity bonus: weight 0.2
+                    net_score = 0.0
+                    if self.collaboration_tracker.graph.has_node(agent.id) and self.collaboration_tracker.graph.has_node(other.id):
+                        dist = self.collaboration_tracker.get_network_distance(agent.id, other.id)
+                        if dist == 1:
+                            net_score = 1.0
+                        elif dist == 2:
+                            net_score = 0.5
+
+                    final_score = 0.4 * topic_score + 0.4 * pub_score + 0.2 * net_score
+                    if final_score > pa_config['min_similarity_threshold']:
+                        expertise_b = [e.topic if hasattr(e, 'topic') else str(e) for e in getattr(other, 'expertise', [])]
+                        recent_paper_titles = [p.title for p in sorted(recent_papers_b, key=lambda x: x.year, reverse=True)[:3]]
+                        scored.append((other.id, final_score, {
+                            'id': other.id,
+                            'institution': inst_b or 'Unknown',
+                            'expertise': expertise_b,
+                            'recent_papers': '; '.join(recent_paper_titles) if recent_paper_titles else 'None',
+                            'score': final_score,
+                        }))
+
+                scored.sort(key=lambda x: x[1], reverse=True)
+                agent_candidates[agent.id] = scored[:top_k]
 
         # --- Step 2: LLM collaboration decision ---
         supports_batching = hasattr(self.llm, 'generate_batch')
@@ -1126,31 +1186,36 @@ class Simulation:
                         collab_decisions[agent.id] = (True, cid)
 
         # --- Step 3: Form pairs (mutual or one-sided matching) ---
-        claimed = set()
-        collaboration_pairs = {}  # lead_id -> co_author_id
+        growth_stats = None
+        if growth_ctx is not None:
+            collaboration_pairs, growth_stats = self._expanding_form_pairs(
+                year, collab_decisions, agent_candidates, growth_ctx)
+        else:
+            claimed = set()
+            collaboration_pairs = {}  # lead_id -> co_author_id
 
-        for agent_id, (_, chosen_id) in collab_decisions.items():
-            if agent_id in claimed or chosen_id in claimed:
-                continue
+            for agent_id, (_, chosen_id) in collab_decisions.items():
+                if agent_id in claimed or chosen_id in claimed:
+                    continue
 
-            # Check if mutual (both chose each other)
-            other_decision = collab_decisions.get(chosen_id)
-            is_mutual = other_decision and other_decision[1] == agent_id
+                # Check if mutual (both chose each other)
+                other_decision = collab_decisions.get(chosen_id)
+                is_mutual = other_decision and other_decision[1] == agent_id
 
-            # Check if one-sided (chosen_id didn't choose anyone else)
-            chosen_available = chosen_id not in collab_decisions or is_mutual
+                # Check if one-sided (chosen_id didn't choose anyone else)
+                chosen_available = chosen_id not in collab_decisions or is_mutual
 
-            if is_mutual or chosen_available:
-                collaboration_pairs[agent_id] = chosen_id
-                claimed.add(agent_id)
-                claimed.add(chosen_id)
+                if is_mutual or chosen_available:
+                    collaboration_pairs[agent_id] = chosen_id
+                    claimed.add(agent_id)
+                    claimed.add(chosen_id)
 
-                # Update collaboration tracker and COI
-                self.collaboration_tracker.add_collaboration(agent_id, chosen_id, year)
-                agent_a = self.ecosystem.get_agent_by_id(agent_id)
-                agent_b = self.ecosystem.get_agent_by_id(chosen_id)
-                agent_a.add_conflict_of_interest(chosen_id)
-                agent_b.add_conflict_of_interest(agent_id)
+                    # Update collaboration tracker and COI
+                    self.collaboration_tracker.add_collaboration(agent_id, chosen_id, year)
+                    agent_a = self.ecosystem.get_agent_by_id(agent_id)
+                    agent_b = self.ecosystem.get_agent_by_id(chosen_id)
+                    agent_a.add_conflict_of_interest(chosen_id)
+                    agent_b.add_conflict_of_interest(agent_id)
 
         self._collaboration_pairs[year] = collaboration_pairs
 
@@ -1164,10 +1229,276 @@ class Simulation:
             'total_nodes': self.collaboration_tracker.graph.number_of_nodes(),
             **basic_metrics,
         }
+        if growth_stats is not None:
+            year_results['collaboration_formation'].update(growth_stats)
 
         logger.info(f"Year {year} Phase 1.5: Formed {len(collaboration_pairs)} collaboration pairs "
                      f"(total: {self.collaboration_tracker.graph.number_of_edges()} edges, "
                      f"{self.collaboration_tracker.graph.number_of_nodes()} nodes)")
+
+    def _expanding_candidate_selection(self, year, active_authors, agent_topics,
+                                       _get_institution, collaboration_mode, pa_config):
+        """Expanding growth mode (prereg_v1_1_source_fix): deterministic 70/30
+        new-tie/repeat-tie proposal channels, scored against the pre-formation
+        graph snapshot. Returns (agent_candidates, growth_ctx).
+        """
+        import math
+        import networkx as nx
+        from utopia.utils.generail_utils import derive_seed
+
+        run_seed = getattr(self.args, 'seed', 42)
+        # All eligibility, distances, and degree terms use the graph BEFORE any
+        # current-year collaboration is added.
+        pre_graph = self.collaboration_tracker.graph.copy()
+        max_log1p_deg = max((math.log1p(d) for _, d in pre_graph.degree()), default=0.0)
+
+        def _recent_topics(agent_id):
+            topics = set()
+            papers = self.paper_tracker.get_papers_by_author(agent_id)
+            for p in sorted(papers, key=lambda x: x.year, reverse=True)[:3]:
+                topics.update(p.topics)
+            return topics
+
+        agent_candidates = {}
+        channels = {}
+        distances = {}       # agent_id -> {other_id: pre-formation distance}
+        components_map = {}  # (agent_id, candidate_id) -> score components
+
+        for agent in active_authors:
+            topics_a = agent_topics.get(agent.id, set())
+            if not topics_a:
+                continue
+            channel = ('new_tie'
+                       if derive_seed(run_seed, 'collab_growth_channel', year, agent.id) % 100 < 70
+                       else 'repeat_tie')
+            channels[agent.id] = channel
+            inst_a = _get_institution(agent)
+            dist_map = (dict(nx.single_source_shortest_path_length(pre_graph, agent.id))
+                        if pre_graph.has_node(agent.id) else {})
+            distances[agent.id] = dist_map
+            recent_topics_a = _recent_topics(agent.id)
+            coi_a = set(getattr(agent, 'conflict_of_interest', set()) or set())
+
+            scored = []
+            for other in active_authors:
+                if other.id == agent.id:
+                    continue
+                inst_b = _get_institution(other)
+                if collaboration_mode == 'intra_institute' and inst_a != inst_b:
+                    continue
+                if collaboration_mode == 'cross_institute' and inst_a == inst_b:
+                    continue
+
+                dist = dist_map.get(other.id, -1)
+                if channel == 'new_tie':
+                    # New ties only: existing d1 partners and COI (either
+                    # direction) are ineligible; d2 and disconnected allowed.
+                    if dist == 1:
+                        continue
+                    if other.id in coi_a or agent.id in set(
+                            getattr(other, 'conflict_of_interest', set()) or set()):
+                        continue
+                else:
+                    # Repeat ties only: must already be a d1 collaborator.
+                    if dist != 1:
+                        continue
+
+                topics_b = agent_topics.get(other.id, set())
+                union = topics_a | topics_b
+                if not union:
+                    continue
+                topic_score = len(topics_a & topics_b) / len(union)
+                recent_topics_b = _recent_topics(other.id)
+                pub_union = recent_topics_a | recent_topics_b
+                pub_score = (len(recent_topics_a & recent_topics_b) / len(pub_union)
+                             if pub_union else 0.0)
+
+                if channel == 'new_tie':
+                    deg = pre_graph.degree(other.id) if pre_graph.has_node(other.id) else 0
+                    degree_score = math.log1p(deg) / max_log1p_deg if max_log1p_deg > 0 else 0.0
+                    d2_indicator = 1.0 if dist == 2 else 0.0
+                    final_score = (0.40 * topic_score + 0.30 * pub_score
+                                   + 0.20 * degree_score + 0.10 * d2_indicator)
+                    score_parts = {'topic': topic_score, 'pub': pub_score,
+                                   'degree': degree_score, 'd2_indicator': d2_indicator}
+                else:
+                    # Existing compatibility logic; net term is constant (1.0)
+                    # across d1 candidates so ranking is topical/publication.
+                    final_score = 0.4 * topic_score + 0.4 * pub_score + 0.2 * 1.0
+                    score_parts = {'topic': topic_score, 'pub': pub_score, 'net': 1.0}
+
+                if final_score > pa_config['min_similarity_threshold']:
+                    recent_papers_b = self.paper_tracker.get_papers_by_author(other.id)
+                    expertise_b = [e.topic if hasattr(e, 'topic') else str(e)
+                                   for e in getattr(other, 'expertise', [])]
+                    recent_paper_titles = [p.title for p in sorted(
+                        recent_papers_b, key=lambda x: x.year, reverse=True)[:3]]
+                    scored.append((other.id, final_score, {
+                        'id': other.id,
+                        'institution': inst_b or 'Unknown',
+                        'expertise': expertise_b,
+                        'recent_papers': '; '.join(recent_paper_titles) if recent_paper_titles else 'None',
+                        'score': final_score,
+                    }))
+                    components_map[(agent.id, other.id)] = score_parts
+
+            # Deterministic: score desc, then candidate ID
+            scored.sort(key=lambda x: (-x[1], x[0]))
+            agent_candidates[agent.id] = scored[:pa_config['top_k_candidates']]
+
+        growth_ctx = {'pre_graph': pre_graph, 'channels': channels,
+                      'distances': distances, 'components': components_map,
+                      'run_seed': run_seed}
+        return agent_candidates, growth_ctx
+
+    def _expanding_form_pairs(self, year, collab_decisions, agent_candidates, growth_ctx):
+        """Pair formation for the expanding mode: same mutual/one-sided rules
+        as legacy, but iterated in a seeded deterministic order, with every
+        proposal and realized event logged and classified against the
+        pre-formation snapshot. Returns (collaboration_pairs, growth_stats).
+        """
+        import random
+        from collections import Counter
+        import networkx as nx
+        from utopia.utils.generail_utils import derive_seed
+
+        pre_graph = growth_ctx['pre_graph']
+        distances = growth_ctx['distances']
+        channels = growth_ctx['channels']
+
+        order = sorted(collab_decisions.keys())
+        random.Random(derive_seed(growth_ctx['run_seed'], 'collab_growth_order', year)).shuffle(order)
+
+        claimed = set()
+        collaboration_pairs = {}
+        growth_log = []
+        realized_counts = Counter()
+        merge_counts = Counter()
+        # Working copy for per-edge component classification (state BEFORE
+        # each insertion), updated as edges land this year.
+        work_graph = pre_graph.copy()
+
+        for res_idx, agent_id in enumerate(order):
+            _, chosen_id = collab_decisions[agent_id]
+            pre_dist = distances.get(agent_id, {}).get(chosen_id, -1)
+            other_decision = collab_decisions.get(chosen_id)
+            is_mutual = bool(other_decision and other_decision[1] == agent_id)
+            rec = {
+                'agent': agent_id,
+                'candidate': chosen_id,
+                'channel': channels.get(agent_id),
+                'pre_d1': pre_dist == 1,
+                'pre_distance': pre_dist,
+                'mutual': is_mutual,
+                'score_components': growth_ctx['components'].get((agent_id, chosen_id)),
+                'resolution_order': res_idx,
+            }
+            if collaboration_pairs.get(chosen_id) == agent_id:
+                # Mirror side of an already-formed mutual pair: the same
+                # collaboration event, already logged — not a rejection.
+                continue
+            chosen_available = chosen_id not in collab_decisions or is_mutual
+            if agent_id in claimed or chosen_id in claimed or not (is_mutual or chosen_available):
+                rec['formed'] = False
+                rec['realized'] = 'rejected'
+                realized_counts['rejected'] += 1
+                growth_log.append(rec)
+                continue
+
+            rec['formed'] = True
+            if pre_dist == 1:
+                rec['realized'] = 'repeat_edge'
+                realized_counts['repeat_edge'] += 1
+            else:
+                rec['realized'] = 'new_edge'
+                realized_counts['new_edge'] += 1
+                a_conn = work_graph.has_node(agent_id) and work_graph.degree(agent_id) > 0
+                b_conn = work_graph.has_node(chosen_id) and work_graph.degree(chosen_id) > 0
+                if a_conn and b_conn:
+                    rec['merge_class'] = ('within_component'
+                                          if nx.has_path(work_graph, agent_id, chosen_id)
+                                          else 'merging_components')
+                else:
+                    rec['merge_class'] = 'attaching_new_node'
+                merge_counts[rec['merge_class']] += 1
+            work_graph.add_edge(agent_id, chosen_id)
+
+            collaboration_pairs[agent_id] = chosen_id
+            claimed.add(agent_id)
+            claimed.add(chosen_id)
+            self.collaboration_tracker.add_collaboration(agent_id, chosen_id, year)
+            agent_a = self.ecosystem.get_agent_by_id(agent_id)
+            agent_b = self.ecosystem.get_agent_by_id(chosen_id)
+            agent_a.add_conflict_of_interest(chosen_id)
+            agent_b.add_conflict_of_interest(agent_id)
+            growth_log.append(rec)
+
+        # Agents that had a candidate menu but made no valid proposal
+        for agent_id, candidates in sorted(agent_candidates.items()):
+            if candidates and agent_id not in collab_decisions:
+                realized_counts['unmatched'] += 1
+                growth_log.append({
+                    'agent': agent_id, 'candidate': None,
+                    'channel': channels.get(agent_id),
+                    'formed': False, 'realized': 'unmatched',
+                })
+
+        post_graph = self.collaboration_tracker.graph
+        comp_sizes = sorted((len(c) for c in nx.connected_components(post_graph)), reverse=True)
+        pre_comp_count = nx.number_connected_components(pre_graph)
+        size_hist = {'1': 0, '2': 0, '3-5': 0, '6-10': 0, '>10': 0}
+        for s in comp_sizes:
+            if s == 1:
+                size_hist['1'] += 1
+            elif s == 2:
+                size_hist['2'] += 1
+            elif s <= 5:
+                size_hist['3-5'] += 1
+            elif s <= 10:
+                size_hist['6-10'] += 1
+            else:
+                size_hist['>10'] += 1
+
+        pair_counts = {'d2': 0, 'd3': 0, 'connected_ge4': 0, 'disconnected': 0}
+        nodes = list(post_graph.nodes)
+        for a in nodes:
+            lengths = nx.single_source_shortest_path_length(post_graph, a)
+            for b in nodes:
+                if b == a:
+                    continue
+                d = lengths.get(b)
+                if d is None:
+                    pair_counts['disconnected'] += 1
+                elif d == 2:
+                    pair_counts['d2'] += 1
+                elif d == 3:
+                    pair_counts['d3'] += 1
+                elif d >= 4:
+                    pair_counts['connected_ge4'] += 1
+
+        growth_stats = {
+            'growth_mode': 'expanding',
+            'channel_assigned': dict(Counter(channels.values())),
+            'proposals': len(collab_decisions),
+            'realized': dict(realized_counts),
+            'new_edge_classes': dict(merge_counts),
+            'components_before': pre_comp_count,
+            'components_after': len(comp_sizes),
+            'largest_component': comp_sizes[0] if comp_sizes else 0,
+            'component_size_hist': size_hist,
+            'degree_hist': dict(Counter(d for _, d in post_graph.degree())),
+            'pair_counts': pair_counts,
+            'growth_log': growth_log,
+        }
+
+        # Persist per-year growth diagnostics next to the checkpoints
+        # (year_results is not fully exported to simulation_report.json).
+        out_dir = getattr(self, 'output_dir', None)
+        if out_dir:
+            with open(os.path.join(out_dir, 'network_growth_log.jsonl'), 'a') as f:
+                f.write(json.dumps({'year': year, **growth_stats}) + '\n')
+
+        return collaboration_pairs, growth_stats
 
     def _apply_coauthorship(self, paper_dict: Dict, agent, year: int):
         """If agent has a collaboration partner this round, update paper_dict with co-author info."""
@@ -2641,6 +2972,16 @@ class Simulation:
         """
         logger.info(f"Year {year} Phase 4: Making acceptance decisions...")
 
+        schedule = getattr(self.args, 'acceptance_rate_schedule', None)
+        if schedule:
+            # Per-year override applied to every conference before decisions; the year-N
+            # checkpoint (written after Phase 4) therefore records the year-N rate.
+            rate = schedule[year - 1]
+            for conf in self.conference_system.conferences:
+                conf.acceptance_rate = rate
+            logger.info(f"Year {year}: acceptance rate set to {rate:.3f} for all conferences "
+                        f"(schedule override)")
+
         self.conference_system.make_all_decisions()
 
         total_accepted = sum(len(conf.decisions['accept']) for conf in self.conference_system.conferences)
@@ -2921,6 +3262,11 @@ class Simulation:
                     agent_applications.setdefault(agent_id, {})[program_id] = app_data
                 university_applications.extend(agent_applications.values())
 
+        # Matthew-RD cost intervention (no-op at the default cost 0).
+        funding_cost_events = charge_application_costs(
+            university_applications,
+            getattr(self.args, 'funding_application_cost', 0) or 0, year)
+
         # Evaluate applications across all funding agencies
         all_funding_winners_dict, all_funding_programs_dict = {}, {}
 
@@ -2938,8 +3284,12 @@ class Simulation:
 
         # Deterministic panelization keeps funding-ranking prompts bounded at scale;
         # fidelity vs global ranking is validated before confirmatory use.
+        # CLI override supports the fidelity experiment (0 = disable panels).
         panel_max_apps = (SIMULATION_CONFIG['exploration_experiment']['funding_panel_max_apps']
                           if self.is_exploration_experiment else None)
+        cli_panel = getattr(self.args, 'funding_panel_max_apps', None)
+        if cli_panel is not None:
+            panel_max_apps = cli_panel if cli_panel > 0 else None
         for funding_agent in funding_agencies:
             all_funding_programs_dict.update(funding_agent.funding_programs)
             funding_proposal_eval_prompts, resp_fmt, eval_metadata = funding_agent.get_funding_evaluation_prompts(
@@ -2963,8 +3313,11 @@ class Simulation:
                     break
 
                 if hasattr(self.llm, 'generate_batch'):
+                    # Ranking ALL panel applications produces long JSON after thinking
+                    # tokens; the 2048 default truncated ~13% of program-years in E3.
                     eval_results = self.llm.generate_batch(
                         all_funding_proposal_eval_prompts, response_format=eval_response_format,
+                        max_tokens=8192,
                         desc=f"{len(all_funding_proposal_eval_prompts)} funding evaluations (attempt {attempt+1}/{MAX_FUNDING_EVAL_RETRIES})",
                         seed_ctx=('phase5_funding_eval', year, attempt),
                     )
@@ -3010,10 +3363,24 @@ class Simulation:
                 novelty_penalties = self._compute_recent_novelty_percentiles(applicant_ids)
                 lambda_funding = SIMULATION_CONFIG['exploration_experiment']['novelty_penalty_in_funding']
 
+            # Matthew-RD experiment: persist full pre-decision rankings so the
+            # funding cutoff is reconstructable for winners AND losers.
+            # Default-off flag; no behavior change for any other experiment.
+            application_log = [] if getattr(self.args, 'log_funding_applications', False) else None
             all_funding_winners_dict = FundingAgency.process_funding_evaluation_results(
                 final_eval_results, final_eval_metadata, all_funding_programs_dict,
                 novelty_penalties=novelty_penalties, lambda_funding=lambda_funding,
+                application_log=application_log,
             )
+            if application_log is not None:
+                app_log_path = os.path.join(self.output_dir,
+                                            f'funding_applications_year_{year}.jsonl')
+                with open(app_log_path, 'w') as f:
+                    for rec in application_log:
+                        rec['year'] = year
+                        f.write(json.dumps(rec) + '\n')
+                logger.info(f"Funding application log: {len(application_log)} records "
+                            f"-> {app_log_path}")
 
             for program_id, winners in all_funding_winners_dict.items():
                 winners_list.extend([agent['applicant_id'] for agent in winners])
@@ -3054,6 +3421,27 @@ class Simulation:
                     'year': year,
                     'amount': funding_to_researcher
                 })
+
+        # Matthew-RD cost intervention: finalize per-application financial
+        # records now that awards are applied (funded flag, award amount,
+        # post-award balance) and persist them alongside the application log.
+        if funding_cost_events:
+            won = {(w['applicant_id'], pid)
+                   for pid, winners in all_funding_winners_dict.items() for w in winners}
+            for ev in funding_cost_events:
+                funded = (ev['applicant_id'], ev['program_id']) in won \
+                    and not ev['withdrawn_unaffordable']
+                ev['funded'] = funded
+                ev['award_amount'] = academic_funding_per_unit if funded else 0
+                agent = self.ecosystem.get_agent_by_id(ev['applicant_id'])
+                ev['post_award_balance'] = getattr(agent, 'resources', None)
+            cost_log_path = os.path.join(self.output_dir,
+                                         f'funding_costs_year_{year}.jsonl')
+            with open(cost_log_path, 'w') as f:
+                for ev in funding_cost_events:
+                    f.write(json.dumps(ev) + '\n')
+            logger.info(f"Funding cost log: {len(funding_cost_events)} records "
+                        f"-> {cost_log_path}")
 
         for agent_id, agent in self.ecosystem.agent_population.items():
             if getattr(agent, 'resources', None) and agent.resources <= 10 and hasattr(agent,
@@ -3413,7 +3801,7 @@ class Simulation:
             }
 
         # Large-stage runs write gzipped checkpoints (~10x smaller; plan scale rule)
-        if getattr(self.args, 'experiment_stage', None) in ('calibration', 'confirmatory', 'manyworld', 'mechanism'):
+        if getattr(self.args, 'experiment_stage', None) in ('calibration', 'confirmatory', 'manyworld', 'mechanism', 'matthew_rd', 'matthew_rd_cost'):
             import gzip
             checkpoint_path += '.gz'
             with gzip.open(checkpoint_path, 'wt') as f:
@@ -3611,6 +3999,7 @@ def main():
         weighted_funding_assignment=args.weighted_funding_assignment,
         experiment_name=args.experiment_name,
         collaboration_mode=args.collaboration_mode,
+        collaboration_network_growth_mode=args.collaboration_network_growth_mode,
         start_year=args.start_year,
         args=args
     )

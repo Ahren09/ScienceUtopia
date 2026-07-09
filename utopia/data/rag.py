@@ -298,6 +298,10 @@ class RAG:
         if os.path.exists(cache_file):
             print(f"[Cache HIT] Loading embeddings from {cache_file}")
             self.document_embeddings = torch.load(cache_file, map_location=self.device, weights_only=True)
+            # Cache was written as fp16 on GPU; CPU queries encode as fp32 —
+            # unify dtype so torch.mm never sees mixed precision.
+            if 'cuda' not in str(self.device) and self.document_embeddings.dtype != torch.float32:
+                self.document_embeddings = self.document_embeddings.float()
             if self.document_embeddings.shape[0] != len(self.documents):
                 print(f"[Cache STALE] Embedding count {self.document_embeddings.shape[0]} != document count {len(self.documents)} — re-encoding")
                 self.document_embeddings = None
