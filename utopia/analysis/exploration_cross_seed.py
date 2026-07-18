@@ -158,6 +158,92 @@ def load_funding_received(experiment_id: str, year: int, outputs_dir: str = 'out
     return out
 
 
+def load_review_scores(experiment_id: str, outputs_dir: str = 'outputs') -> pd.DataFrame:
+    """Individual reviewer scores for every submission event of every paper.
+
+    Read from the LATEST checkpoint's paper_tracker: review_history
+    accumulates across years with per-event year tags, so one checkpoint
+    holds the full record. Returns one row per individual review:
+    year (of the submission event), paper_id, event_idx (submission
+    attempt, 0-based), overall_score (1-5 rubric, decimals allowed).
+    """
+    import gzip
+    ck_dir = os.path.join(outputs_dir, 'checkpoints', experiment_id)
+    paths = glob.glob(os.path.join(ck_dir, 'checkpoint_year_*.json*'))
+    if not paths:
+        raise FileNotFoundError(f'No checkpoints under {ck_dir}')
+    year_of = lambda p: int(os.path.basename(p).split('_')[-1].split('.')[0])
+    path = max(paths, key=year_of)
+    opener = gzip.open if path.endswith('.gz') else open
+    with opener(path, 'rt') as f:
+        ck = json.load(f)
+    rows = []
+    for paper in ck['paper_tracker']['papers']:
+        for event_idx, event in enumerate(paper.get('review_history') or []):
+            for review in event.get('reviews') or []:
+                rows.append((event['year'], paper['id'], event_idx,
+                             float(review['overall_score'])))
+    return pd.DataFrame(rows, columns=['year', 'paper_id', 'event_idx',
+                                       'overall_score'])
+
+
+def review_score_trajectories(valid, out_dir: str, outputs_dir: str = 'outputs'):
+    """Per seed x year distribution of individual reviewer scores.
+
+    Tests the score-homogenization question descriptively: does the
+    cross-review dispersion shrink over the simulated decade, and where does
+    the score mass sit relative to the 1-5 rubric (3 = borderline accept;
+    the 2.0-2.5 band reads as borderline reject)? Writes
+    review_score_trajectories.csv (seed x year: n, mean, sd, percentiles,
+    share in [2.0, 2.5], mean within-event reviewer SD) plus
+    review_score_convergence.json (per-seed year-1/year-final values, OLS
+    slope vs year, and cross-seed direction agreement for each statistic).
+    """
+    rows = []
+    for r in valid:
+        reviews = load_review_scores(r['experiment_id'], outputs_dir)
+        for year, sub in reviews.groupby('year'):
+            s = sub['overall_score']
+            # reviewer disagreement within one submission event (~3 reviews)
+            within = (sub.groupby(['paper_id', 'event_idx'])['overall_score']
+                      .std(ddof=1).dropna())
+            rows.append({
+                'seed': r['seed'], 'year': year, 'n_reviews': len(s),
+                'mean': s.mean(), 'sd': s.std(ddof=1),
+                'p10': s.quantile(.10), 'p25': s.quantile(.25),
+                'median': s.quantile(.50), 'p75': s.quantile(.75),
+                'p90': s.quantile(.90),
+                'share_borderline_reject': s.between(2.0, 2.5).mean(),
+                'within_event_sd': within.mean(),
+            })
+    traj = pd.DataFrame(rows).sort_values(['seed', 'year'])
+    csv_path = os.path.join(out_dir, 'review_score_trajectories.csv')
+    traj.to_csv(csv_path, index=False)
+
+    summary = {}
+    for stat in ('sd', 'within_event_sd', 'mean', 'share_borderline_reject'):
+        per_seed = {}
+        for seed, sub in traj.groupby('seed'):
+            per_seed[int(seed)] = {
+                'first_year': float(sub[stat].iloc[0]),
+                'final_year': float(sub[stat].iloc[-1]),
+                'slope_per_year': float(np.polyfit(sub['year'], sub[stat], 1)[0]),
+            }
+        slopes = [v['slope_per_year'] for v in per_seed.values()]
+        summary[stat] = {'per_seed': per_seed,
+                         'seeds_with_negative_slope': int(sum(s < 0 for s in slopes)),
+                         'mean_slope_per_year': float(np.mean(slopes))}
+        print(f"{stat}: first->final "
+              + '; '.join(f"seed {k}: {v['first_year']:.3f}->{v['final_year']:.3f}"
+                          for k, v in per_seed.items())
+              + f" | mean slope {summary[stat]['mean_slope_per_year']:+.4f}/yr, "
+                f"{summary[stat]['seeds_with_negative_slope']}/{len(slopes)} seeds negative")
+    json_path = os.path.join(out_dir, 'review_score_convergence.json')
+    with open(json_path, 'w') as f:
+        json.dump(summary, f, indent=2)
+    print(f'Wrote {csv_path} and {json_path}')
+
+
 def hierarchical_bootstrap(contrasts: pd.DataFrame, n_boot=10000, seed=0):
     """Two-level bootstrap: resample seeds, then institutions within seed.
 
@@ -183,11 +269,16 @@ def hierarchical_bootstrap(contrasts: pd.DataFrame, n_boot=10000, seed=0):
                 vals.append(np.mean(v[rng.integers(0, len(v), len(v))]))
             boots[b] = np.mean(vals)
         pooled_sd = float(df['diff'].std(ddof=1)) if len(df) > 1 else np.nan
+        # Two-sided bootstrap p: how often the resampled mean crosses zero,
+        # floored at 1/n_boot (cannot resolve smaller p from n_boot draws).
+        p_boot = 2.0 * min(float(np.mean(boots <= 0)), float(np.mean(boots >= 0)))
+        p_boot = float(min(1.0, max(p_boot, 1.0 / n_boot)))
         out.append({
             'outcome': outcome, 'contrast': contrast,
             'mean_diff': point,
             'ci_lo': float(np.percentile(boots, 2.5)),
             'ci_hi': float(np.percentile(boots, 97.5)),
+            'p_boot': p_boot,
             'smd': point / pooled_sd if pooled_sd and pooled_sd > 0 else np.nan,
             'n_seeds': len(seeds),
             'n_institution_blocks': len(df),
@@ -466,17 +557,30 @@ def main():
                         help='Merge cumulative funding received at this horizon from checkpoints '
                              '(activates the frozen H-CE endpoint)')
     parser.add_argument('--n_boot', type=int, default=10000)
+    parser.add_argument('--aggregates_only', action='store_true',
+                        help='Regenerate only the deterministic per-seed strategy aggregates '
+                             '(aggregate_results.csv) and exit before the bootstrap, figures, '
+                             'and report, leaving all other analysis outputs untouched')
+    parser.add_argument('--review_scores_only', action='store_true',
+                        help='Compute only the per-year review-score distribution trajectories '
+                             '(review_score_trajectories.csv + review_score_convergence.json) '
+                             'from checkpoints and exit, leaving all other outputs untouched')
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
     runs = discover_runs(args.multi_run_prefix, args.outputs_dir)
     valid, excluded = validate_runs(runs)
     print(f"Discovered {len(runs)} runs; {len(valid)} valid, {len(excluded)} excluded")
-    pd.DataFrame([{k: r[k] for k in ('experiment_id', 'seed', 'status', 'problems')}
-                  for r in excluded]).to_csv(
-        os.path.join(args.out_dir, 'failed_or_excluded_runs.csv'), index=False)
+    if not (args.aggregates_only or args.review_scores_only):
+        pd.DataFrame([{k: r[k] for k in ('experiment_id', 'seed', 'status', 'problems')}
+                      for r in excluded]).to_csv(
+            os.path.join(args.out_dir, 'failed_or_excluded_runs.csv'), index=False)
     if not valid:
         raise SystemExit("No valid runs found")
+
+    if args.review_scores_only:
+        review_score_trajectories(valid, args.out_dir, args.outputs_dir)
+        return
 
     agent_year = load_table(valid, 'agent_year')
     paper_age = load_table(valid, 'paper_age')
@@ -501,13 +605,15 @@ def main():
             fund.get((s, a), np.nan) for s, a in zip(researchers.seed, researchers.agent_id)]
 
     # Manipulation + balance
-    manip = manipulation_check(researchers)
-    manip.to_csv(os.path.join(args.out_dir, 'manipulation_check.csv'), index=False)
-    balance = balance_check(valid)
-    balance.to_csv(os.path.join(args.out_dir, 'balance_check.csv'), index=False)
+    if not args.aggregates_only:
+        manip = manipulation_check(researchers)
+        manip.to_csv(os.path.join(args.out_dir, 'manipulation_check.csv'), index=False)
+        balance = balance_check(valid)
+        balance.to_csv(os.path.join(args.out_dir, 'balance_check.csv'), index=False)
 
-    # Strategy aggregates per seed
-    agg = researchers.groupby(['seed', 'strategy']).agg(
+    # Strategy aggregates per seed (cumulative funding column only when the
+    # frozen H-CE endpoint was merged via --funding_horizon_year)
+    agg_cols = dict(
         n=('agent_id', 'count'),
         career_distance=('mean_career_distance', 'mean'),
         direction_distance=('mean_direction_distance', 'mean'),
@@ -516,8 +622,14 @@ def main():
         final_funding=('final_funding', 'mean'),
         log1p_citations=('log1p_citations', 'mean'),
         hit_rate=('ever_hit', 'mean'),
-    ).reset_index()
+    )
+    if 'cumulative_funding_received' in researchers:
+        agg_cols['cumulative_funding_received'] = ('cumulative_funding_received', 'mean')
+    agg = researchers.groupby(['seed', 'strategy']).agg(**agg_cols).reset_index()
     agg.to_csv(os.path.join(args.out_dir, 'aggregate_results.csv'), index=False)
+    if args.aggregates_only:
+        print(f"Wrote {os.path.join(args.out_dir, 'aggregate_results.csv')} (aggregates only)")
+        return
 
     # Primary contrasts with hierarchical bootstrap (frozen endpoints when
     # funding_horizon_year is set; legacy final_funding otherwise)

@@ -6,6 +6,12 @@ resub_prior_rejections_by_accept_year field of the two resubmission_stats.json
 files (fixed vs declining acceptance regime). A rising curve shows that getting
 a recycled paper accepted requires enduring ever more rejections.
 
+Layout: the compact right panel (~1.75 in) of the paper's two-panel
+"Resubmission cascades" figure (left panel: plot_resubmission_cascades),
+placed side by side in a wrapfigure of about half a line (one-column build)
+or a column-width float (two-column build). The panel letter lives in the
+title, so the LaTeX side needs no subfigure captions.
+
 Run:
     python -m utopia.visual.plot_resubmission_difficulty
 """
@@ -34,8 +40,8 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     nature_style()
-    # Single-column Nature width (88 mm = 3.46 in).
-    fig, ax = plt.subplots(figsize=(3.2, 2.5))
+    # Right panel of a side-by-side pair (~1.75 in of the pair's ~3.1 in).
+    fig, ax = plt.subplots(figsize=(1.75, 1.6))
     ends = {}
     for regime in REGIMES:
         rec = stats[regime]['resub_prior_rejections_by_accept_year']
@@ -44,8 +50,8 @@ def main():
                            'sem': [v['sem'] for v in rec.values()]}
                           ).sort_values('year')
         sns.lineplot(data=df, x='year', y='mean', ax=ax, color=PALETTE[regime],
-                     linewidth=1.4, marker='o', markersize=3.5,
-                     markeredgecolor='white', markeredgewidth=0.6, label=regime)
+                     linewidth=1.2, marker='o', markersize=3,
+                     markeredgecolor='white', markeredgewidth=0.5, label=regime)
         ax.fill_between(df['year'], df['mean'] - 1.96 * df['sem'],
                         df['mean'] + 1.96 * df['sem'],
                         color=PALETTE[regime], alpha=0.12, linewidth=0)
@@ -64,14 +70,15 @@ def main():
     ax.set_xticks(range(2, 11, 2))
     ax.margins(x=0.04)
     ax.set_xlabel('Acceptance year')
-    ax.set_ylabel('Prior rejections per accepted resubmission')
-    # ax.set_title('Rising cost of resubmission acceptance', pad=4)
+    ax.set_ylabel('Prior rejections per\naccepted resubmission')
+    ax.set_title('b  Acceptance price', pad=2)
     ax.grid(axis='y', linewidth=0.5, color=GRID)
     ax.set_axisbelow(True)
-    ax.legend(frameon=False, handlelength=1.2, loc='upper left',title='Acceptance Rate',
-              borderaxespad=0.2)
+    ax.legend(frameon=False, handlelength=1.0, loc='upper left',
+              title='Acceptance rate', fontsize=5.5, title_fontsize=5.5,
+              borderaxespad=0.2, labelspacing=0.3, handletextpad=0.4)
     ax.annotate('Shading: 95% CI', xy=(0.98, 0.04), xycoords='axes fraction',
-                ha='right', fontsize=5.5, color=MUTED)
+                ha='right', fontsize=5, color=MUTED)
     sns.despine(fig)
     fig.tight_layout()
 

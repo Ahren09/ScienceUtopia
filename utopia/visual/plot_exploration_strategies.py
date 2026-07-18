@@ -76,7 +76,8 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
 
-from utopia.utils.visual_utils import GRID, INK, MUTED, nature_style
+from utopia.utils.visual_utils import (
+    GRID, INK, MUTED, nature_style, STRATEGY_PALETTE, STRATEGY_NICE)
 
 DEFAULT_ANALYSIS_DIR = 'outputs/docs/explore_calibration_analysis'
 DEFAULT_RUNS_GLOB = ('outputs/docs/'
@@ -84,15 +85,12 @@ DEFAULT_RUNS_GLOB = ('outputs/docs/'
 DEFAULT_OUT_DIR = 'outputs/visual/exploration_strategies_calibration'
 DEFAULT_FUNDING_CACHE = 'data/explore_calibration_cumulative_funding.csv'
 
-# Three-strategy palette validated with the dataviz six-checks script
-# (lightness band, chroma floor, CVD separation, contrast on white all PASS).
-# Cautious explorer wears the salient blue -- it is the story's protagonist;
-# the risky explorer is red, the exploiter baseline a recessive ochre.
+# Shared three-strategy palette (single source of truth in visual_utils):
+# Hiroshige-family warm coral / soft amber / deep steel blue. The cautious
+# explorer wears the salient deep blue -- it is the story's protagonist.
 STRATEGIES = ['explorer', 'cautious_explorer', 'exploiter']
-PALETTE = {'explorer': '#d1495b', 'cautious_explorer': '#2a78d6',
-           'exploiter': '#b07d2b'}
-LABELS = {'explorer': 'Explorer', 'cautious_explorer': 'Cautious explorer',
-          'exploiter': 'Exploiter'}
+PALETTE = STRATEGY_PALETTE
+LABELS = STRATEGY_NICE
 
 def load_run_tables(runs_glob: str, table: str) -> pd.DataFrame:
     """Concat one parquet table across all completed seed runs.

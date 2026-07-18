@@ -553,6 +553,28 @@ Respond in JSON format with all applications ranked from most preferred (rank 1)
         return normalized, rejects
 
     @staticmethod
+    def allocate_slots_largest_remainder(total: int, weights: List[int]) -> List[int]:
+        """Split `total` integer slots across groups in proportion to `weights`
+        (Hamilton / largest-remainder apportionment). Deterministic: ties in the
+        fractional part go to the earlier group. Groups with weight 0 get 0.
+        sum(result) == min(total, sum(weights)) so no group exceeds its demand.
+        """
+        assert total >= 0 and all(w >= 0 for w in weights)
+        demand = sum(weights)
+        if demand == 0 or total == 0:
+            return [0] * len(weights)
+        total = min(total, demand)
+        quotas = [total * w / demand for w in weights]
+        base = [int(q) for q in quotas]
+        remainder = total - sum(base)
+        order = sorted(range(len(weights)), key=lambda i: (-(quotas[i] - base[i]), i))
+        for i in order[:remainder]:
+            base[i] += 1
+        # never exceed demand of a group
+        assert all(b <= w for b, w in zip(base, weights))
+        return base
+
+    @staticmethod
     def process_funding_evaluation_results(
             batch_results: List[Tuple[Dict, List[Dict]]],
             metadata_list: List[Dict],
@@ -560,8 +582,15 @@ Respond in JSON format with all applications ranked from most preferred (rank 1)
             novelty_penalties: Optional[Dict[str, float]] = None,
             lambda_funding: float = 0.0,
             application_log: Optional[List[Dict]] = None,
+            slot_override: Optional[Dict[str, int]] = None,
     ) -> Dict[str, List[Dict]]:
         """Process batch LLM results into winners per program (or per panel).
+
+        slot_override (--funding_budget_mode fixed): program_id -> total winner slots
+        for that program this year. When given, replaces the legacy
+        max(1, int(n * funding_rate)) rule; a program's slots are split across its
+        panels by largest remainder over panel sizes, and a program may get 0 winners.
+        None (default) reproduces the legacy rule exactly.
 
         Funding-conservatism intervention (plan 4.4/6.2): when lambda_funding > 0,
         each application's LLM rank is converted to a normalized raw score
@@ -581,6 +610,18 @@ Respond in JSON format with all applications ranked from most preferred (rank 1)
             Dict[program_id, List[Dict]] — winner lists per program (panels merged).
         """
         winners_all_programs = {}
+        # Fixed-budget mode: per-panel slot table computed up front from panel sizes
+        panel_slots = {}
+        if slot_override is not None:
+            panels_by_program = {}
+            for idx, meta in enumerate(metadata_list):
+                panels_by_program.setdefault(meta['program_id'], []).append(idx)
+            for program_id, idxs in panels_by_program.items():
+                sizes = [len(metadata_list[i]['apps']) for i in idxs]
+                shares = FundingAgency.allocate_slots_largest_remainder(
+                    int(slot_override.get(program_id, 0)), sizes)
+                for i, share in zip(idxs, shares):
+                    panel_slots[i] = share
         for idx, (result, _message_history) in enumerate(batch_results):
             program_id = metadata_list[idx]['program_id']
             apps = metadata_list[idx]['apps']
@@ -629,7 +670,10 @@ Respond in JSON format with all applications ranked from most preferred (rank 1)
                 ranked_apps_sorted = sorted(
                     ranked_apps_sorted, key=lambda x: -x['adjusted_score'])
 
-            num_winners = max(1, int(n * program.funding_rate))
+            if slot_override is not None:
+                num_winners = min(panel_slots.get(idx, 0), n)
+            else:
+                num_winners = max(1, int(n * program.funding_rate))
             winners_all_programs.setdefault(program_id, []).extend(
                 ranked_apps_sorted[:num_winners])
 

@@ -29,7 +29,7 @@ import random
 import time
 import traceback
 from collections import Counter, defaultdict
-from typing import List, Dict, Set
+from typing import List, Dict, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -105,6 +105,64 @@ def check_citation_integrity(paper_tracker, citation_tracker) -> List[str]:
     return failures
 
 
+# Default-population institution rosters (single source of truth for
+# initialize_agents() and build_influx_cohort(); the [:10]/[:20] slices below
+# select the active ecosystem: 10 rich + 20 normal of each kind, 5 researchers
+# each = 300 researchers).
+RICH_UNIVERSITIES = [
+    "MIT", "Stanford", "Berkeley", "CMU", "GeorgiaTech",
+    "Princeton", "Cornell", "UCLA", "UIUC", "UW",
+]
+NORMAL_UNIVERSITIES = [
+    # Top US Universities
+    "Harvard", "Yale", "Caltech", "UCSD", "UT Austin",
+    "UMich", "Columbia", "NYU", "USC", "Northwestern",
+    "UPenn", "Duke", "Johns Hopkins", "Brown", "Dartmouth",
+    "UChicago", "Rice", "Vanderbilt", "Notre Dame", "Emory",
+    "UNC Chapel Hill", "UVA", "UCSB", "UCI", "UC Davis",
+    "Purdue", "Penn State", "OSU", "Wisconsin", "Maryland",
+    # European Universities
+    "Oxford", "Cambridge", "Imperial College", "UCL", "Edinburgh",
+    "ETH Zurich", "EPFL", "TU Munich", "KU Leuven", "Heidelberg",
+    # Asian Universities
+    "Tsinghua", "Peking University", "NUS", "NTU", "HKUST",
+    "Tokyo", "Kyoto", "KAIST", "SNU", "IIT Bombay",
+    # Others
+    "Toronto", "UBC", "McGill", "Melbourne", "ANU"
+]
+RICH_COMPANIES = ["Google", "Meta", "Microsoft", "Amazon", "Apple",
+                  "OpenAI", "DeepMind", "Anthropic", "Waymo", "Netflix",
+                  ]
+NORMAL_COMPANIES = [
+    # Major Tech Giants
+    "IBM", "Oracle", "Salesforce", "SAP", "Cisco",
+    # AI Companies & Labs
+    "Cohere", "Stability AI",
+    "Hugging Face", "Mistral AI", "Inflection AI", "Adept AI", "Character.AI",
+    # Hardware & Semiconductors
+    "Nvidia", "Intel", "AMD", "Qualcomm", "Broadcom",
+    "TSMC", "Samsung Electronics", "SK Hynix", "Micron", "ARM",
+    # Software & Cloud
+    "Adobe", "Autodesk", "ServiceNow", "Workday", "Snowflake",
+    "Databricks", "MongoDB", "Atlassian", "VMware", "Red Hat",
+    # Research Labs & Institutes
+    "Allen Institute", "FAIR", "Google Research", "MSR", "Sony AI",
+    "NVIDIA Research", "IBM Research", "Bosch Research", "Toyota Research", "Samsung Research",
+    # Chinese Tech Companies
+    "Tencent", "Alibaba", "Baidu", "ByteDance", "Huawei",
+    "JD.com", "Xiaomi", "Meituan", "DiDi", "SenseTime",
+    # Others
+    "Tesla", "Uber", "Lyft", "Spotify", "Netflix",
+    "Shopify", "Square", "Stripe", "Airbnb", "DoorDash"
+]
+# Initial funding by institution tier — entrant funding (influx2x2) must equal
+# founder funding, so both code paths read these constants.
+RICH_UNIVERSITY_FUNDING = 160
+NORMAL_UNIVERSITY_FUNDING = 80
+RICH_COMPANY_FUNDING = 320
+NORMAL_COMPANY_FUNDING = 160
+
+
 def build_population_blueprint(num_institutions: int, researchers_per_institution: int,
                                seed: int, num_expertise: int = 3,
                                strategy_mix: List[str] = None) -> List[Dict]:
@@ -146,6 +204,60 @@ def build_population_blueprint(num_institutions: int, researchers_per_institutio
                 'expertise_topics': [AVAILABLE_DIRECTIONS[i].topic for i in expertise_indices],
             })
     return blueprint
+
+
+def build_influx_cohort(year: int, seed: int) -> List[Dict]:
+    """Deterministic yearly junior-researcher cohort for the DEFAULT population
+    (influx2x2 experiment).
+
+    Staggered exact-10% schedule: the 60 selected institutions (10 rich + 20
+    normal universities, 10 rich + 20 normal companies) are split into two
+    stratified halves by index parity WITHIN each tier group, so each half is
+    5 rich-uni + 10 normal-uni + 5 rich-co + 10 normal-co and matches the
+    ecosystem composition. H1 (even indices) hires 1 junior per institution in
+    ODD sim years (1,3,5,...); H2 (odd indices) in EVEN years -> exactly
+    +30/year = 10% of the initial 300, N(t) = 300 + 30t (linear growth).
+
+    Entrant IDs continue per-institution numbering in closed form (founders are
+    indices 0-4): researcher index = 5 + (# scheduled hire-years for that
+    institution strictly before `year`), i.e. 5,6,7,... over the run —
+    collision-free and independent of runtime population state (robust to
+    attrition culls and checkpoint resume).
+
+    Expertise: 3 draws from a dedicated random.Random seeded with
+    derive_seed(seed, 'influx', year, institution) — the GLOBAL random stream
+    is never touched, so influx-off runs stay byte-identical to legacy runs.
+
+    Pure function — unit-testable without any Simulation or LLM.
+
+    Returns:
+        List of rows: {institution, kind ('university'|'industry'),
+        funding_level, researcher_name, expertise_indices}
+    """
+    groups = [
+        ('university', RICH_UNIVERSITIES[:10], RICH_UNIVERSITY_FUNDING),
+        ('university', NORMAL_UNIVERSITIES[:20], NORMAL_UNIVERSITY_FUNDING),
+        ('industry', RICH_COMPANIES[:10], RICH_COMPANY_FUNDING),
+        ('industry', NORMAL_COMPANIES[:20], NORMAL_COMPANY_FUNDING),
+    ]
+    cohort = []
+    for kind, names, funding_level in groups:
+        for idx, institution in enumerate(names):
+            in_h1 = (idx % 2 == 0)
+            hires_now = (year % 2 == 1) if in_h1 else (year % 2 == 0)
+            if not hires_now:
+                continue
+            prior_hires = sum(1 for h in range(1, year) if ((h % 2 == 1) == in_h1))
+            rng = random.Random(derive_seed(seed, 'influx', year, institution))
+            expertise_indices = rng.sample(range(len(AVAILABLE_DIRECTIONS)), 3)
+            cohort.append({
+                'institution': institution,
+                'kind': kind,
+                'funding_level': funding_level,
+                'researcher_name': f"{institution}_researcher_{5 + prior_hires}",
+                'expertise_indices': expertise_indices,
+            })
+    return cohort
 
 
 def charge_application_costs(university_applications: List[Dict], app_cost: int,
@@ -193,6 +305,12 @@ def charge_application_costs(university_applications: List[Dict], app_cost: int,
     return events
 
 
+def argparse_namespace_placeholder():
+    """Empty namespace used when Simulation is built without CLI args (tests)."""
+    import argparse
+    return argparse.Namespace()
+
+
 class Simulation:
     """Main simulation orchestrator for the academic ecosystem"""
 
@@ -237,7 +355,28 @@ class Simulation:
                                               SIMULATION_CONFIG['preferential_attachment_experiment']['collaboration_mode'])
         self.collaboration_network_growth_mode = kwargs.get('collaboration_network_growth_mode', 'legacy')
 
-        assert self.experiment_name.startswith(('default', 'acl-acceptance-rates', 'acl_schedule_smoke')) or self.experiment_name in ['exploration_vs_exploitation', 'preferential_attachment'], f"Invalid experiment name: {self.experiment_name}"
+        assert self.experiment_name.startswith(('default', 'acl-acceptance-rates', 'acl_schedule_smoke', 'influx', 'scale')) or self.experiment_name in ['exploration_vs_exploitation', 'preferential_attachment'], f"Invalid experiment name: {self.experiment_name}"
+
+        # ---- Scale-expansion design factors (all default = legacy behaviour) ----
+        _a = args if args is not None else argparse_namespace_placeholder()
+        self.papers_per_project = int(getattr(_a, 'papers_per_project', 1) or 1)
+        self.funding_budget_mode = getattr(_a, 'funding_budget_mode', 'track') or 'track'
+        self.funding_budget_slots_frac = getattr(_a, 'funding_budget_slots_frac', None)
+        self.reviewer_capacity = getattr(_a, 'reviewer_capacity', None)
+        self.reviews_per_paper = int(getattr(_a, 'reviews_per_paper', 3) or 3)
+        self.reviewer_matching = getattr(_a, 'reviewer_matching', 'random') or 'random'
+        self.review_policy = getattr(_a, 'review_policy', 'persona') or 'persona'
+        self.review_score_mode = getattr(_a, 'review_score_mode', 'int') or 'int'
+        self.acceptance_tiebreak = getattr(_a, 'acceptance_tiebreak', 'stable') or 'stable'
+        self.acceptance_mode = getattr(_a, 'acceptance_mode', 'rate') or 'rate'
+        # Capacity-aware reviewer assignment replaces the legacy random.sample only when
+        # one of these deviates from its legacy value (keeps the global RNG stream intact).
+        self._capacity_mode_on = (self.reviewer_capacity is not None
+                                  or self.reviews_per_paper != 3
+                                  or self.reviewer_matching != 'random')
+        # N0: initial university / industry populations, anchors for --funding_budget_mode fixed
+        self.initial_university_count = None
+        self.initial_industry_count = None
 
         # Store args for backward compatibility with existing code
         if args is None:
@@ -304,30 +443,9 @@ class Simulation:
         if getattr(self.args, 'population_mode', 'default') == 'university_only':
             return self._initialize_university_only_population()
 
-        rich_universities = [
-            "MIT", "Stanford", "Berkeley", "CMU", "GeorgiaTech",
-            "Princeton", "Cornell", "UCLA", "UIUC", "UW",
-        ]
-
-        # Create multiple university researchers mapped to same universities
-        normal_universities = [
-            # Top US Universities
-
-            "Harvard", "Yale", "Caltech", "UCSD", "UT Austin",
-            "UMich", "Columbia", "NYU", "USC", "Northwestern",
-            "UPenn", "Duke", "Johns Hopkins", "Brown", "Dartmouth",
-            "UChicago", "Rice", "Vanderbilt", "Notre Dame", "Emory",
-            "UNC Chapel Hill", "UVA", "UCSB", "UCI", "UC Davis",
-            "Purdue", "Penn State", "OSU", "Wisconsin", "Maryland",
-            # European Universities
-            "Oxford", "Cambridge", "Imperial College", "UCL", "Edinburgh",
-            "ETH Zurich", "EPFL", "TU Munich", "KU Leuven", "Heidelberg",
-            # Asian Universities
-            "Tsinghua", "Peking University", "NUS", "NTU", "HKUST",
-            "Tokyo", "Kyoto", "KAIST", "SNU", "IIT Bombay",
-            # Others
-            "Toronto", "UBC", "McGill", "Melbourne", "ANU"
-        ]
+        # Rosters hoisted to module constants (shared with build_influx_cohort)
+        rich_universities = RICH_UNIVERSITIES
+        normal_universities = NORMAL_UNIVERSITIES
         if self.debug:
             universities = rich_universities[:3] + normal_universities[:3]
             num_researchers = 5
@@ -352,7 +470,8 @@ class Simulation:
                 # researcher_name = f"university_researcher_{counter}"
                 researcher_name = f"{university}_researcher_{i}"
 
-                funding_level = 160 if university in rich_universities else 80
+                funding_level = (RICH_UNIVERSITY_FUNDING if university in rich_universities
+                                 else NORMAL_UNIVERSITY_FUNDING)
 
                 # Assign exploration strategy if experiment is enabled
                 if self.is_exploration_experiment:
@@ -388,33 +507,8 @@ class Simulation:
                 if self.verbose:
                     logger.debug(f"Added {len(researcher.conflict_of_interest)} CoI for {researcher_name}")
 
-        rich_companies = ["Google", "Meta", "Microsoft", "Amazon", "Apple",
-                          "OpenAI", "DeepMind", "Anthropic", "Waymo", "Netflix",
-                          ]
-        # Create multiple industry researchers mapped to same companies
-        normal_companies = [
-            # Major Tech Giants
-
-            "IBM", "Oracle", "Salesforce", "SAP", "Cisco",
-            # AI Companies & Labs
-            "Cohere", "Stability AI",
-            "Hugging Face", "Mistral AI", "Inflection AI", "Adept AI", "Character.AI",
-            # Hardware & Semiconductors
-            "Nvidia", "Intel", "AMD", "Qualcomm", "Broadcom",
-            "TSMC", "Samsung Electronics", "SK Hynix", "Micron", "ARM",
-            # Software & Cloud
-            "Adobe", "Autodesk", "ServiceNow", "Workday", "Snowflake",
-            "Databricks", "MongoDB", "Atlassian", "VMware", "Red Hat",
-            # Research Labs & Institutes
-            "Allen Institute", "FAIR", "Google Research", "MSR", "Sony AI",
-            "NVIDIA Research", "IBM Research", "Bosch Research", "Toyota Research", "Samsung Research",
-            # Chinese Tech Companies
-            "Tencent", "Alibaba", "Baidu", "ByteDance", "Huawei",
-            "JD.com", "Xiaomi", "Meituan", "DiDi", "SenseTime",
-            # Others
-            "Tesla", "Uber", "Lyft", "Spotify", "Netflix",
-            "Shopify", "Square", "Stripe", "Airbnb", "DoorDash"
-        ]
+        rich_companies = RICH_COMPANIES
+        normal_companies = NORMAL_COMPANIES
 
         if self.debug:
             companies = rich_companies[:3] + normal_companies[:3]
@@ -430,7 +524,8 @@ class Simulation:
             # Create 2-3 researchers per company
             researcher_names = []
 
-            funding_level = 320 if company in rich_companies else 160
+            funding_level = (RICH_COMPANY_FUNDING if company in rich_companies
+                             else NORMAL_COMPANY_FUNDING)
 
             for i in range(num_researchers):
                 if self.is_exploration_experiment:
@@ -487,9 +582,36 @@ class Simulation:
             logger.info(f"Added {freelancer.id}")
         """
 
+        self._record_initial_university_count()
         self._add_funding_agencies()
 
         logger.info(f"Total agents initialized: {len(self.ecosystem.agent_population)}")
+
+    def _record_initial_university_count(self):
+        """N0 per sector at initialization: anchors for --funding_budget_mode fixed
+        (agency slots = round(f x N0_university); industry pool = round(f x N0_industry) x base budget)."""
+        self.initial_university_count = sum(
+            1 for a in self.ecosystem.agent_population.values() if isinstance(a, UniversityResearcher))
+        self.initial_industry_count = sum(
+            1 for a in self.ecosystem.agent_population.values() if isinstance(a, IndustryResearcher))
+
+    def _fixed_industry_pool_per_unit(self, denominator: int) -> Tuple[int, Dict]:
+        """--funding_budget_mode fixed for the industry sector (symmetric with the agency slots).
+
+        Annual industry pool = round(f x N0_industry) x industry_base_budget, paid out per
+        accepted-paper maturity unit: per_unit = max(pool // denominator, 1) where denominator
+        is this year's total maturity of accepted industry papers (the legacy rule pays
+        base_budget per unit, so the pool then grows with output). Returns (per_unit, info).
+        """
+        assert self.initial_industry_count is not None, "N0_industry unknown: population not initialized"
+        base = SIMULATION_CONFIG['funding']['industry_base_budget']
+        pool = int(round(self.funding_budget_slots_frac * self.initial_industry_count)) * base
+        per_unit = max(pool // denominator, 1) if denominator > 0 else 0
+        info = {'mode': 'fixed', 'slots_frac': self.funding_budget_slots_frac,
+                'initial_industry_count': self.initial_industry_count, 'pool': pool,
+                'maturity_units_accepted': int(denominator), 'per_unit': per_unit,
+                'paid': int(per_unit * denominator)}
+        return per_unit, info
 
     def _add_funding_agencies(self):
         """Add the funding agencies shared by all population modes.
@@ -556,6 +678,7 @@ class Simulation:
                     f"{num_institutions} institutions (equal funding {initial_funding}); "
                     f"blueprint saved to {blueprint_path}")
 
+        self._record_initial_university_count()
         self._add_funding_agencies()
 
         logger.info(f"Total agents initialized: {len(self.ecosystem.agent_population)}")
@@ -1542,6 +1665,12 @@ class Simulation:
         if self.experiment_name != 'preferential_attachment' or not self.collaboration_tracker:
             return None
 
+        # network_review_bias source runs: keep source reviews blind (no author
+        # identity or network relationship in review prompts) while collaboration
+        # tracking stays on. Default (env unset) is byte-identical to before.
+        if os.environ.get('UTOPIA_PA_BLIND_REVIEW') == '1':
+            return None
+
         lead_id = self._get_lead_author_id(paper)
         author = self.ecosystem.get_agent_by_id(lead_id)
         institution = getattr(author, 'university_name', None) or getattr(author, 'company_name', None) or 'Unknown'
@@ -1568,8 +1697,69 @@ class Simulation:
                         f"Pearson r={all_metrics['pearson_r']:.3f} (p={all_metrics['pearson_p']:.4f}), "
                         f"Spearman r={all_metrics['spearman_r']:.3f}")
 
+    def _apply_annual_influx(self, year: int) -> List[str]:
+        """Influx2x2: inject this year's junior cohort at the top of _setup_year.
+
+        OFF (annual_influx_rate <= 0, the default): returns [] immediately —
+        no RNG use, no side effects, byte-identical to the pre-influx code path.
+        ON: constructs entrants via the stock researcher constructors
+        (reputation defaults 5/6, zero publications via empty papers_by_author,
+        no collaboration edges), wires conflict-of-interest bidirectionally with
+        ALL current same-institution members (active or culled — culled agents
+        still review), and adds them to the ecosystem. Idempotent under
+        checkpoint resume: an id already in agent_population is skipped.
+        """
+        rate = getattr(self.args, 'annual_influx_rate', 0.0) or 0.0
+        if rate <= 0:
+            return []
+        assert abs(rate - 0.1) < 1e-12, \
+            "only the staggered 10%/yr influx schedule is implemented"
+        assert getattr(self.args, 'population_mode', 'default') == 'default' and not self.debug, \
+            "annual influx is defined only for the non-debug default population"
+
+        entrant_ids = []
+        for spec in build_influx_cohort(year, getattr(self.args, 'seed', 42)):
+            name = spec['researcher_name']
+            if name in self.ecosystem.agent_population:  # resume idempotence guard
+                continue
+            expertise = [AVAILABLE_DIRECTIONS[i] for i in spec['expertise_indices']]
+            if spec['kind'] == 'university':
+                agent = UniversityResearcher(
+                    researcher_name=name,
+                    university_name=spec['institution'],
+                    funding_level=spec['funding_level'],
+                    expertise=expertise,
+                    llm=self.llm,
+                    generate_research_proposal=True,
+                    exploration_strategy="balanced",
+                )
+            else:
+                agent = IndustryResearcher(
+                    researcher_name=name,
+                    company_name=spec['institution'],
+                    funding_level=spec['funding_level'],
+                    expertise=expertise,
+                    llm=self.llm,
+                    funding_mode=self.industry_funding_mode,
+                    exploration_strategy="balanced",
+                )
+            peers = [a for a in self.ecosystem.agent_population.values()
+                     if getattr(a, 'university_name', None) == spec['institution']
+                     or getattr(a, 'company_name', None) == spec['institution']]
+            agent.add_conflict_of_interest({p.id for p in peers})
+            for p in peers:
+                p.add_conflict_of_interest(agent.id)
+            self.ecosystem.add_agent(agent)
+            entrant_ids.append(name)
+            logger.info(f"Added {agent.id} from {spec['institution']} (influx junior, year {year})")
+
+        logger.info(f"[Influx] Year {year}: +{len(entrant_ids)} junior researchers "
+                    f"(population={len(self.ecosystem.agent_population)})")
+        return entrant_ids
+
     def _setup_year(self, year: int) -> Dict:
-        """Setup year: log start, reset funding tracker, reset conferences
+        """Setup year: (influx2x2) inject junior cohort, log start, reset funding
+        tracker, reset conferences
 
         Args:
             year: Current year number
@@ -1577,9 +1767,13 @@ class Simulation:
         Returns:
             year_results: Dict initialized with year number
         """
-        
+
         logger.info(f"*** YEAR {year} ***")
-        
+
+        # Influx2x2: entrants join BEFORE funding_tracker.start_cycle so their
+        # resources count in the year's opening total and they participate in
+        # every phase of their entry year (no-op when the flag is off).
+        influx_entrants = self._apply_annual_influx(year)
 
         # Reset all fundings to 0 at start of cycle
         total_funding = self.funding_tracker.start_cycle(year, self.ecosystem.agent_population)
@@ -1589,7 +1783,10 @@ class Simulation:
         self.conference_system.reset_all_for_new_year(year)
 
         # Initialize year results dict
-        return {'year': year}
+        year_results = {'year': year}
+        if influx_entrants:
+            year_results['influx_entrants'] = influx_entrants
+        return year_results
 
     def _run_phase_0_resubmissions(self, year: int, year_results: Dict) -> List[Dict]:
         """Phase 0: Process resubmissions from previous year (year 2+)
@@ -1603,6 +1800,12 @@ class Simulation:
         """
         resubmissions_list = []
         resubmissions_paper_ids = set()
+
+        # Influx2x2: --disable_resubmission skips Phase 0 entirely (rejected
+        # papers are never resubmitted). Zero LLM calls, zero RNG use.
+        if getattr(self.args, 'disable_resubmission', False):
+            logger.info(f"Year {year} Phase 0: resubmissions disabled (--disable_resubmission); skipping")
+            return resubmissions_list
 
         if year <= 1:
             return resubmissions_list
@@ -2040,7 +2243,8 @@ class Simulation:
                     year=year,
                     direction=directions[agent.id],
                     conferences=self.conference_system.conferences,
-                    paper_tracker=self.paper_tracker
+                    paper_tracker=self.paper_tracker,
+                    max_submissions=self.papers_per_project,
                 )
 
                 batch_prompts.append(prompt)
@@ -2048,6 +2252,7 @@ class Simulation:
                     'agent': agent,
                     'agent_idx': agent_idx,
                     'candidate_papers': candidate_papers,
+                    'n_needed': self.papers_per_project,
                 })
                 if paper_submission_response_format is None:
                     paper_submission_response_format = response_format
@@ -2065,10 +2270,15 @@ class Simulation:
                 agents_needing_fallback = []
 
                 # Step 3: Process results
+                # k = papers_per_project. k == 1 is the legacy single-dict response; k > 1
+                # returns {"submissions": [...]} and each entry is processed with the
+                # SAME validation/fallback rules as the legacy single entry.
+                k_total = self.papers_per_project
                 for i, (submission_metadata, message_history) in enumerate(batch_results):
                     meta = batch_metadata[i]
                     agent = meta['agent']
                     candidate_papers = meta['candidate_papers']
+                    n_needed = meta.get('n_needed', k_total)
 
                     # Handle failed JSON parse from batch
                     if submission_metadata is None:
@@ -2077,76 +2287,105 @@ class Simulation:
                             'agent': agent,
                             'candidate_papers': candidate_papers,
                             'conference': None,
-                            'message_history': message_history
+                            'message_history': message_history,
+                            'n_needed': n_needed,
                         })
                         continue
 
-                    # Validate response
-                    try:
-                        arxiv_id = submission_metadata['arxiv_id']
-                        assert "reason" in submission_metadata, f"Reason is not in the submission metadata: {submission_metadata}"
-                        assert arxiv_id in [p.metadata['id'] for p in candidate_papers] or arxiv_id == "DO_NOT_SUBMIT"
-                        assert submission_metadata['conference'] in self.conference_system.conference_map or \
-                               submission_metadata['conference'] == "DO_NOT_SUBMIT", f"Generated invalid conference name: {submission_metadata['conference']}"
-                    except (KeyError, AssertionError) as e:
-                        traceback.print_exc()
-                        logger.warning(f"Invalid submission from {agent.id}: {e}")
-                        agents_needing_fallback.append({
-                            'agent': agent,
-                            'candidate_papers': candidate_papers,
-                            'conference': None,
-                            'message_history': message_history
-                        })
-                        continue
+                    if k_total == 1:
+                        entries = [submission_metadata]
+                    else:
+                        entries = (submission_metadata.get('submissions')
+                                   if isinstance(submission_metadata, dict) else None)
+                        if not isinstance(entries, list):
+                            logger.warning(f"Invalid submission list from {agent.id}, adding to fallback")
+                            agents_needing_fallback.append({
+                                'agent': agent, 'candidate_papers': candidate_papers,
+                                'conference': None, 'message_history': message_history,
+                                'n_needed': n_needed,
+                            })
+                            continue
+                        entries = entries[:n_needed]
+                        if not entries:
+                            logger.info(f"Agent {agent.id} did not submit any paper due to funding issues")
+                            continue
 
-                    if arxiv_id == "DO_NOT_SUBMIT":
-                        logger.info(f"Agent {agent.id} did not submit any paper due to funding issues")
-                        continue
+                    n_submitted = 0
+                    seen_ids = set()
+                    needs_fallback = False
+                    fallback_conference = None
+                    for submission_metadata in entries:
+                        # Validate response
+                        try:
+                            arxiv_id = submission_metadata['arxiv_id']
+                            assert "reason" in submission_metadata, f"Reason is not in the submission metadata: {submission_metadata}"
+                            assert arxiv_id in [p.metadata['id'] for p in candidate_papers] or arxiv_id == "DO_NOT_SUBMIT"
+                            assert submission_metadata['conference'] in self.conference_system.conference_map or \
+                                   submission_metadata['conference'] == "DO_NOT_SUBMIT", f"Generated invalid conference name: {submission_metadata['conference']}"
+                            assert arxiv_id not in seen_ids, f"Duplicate arxiv_id in one response: {arxiv_id}"
+                        except (KeyError, AssertionError) as e:
+                            traceback.print_exc()
+                            logger.warning(f"Invalid submission from {agent.id}: {e}")
+                            needs_fallback = True
+                            fallback_conference = None
+                            break
 
-                    # Skip if paper was already submitted by another agent in this batch
-                    if arxiv_id in self.paper_tracker.papers_by_id:
-                        logger.warning(f"Paper {arxiv_id} already taken, {agent.id} needs fallback selection")
-                        agents_needing_fallback.append({
-                            'agent': agent,
-                            'candidate_papers': candidate_papers,
+                        if arxiv_id == "DO_NOT_SUBMIT":
+                            logger.info(f"Agent {agent.id} did not submit any paper due to funding issues")
+                            break
+                        seen_ids.add(arxiv_id)
+
+                        # Skip if paper was already submitted by another agent in this batch
+                        if arxiv_id in self.paper_tracker.papers_by_id:
+                            logger.warning(f"Paper {arxiv_id} already taken, {agent.id} needs fallback selection")
+                            needs_fallback = True
+                            fallback_conference = submission_metadata['conference']
+                            break
+
+                        logger.info(
+                            f"{agent.id} - {submission_metadata['conference']} - submitted \'{self.rag.id2docs[arxiv_id].metadata['title']}\'")
+
+                        # Process successful submission
+                        paper_doc = self.rag.id2docs[arxiv_id]
+
+                        assert agent.project_start_year <= year, f"Agent {agent.id} MUST started the project before the current year: {agent.project_start_year} <= {year}"
+                        assert agent.project_end_year == year, f"Agent {agent.id} MUST completed the project in the current year"
+
+                        paper_dict = {
+                            'id': arxiv_id,
+                            'author_id': agent.id,
+                            'author_type': agent.get_type(),
+                            'title': paper_doc.metadata['title'],
+                            'abstract': paper_doc.page_content,
+                            'tags': paper_doc.metadata['tags'],
+                            'topics': paper_doc.metadata['topics'],
                             'conference': submission_metadata['conference'],
-                            'message_history': message_history
+                            'type': 'submission',
+                            'year': year,
+                            'project_start_year': agent.project_start_year,
+                            'project_end_year': agent.project_end_year,
+                            'maturity': directions[agent.id]['direction'].years,
+                            'status': 'pending'
+                        }
+                        self._apply_coauthorship(paper_dict, agent, year)
+
+                        message_history_dict[agent.id] = message_history
+
+                        submissions_list.append(paper_dict)
+                        self.paper_tracker.add_or_update_paper(paper_dict)
+                        self._record_paper_metadata(paper_dict, agent.id, year)
+                        self.rag.document_status.loc[self.rag.document_status['id'] == arxiv_id, 'status'] = 'submitted'
+                        n_submitted += 1
+
+                    remaining = n_needed - n_submitted
+                    if needs_fallback and remaining > 0:
+                        agents_needing_fallback.append({
+                            'agent': agent,
+                            'candidate_papers': candidate_papers,
+                            'conference': fallback_conference,
+                            'message_history': message_history,
+                            'n_needed': remaining,
                         })
-                        continue
-
-                    logger.info(
-                        f"{agent.id} - {submission_metadata['conference']} - submitted \'{self.rag.id2docs[arxiv_id].metadata['title']}\'")
-
-                    # Process successful submission
-                    paper_doc = self.rag.id2docs[arxiv_id]
-
-                    assert agent.project_start_year <= year, f"Agent {agent.id} MUST started the project before the current year: {agent.project_start_year} <= {year}"
-                    assert agent.project_end_year == year, f"Agent {agent.id} MUST completed the project in the current year"
-
-                    paper_dict = {
-                        'id': arxiv_id,
-                        'author_id': agent.id,
-                        'author_type': agent.get_type(),
-                        'title': paper_doc.metadata['title'],
-                        'abstract': paper_doc.page_content,
-                        'tags': paper_doc.metadata['tags'],
-                        'topics': paper_doc.metadata['topics'],
-                        'conference': submission_metadata['conference'],
-                        'type': 'submission',
-                        'year': year,
-                        'project_start_year': agent.project_start_year,
-                        'project_end_year': agent.project_end_year,
-                        'maturity': directions[agent.id]['direction'].years,
-                        'status': 'pending'
-                    }
-                    self._apply_coauthorship(paper_dict, agent, year)
-
-                    message_history_dict[agent.id] = message_history
-
-                    submissions_list.append(paper_dict)
-                    self.paper_tracker.add_or_update_paper(paper_dict)
-                    self._record_paper_metadata(paper_dict, agent.id, year)
-                    self.rag.document_status.loc[self.rag.document_status['id'] == arxiv_id, 'status'] = 'submitted'
 
                 # Rebuild batch_prompts/batch_metadata from fallback agents for next attempt
                 if not agents_needing_fallback:
@@ -2163,18 +2402,22 @@ class Simulation:
                     if not available_papers:
                         continue
 
+                    n_needed = fallback_info.get('n_needed', 1)
                     prompt, _ = agent.get_paper_submission_prompt(
                         candidate_papers=available_papers,
                         year=year,
                         direction=directions[agent.id],
                         conferences=self.conference_system.conferences,
-                        paper_tracker=self.paper_tracker
+                        paper_tracker=self.paper_tracker,
+                        max_submissions=n_needed,
+                        force_list=self.papers_per_project > 1,
                     )
 
                     batch_prompts.append(prompt)
                     batch_metadata.append({
                         'agent': agent,
                         'candidate_papers': available_papers,
+                        'n_needed': n_needed,
                     })
 
             # Step 4: Final random assignment for agents still remaining after all retries
@@ -2190,43 +2433,54 @@ class Simulation:
                         logger.warning(f"{agent.id} final fallback failed - no available papers remaining")
                         continue
 
-                    selected_paper = random.choice(available_papers)
-                    arxiv_id = selected_paper.metadata['id']
+                    # Legacy draw order preserved: paper first, then conference. For k > 1
+                    # the remaining papers are drawn one by one from the shrinking pool and
+                    # all go to the same (hinted or random) conference.
+                    n_needed = fallback_info.get('n_needed', 1)
+                    pool = list(available_papers)
+                    chosen_papers = []
+                    for _ in range(min(n_needed, len(pool))):
+                        selected_paper = random.choice(pool)
+                        pool.remove(selected_paper)
+                        chosen_papers.append(selected_paper)
                     conference = fallback_info['conference'] or random.choice(list(self.conference_system.conference_map.keys()))
 
-                    logger.info(f"{agent.id} random fallback - {conference} - submitted '{selected_paper.metadata['title']}'")
+                    for selected_paper in chosen_papers:
+                        arxiv_id = selected_paper.metadata['id']
+                        logger.info(f"{agent.id} random fallback - {conference} - submitted '{selected_paper.metadata['title']}'")
 
-                    paper_doc = self.rag.id2docs[arxiv_id]
+                        paper_doc = self.rag.id2docs[arxiv_id]
 
-                    assert agent.project_start_year <= year, f"Agent {agent.id} MUST started the project before the current year: {agent.project_start_year} <= {year}"
-                    assert agent.project_end_year == year, f"Agent {agent.id} MUST completed the project in the current year"
+                        assert agent.project_start_year <= year, f"Agent {agent.id} MUST started the project before the current year: {agent.project_start_year} <= {year}"
+                        assert agent.project_end_year == year, f"Agent {agent.id} MUST completed the project in the current year"
 
-                    paper_dict = {
-                        'id': arxiv_id,
-                        'author_id': agent.id,
-                        'author_type': agent.get_type(),
-                        'title': paper_doc.metadata['title'],
-                        'abstract': paper_doc.page_content,
-                        'tags': paper_doc.metadata['tags'],
-                        'topics': paper_doc.metadata['topics'],
-                        'conference': conference,
-                        'type': 'submission',
-                        'year': year,
-                        'project_start_year': agent.project_start_year,
-                        'project_end_year': agent.project_end_year,
-                        'maturity': directions[agent.id]['direction'].years,
-                        'status': 'pending'
-                    }
-                    self._apply_coauthorship(paper_dict, agent, year)
+                        paper_dict = {
+                            'id': arxiv_id,
+                            'author_id': agent.id,
+                            'author_type': agent.get_type(),
+                            'title': paper_doc.metadata['title'],
+                            'abstract': paper_doc.page_content,
+                            'tags': paper_doc.metadata['tags'],
+                            'topics': paper_doc.metadata['topics'],
+                            'conference': conference,
+                            'type': 'submission',
+                            'year': year,
+                            'project_start_year': agent.project_start_year,
+                            'project_end_year': agent.project_end_year,
+                            'maturity': directions[agent.id]['direction'].years,
+                            'status': 'pending'
+                        }
+                        self._apply_coauthorship(paper_dict, agent, year)
 
-                    message_history_dict[agent.id] = fallback_info['message_history']
-                    submissions_list.append(paper_dict)
-                    self.paper_tracker.add_or_update_paper(paper_dict)
-                    self._record_paper_metadata(paper_dict, agent.id, year)
-                    self.rag.document_status.loc[self.rag.document_status['id'] == arxiv_id, 'status'] = 'submitted'
+                        message_history_dict[agent.id] = fallback_info['message_history']
+                        submissions_list.append(paper_dict)
+                        self.paper_tracker.add_or_update_paper(paper_dict)
+                        self._record_paper_metadata(paper_dict, agent.id, year)
+                        self.rag.document_status.loc[self.rag.document_status['id'] == arxiv_id, 'status'] = 'submitted'
 
         else:
             # ==================== [START] SEQUENTIAL PATH (GPT/Gemini) ====================
+            assert self.papers_per_project == 1, "papers_per_project>1 requires the batched path"
             for agent_idx, agent in enumerate(tqdm(active_authors, desc="Submission (active researchers)")):
 
                 if agent.project_end_year > year:
@@ -2783,25 +3037,33 @@ class Simulation:
             batch_prompts = []
             batch_metadata = []  # Store (reviewer, paper, conference) per prompt
             peer_review_response_format = None
+            # Capacity-aware assignment (factor K) is computed up front from a dedicated
+            # RNG; the legacy path below is untouched when the flags are off.
+            capacity_assignment = (self._assign_reviewers_with_capacity(year, year_results)
+                                   if self._capacity_mode_on else None)
             for conference in self.conference_system.conferences:
                 for paper in conference.submitted_papers:
-                    # Assign reviewers (excluding all paper authors + their COIs)
-                    author_ids = self._get_all_author_ids(paper)
-                    all_coi = set(author_ids)
-                    for aid in author_ids:
-                        author = self.ecosystem.get_agent_by_id(aid)
-                        all_coi.update(author.conflict_of_interest)
-                    reviewers = self.ecosystem.get_available_reviewers(
-                        exclude_agent_ids=list(all_coi)
-                    )
+                    if capacity_assignment is not None:
+                        selected_reviewers = capacity_assignment[paper['id']]
+                    else:
+                        # Assign reviewers (excluding all paper authors + their COIs)
+                        author_ids = self._get_all_author_ids(paper)
+                        all_coi = set(author_ids)
+                        for aid in author_ids:
+                            author = self.ecosystem.get_agent_by_id(aid)
+                            all_coi.update(author.conflict_of_interest)
+                        reviewers = self.ecosystem.get_available_reviewers(
+                            exclude_agent_ids=list(all_coi)
+                        )
 
-                    # Select 3 random reviewers
-                    selected_reviewers = random.sample(reviewers, min(3, len(reviewers)))
+                        # Select 3 random reviewers
+                        selected_reviewers = random.sample(reviewers, min(3, len(reviewers)))
 
                     for reviewer in selected_reviewers:
                         # reviewer: SimulationAgent
                         author_info = self._build_author_info_for_review(reviewer, paper)
-                        prompt, response_format = reviewer.get_review_prompt(paper, author_info=author_info)
+                        prompt, response_format = reviewer.get_review_prompt(
+                            paper, author_info=author_info, review_policy=self.review_policy)
 
                         if peer_review_response_format is None:
                             peer_review_response_format = response_format
@@ -2834,7 +3096,7 @@ class Simulation:
                     # Validate response
                     try:
                         assert all(field in review_json for field in ['overall_score', "justification"])
-                        review_json['overall_score'] = int(review_json['overall_score'])
+                        review_json['overall_score'] = self._cast_review_score(review_json['overall_score'])
                         review = {
                             'overall_score': review_json['overall_score'],
                             'justification': review_json['justification'],
@@ -2878,6 +3140,8 @@ class Simulation:
 
         else:
             # ==================== SEQUENTIAL PATH (OpenAI API) ====================
+            assert not self._capacity_mode_on and self.review_policy == 'persona', \
+                "reviewer capacity/matching and standardized review require the batched path"
             for conference in tqdm(self.conference_system.conferences, desc="Peer reviews"):
                 for paper in tqdm(conference.submitted_papers, desc=f"{conference.conference_id}"):
                     # Assign reviewers (excluding all paper authors + their COIs)
@@ -2963,6 +3227,129 @@ class Simulation:
 
         return average_scores
 
+    def _cast_review_score(self, value):
+        """--review_score_mode: 'int' (legacy truncation) or 'float' (keep decimals)."""
+        return float(value) if self.review_score_mode == 'float' else int(value)
+
+    def _assign_reviewers_with_capacity(self, year: int, year_results: Dict) -> Dict[str, List]:
+        """Capacity-aware reviewer assignment (scale experiment factor K).
+
+        reviews per paper r = min(reviews_per_paper, floor(c * N_reviewers / N_submissions))
+        with a hard floor of 1 when a per-reviewer annual cap c is set (r = reviews_per_paper
+        when c is None). Papers are visited in a seeded random order; each takes up to r
+        eligible reviewers (no author, no conflict of interest, remaining capacity). With
+        --reviewer_matching topic, reviewers whose expertise category overlaps the paper's
+        arXiv tags are drawn first. Fails fast (RuntimeError) if any paper would receive
+        zero reviews, so the preregistered capacity range must guarantee >= 1 review.
+
+        Uses a dedicated random.Random so the global RNG stream is never consumed.
+        Returns paper_id -> [reviewer agents]; assignment stats go to year_results.
+        """
+        papers = [paper for conf in self.conference_system.conferences for paper in conf.submitted_papers]
+        reviewers_all = self.ecosystem.get_available_reviewers()
+        n_sub, n_rev = len(papers), len(reviewers_all)
+        c = self.reviewer_capacity
+        r_target = self.reviews_per_paper
+        if n_sub == 0:
+            year_results['review_assignment'] = {'n_submissions': 0, 'n_reviewers': n_rev}
+            return {}
+        if c is not None:
+            if c * n_rev < n_sub:
+                raise RuntimeError(
+                    f"Year {year}: reviewer capacity {c} x {n_rev} reviewers < {n_sub} submissions; "
+                    f"cannot give every paper one review (outside the preregistered range)")
+            r = max(1, min(r_target, (c * n_rev) // n_sub))
+        else:
+            r = r_target
+
+        rng = random.Random(derive_seed(getattr(self.args, 'seed', 42), 'phase3_assign', year))
+        order = list(range(n_sub))
+        rng.shuffle(order)
+
+        # Topic matching via coarse categories: reviewer expertise topic -> category
+        # (TOPIC_TO_CATEGORY_MAPPING); paper arXiv tag -> categories of conferences that
+        # list the tag (derived from the conference roster).
+        tag_to_categories = None
+        reviewer_categories = {}
+        if self.reviewer_matching == 'topic':
+            from utopia.agents.conference import CONFERENCES, TOPIC_TO_CATEGORY_MAPPING
+            tag_to_categories = defaultdict(set)
+            for conf in CONFERENCES.values():
+                for tag in conf.topics:
+                    tag_to_categories[tag.lower()].add(conf.category)
+            for a in reviewers_all:
+                reviewer_categories[a.id] = {
+                    TOPIC_TO_CATEGORY_MAPPING.get(d.topic, 'Interdisciplinary')
+                    for d in getattr(a, 'expertise', [])}
+
+        load = defaultdict(int)
+        assignment = {}
+        for idx in order:
+            paper = papers[idx]
+            author_ids = self._get_all_author_ids(paper)
+            all_coi = set(author_ids)
+            for aid in author_ids:
+                author = self.ecosystem.get_agent_by_id(aid)
+                if author is not None:
+                    all_coi.update(author.conflict_of_interest)
+            eligible = [a for a in reviewers_all
+                        if a.id not in all_coi and (c is None or load[a.id] < c)]
+            if tag_to_categories is not None:
+                paper_cats = set()
+                for tag in paper.get('tags', []):
+                    paper_cats |= tag_to_categories.get(str(tag).lower(), set())
+                matched = [a for a in eligible if reviewer_categories.get(a.id, set()) & paper_cats]
+                unmatched = [a for a in eligible if a not in matched]
+                chosen = rng.sample(matched, min(r, len(matched)))
+                if len(chosen) < r and unmatched:
+                    chosen += rng.sample(unmatched, min(r - len(chosen), len(unmatched)))
+            else:
+                chosen = rng.sample(eligible, min(r, len(eligible)))
+            if not chosen:
+                raise RuntimeError(f"Year {year}: paper {paper['id']} has no eligible reviewer "
+                                   f"with remaining capacity (c={c}, n_rev={n_rev}, n_sub={n_sub})")
+            for a in chosen:
+                load[a.id] += 1
+            assignment[paper['id']] = chosen
+
+        loads = [load[a.id] for a in reviewers_all]
+        year_results['review_assignment'] = {
+            'n_submissions': n_sub, 'n_reviewers': n_rev, 'reviewer_capacity': c,
+            'reviews_per_paper_target': r, 'reviewer_matching': self.reviewer_matching,
+            'reviews_assigned': int(sum(loads)), 'max_load': int(max(loads)),
+            'mean_load': float(np.mean(loads)),
+            'papers_below_target': int(sum(1 for v in assignment.values() if len(v) < r)),
+        }
+        logger.info(f"Year {year} reviewer assignment: {n_sub} papers, {n_rev} reviewers, "
+                    f"r={r}, cap={c}, max load {max(loads)}")
+        return assignment
+
+    def _fixed_budget_slots(self, eval_metadata: List[Dict]) -> Tuple[Dict[str, int], Dict]:
+        """--funding_budget_mode fixed: annual agency slots anchored to N0.
+
+        total_slots = round(f * N0); split across programs by largest remainder over this
+        year's application counts (so relative program sizes are preserved and the budget,
+        not the application count, bounds the number of winners).
+        """
+        assert self.initial_university_count, "N0 unknown: population not initialized"
+        apps_by_program = {}
+        for meta in eval_metadata:
+            apps_by_program[meta['program_id']] = apps_by_program.get(meta['program_id'], 0) + len(meta['apps'])
+        program_ids = list(apps_by_program.keys())
+        total_slots = int(round(self.funding_budget_slots_frac * self.initial_university_count))
+        shares = FundingAgency.allocate_slots_largest_remainder(
+            total_slots, [apps_by_program[p] for p in program_ids])
+        slot_override = dict(zip(program_ids, shares))
+        info = {
+            'mode': 'fixed', 'slots_frac': self.funding_budget_slots_frac,
+            'initial_university_count': self.initial_university_count,
+            'total_slots': total_slots, 'total_applications': int(sum(apps_by_program.values())),
+            'slots_by_program': slot_override, 'apps_by_program': apps_by_program,
+            'effective_rate_by_program': {p: (slot_override[p] / apps_by_program[p] if apps_by_program[p] else None)
+                                          for p in program_ids},
+        }
+        return slot_override, info
+
     def _run_phase_4_acceptance_decisions(self, year: int, year_results: Dict):
         """Phase 4: Make acceptance decisions
 
@@ -2982,7 +3369,10 @@ class Simulation:
             logger.info(f"Year {year}: acceptance rate set to {rate:.3f} for all conferences "
                         f"(schedule override)")
 
-        self.conference_system.make_all_decisions()
+        tiebreak_seed = (derive_seed(getattr(self.args, 'seed', 42), 'phase4_tiebreak', year)
+                         if self.acceptance_tiebreak == 'seeded' else None)
+        self.conference_system.make_all_decisions(tiebreak_seed=tiebreak_seed,
+                                                  acceptance_mode=self.acceptance_mode)
 
         total_accepted = sum(len(conf.decisions['accept']) for conf in self.conference_system.conferences)
         total_rejected = sum(len(conf.decisions['reject']) for conf in self.conference_system.conferences)
@@ -3086,6 +3476,12 @@ class Simulation:
 
         if denominator == 0:
             industry_funding_per_unit = 0
+        elif self.funding_budget_mode == 'fixed':
+            # factor R for the industry sector: fixed annual pool instead of pay-per-paper
+            industry_funding_per_unit, industry_budget_info = self._fixed_industry_pool_per_unit(int(denominator))
+            year_results['funding_budget_industry'] = industry_budget_info
+            logger.info(f"Year {year} fixed industry pool: {industry_budget_info['pool']} for "
+                        f"{industry_budget_info['maturity_units_accepted']} maturity units")
         elif self.funding_allocation_mode == 'fixed':
             industry_funding_per_unit = SIMULATION_CONFIG['funding']['industry_base_budget']
         else:
@@ -3367,10 +3763,18 @@ class Simulation:
             # funding cutoff is reconstructable for winners AND losers.
             # Default-off flag; no behavior change for any other experiment.
             application_log = [] if getattr(self.args, 'log_funding_applications', False) else None
+            # Fixed agency budget (factor R): slots anchored to N0 replace the
+            # per-program int(n x rate) rule; 'track' (default) passes None.
+            slot_override = None
+            if self.funding_budget_mode == 'fixed':
+                slot_override, budget_info = self._fixed_budget_slots(final_eval_metadata)
+                year_results['funding_budget'] = budget_info
+                logger.info(f"Year {year} fixed agency budget: {budget_info['total_slots']} slots "
+                            f"for {budget_info['total_applications']} applications")
             all_funding_winners_dict = FundingAgency.process_funding_evaluation_results(
                 final_eval_results, final_eval_metadata, all_funding_programs_dict,
                 novelty_penalties=novelty_penalties, lambda_funding=lambda_funding,
-                application_log=application_log,
+                application_log=application_log, slot_override=slot_override,
             )
             if application_log is not None:
                 app_log_path = os.path.join(self.output_dir,
@@ -3652,6 +4056,12 @@ class Simulation:
     def run(self):
         """Run the complete simulation"""
         logger.info("Starting Academic Ecosystem Simulation")
+        if not hasattr(self.llm, 'generate_batch') and (
+                self.papers_per_project > 1 or self._capacity_mode_on
+                or self.review_policy != 'persona'):
+            raise NotImplementedError(
+                "papers_per_project>1, reviewer capacity/matching and review_policy=standardized "
+                "are implemented for the batched (vLLM) path only")
         logger.info(f"Configuration: {self.num_years} years")
 
         docs_dir = getattr(self.args, 'docs_dir', self.output_dir)
@@ -3774,7 +4184,9 @@ class Simulation:
             'paper_tracker': self.paper_tracker.to_dict(),
             'yearly_results': self.yearly_results,
             'industry_funding_system': self.industry_funding_system.to_dict(),
-            'submitted_paper_ids': list(self.submitted_paper_ids)  # Convert set to list
+            'submitted_paper_ids': list(self.submitted_paper_ids),  # Convert set to list
+            'initial_university_count': self.initial_university_count,
+            'initial_industry_count': self.initial_industry_count,
         }
 
         # Save exploration experiment trackers if enabled
@@ -3864,6 +4276,13 @@ class Simulation:
 
         # Convert submitted_paper_ids from list back to set
         self.submitted_paper_ids = set(checkpoint_data['submitted_paper_ids'])
+        # N0 anchor (older checkpoints lack it: fall back to the current university count)
+        self.initial_university_count = checkpoint_data.get('initial_university_count')
+        self.initial_industry_count = checkpoint_data.get('initial_industry_count')
+        if self.initial_university_count is None or self.initial_industry_count is None:
+            self._record_initial_university_count()
+            if self.funding_budget_mode == 'fixed':
+                logger.warning("Checkpoint has no initial_university_count; using current count as N0")
 
         # Reconstruct RAG with document_status from checkpoint
         if 'rag' in checkpoint_data:

@@ -9,6 +9,21 @@ logger = logging.getLogger(__name__)
 # warm light-gray grid that recedes behind the data.
 INK, MUTED, GRID = '#0b0b0b', '#52514e', '#e1e0d9'
 
+# Unified strategy palette for ALL exploration figures (single source of truth).
+# Hiroshige-family tones (MetBrewer): warm coral / soft amber / deep steel blue —
+# the muted-yet-rich warm-cool language of contemporary Nature figures;
+# distinguishable under deuteranopia and ordered in grayscale luminance.
+STRATEGY_PALETTE = {
+    'explorer': '#E76254',           # warm coral
+    'exploiter': '#F2A65A',          # soft amber
+    'cautious_explorer': '#376795',  # deep steel blue
+}
+STRATEGY_NICE = {'explorer': 'Explorer', 'exploiter': 'Exploiter',
+                 'cautious_explorer': 'Cautious explorer'}
+
+# Accent pair for two-series figures (e.g., dual-axis panels)
+ACCENT_WARM, ACCENT_COOL = '#E76254', '#1E466E'
+
 
 def nature_style():
     """Nature-journal seaborn theme shared by all paper figures.

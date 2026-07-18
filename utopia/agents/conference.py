@@ -59,6 +59,9 @@ class Conference:
         default_factory=lambda: defaultdict(list))  # author_id -> [rejected_papers]
     # Review tracking
     reviews: Dict[str, List[Dict]] = field(default_factory=dict)  # paper_id -> [reviews]
+    # --acceptance_mode fixed_slots: accepted count frozen at the first decision year
+    # (None = never frozen; legacy rate mode never touches it)
+    fixed_slots: Optional[int] = None
 
     @property
     def most_preferred_topics(self) -> List[str]:
@@ -136,14 +139,20 @@ class Conference:
         review['review_time'] = time.time()
         self.reviews[paper_id].append(review)
 
-    def make_acceptance_decisions(self) -> None:
+    def make_acceptance_decisions(self, tiebreak_seed: Optional[int] = None,
+                                  acceptance_mode: str = 'rate') -> None:
         """Make final acceptance/rejection decisions
 
         Uses aggregate review scores and acceptance rate to determine which papers to accept.
 
-        Returns:
-            Dictionary with 'accepted' and 'rejected' lists
+        Args:
+            tiebreak_seed: None (default, legacy) keeps Python's stable sort, i.e. ties at the
+                cutoff are resolved by submission order. An int seeds a deterministic
+                per-conference random key that breaks ties (--acceptance_tiebreak seeded).
+            acceptance_mode: 'rate' (default, legacy) accepts round(n x acceptance_rate);
+                'fixed_slots' freezes the accepted count at its first-decision value.
         """
+        assert acceptance_mode in ('rate', 'fixed_slots'), acceptance_mode
         if self.status != ConferenceStatus.UNDER_REVIEW:
             return
 
@@ -169,10 +178,22 @@ class Conference:
             })
 
         # Sort papers by score
-        paper_scores.sort(key=lambda x: x['score'], reverse=True)
+        if tiebreak_seed is None:
+            paper_scores.sort(key=lambda x: x['score'], reverse=True)
+        else:
+            from utopia.utils.generail_utils import derive_seed
+            rng = random.Random(derive_seed(tiebreak_seed, self.conference_id))
+            tiebreak_keys = [rng.random() for _ in paper_scores]
+            order = sorted(range(len(paper_scores)),
+                           key=lambda i: (-paper_scores[i]['score'], tiebreak_keys[i]))
+            paper_scores = [paper_scores[i] for i in order]
 
         # Accept top papers according to acceptance rate
         num_to_accept = max(1, round(len(paper_scores) * self.acceptance_rate))
+        if acceptance_mode == 'fixed_slots':
+            if self.fixed_slots is None:
+                self.fixed_slots = num_to_accept  # anchored at the first decision year
+            num_to_accept = min(self.fixed_slots, len(paper_scores))
 
         for i, item in enumerate(paper_scores):
             paper = item['paper']
@@ -301,7 +322,8 @@ class Conference:
             'authors_to_accepted_papers': self.authors_to_accepted_papers,
             'authors_to_rejected_papers': self.authors_to_rejected_papers,
             'status': self.status.value,  # Convert enum to string
-            'reviews': self.reviews
+            'reviews': self.reviews,
+            'fixed_slots': self.fixed_slots,
         }
 
     @classmethod
@@ -323,6 +345,7 @@ class Conference:
         conf.authors_to_accepted_papers = defaultdict(list, data.get('authors_to_accepted_papers', {}))
         conf.authors_to_rejected_papers = defaultdict(list, data.get('authors_to_rejected_papers', {}))
         conf.reviews = defaultdict(list, data.get('reviews', {}))
+        conf.fixed_slots = data.get('fixed_slots')
         return conf
 
 
@@ -371,12 +394,13 @@ class ConferenceSystem:
         for conf in self.conferences:
             conf.start_review_process()
 
-    def make_all_decisions(self) -> Dict[str, Dict]:
-        """Make acceptance decisions for all conferences
+    def make_all_decisions(self, tiebreak_seed: Optional[int] = None,
+                           acceptance_mode: str = 'rate') -> Dict[str, Dict]:
+        """Make acceptance decisions for all conferences (see Conference.make_acceptance_decisions)
         """
 
         for conf in self.conferences:
-            conf.make_acceptance_decisions()
+            conf.make_acceptance_decisions(tiebreak_seed=tiebreak_seed, acceptance_mode=acceptance_mode)
 
             for paper in conf.decisions['accept']:
                 author_ids = paper['author_id'] if isinstance(paper['author_id'], list) else [paper['author_id']]

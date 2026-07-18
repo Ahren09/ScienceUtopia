@@ -168,7 +168,7 @@ def parse_arguments(argv=None):
         '--experiment_stage',
         type=str,
         default=None,
-        choices=['smoke', 'pilot', 'scalecheck', 'calibration', 'confirmatory', 'manyworld', 'mechanism', 'matthew_rd', 'matthew_rd_cost'],
+        choices=['smoke', 'pilot', 'scalecheck', 'calibration', 'confirmatory', 'manyworld', 'mechanism', 'matthew_rd', 'matthew_rd_cost', 'scale'],
         help='Experiment stage. When set, canonical outputs/{logs,checkpoints,visual,docs}/<experiment_id>/ '
              'paths are used and an experiment_id is derived. When absent, legacy layout is preserved.'
     )
@@ -259,6 +259,110 @@ def parse_arguments(argv=None):
         help='Enable the citation risk-return intervention (citation-potential reranking of candidate papers). '
              'Off = neutral condition.'
     )
+    parser.add_argument(
+        '--annual_influx_rate',
+        type=float,
+        default=0.0,
+        help='Researcher-influx rate for the influx2x2 experiment. 0.0 (default) = OFF, '
+             'byte-identical code path to existing runs. Only 0.1 is implemented: the '
+             'staggered exact schedule where half of the 60 default-mode institutions '
+             'each add 1 junior researcher per year, halves alternating years '
+             '(+30/year = 10%% of the initial 300, linear growth). Requires '
+             'population_mode=default, non-debug.'
+    )
+    parser.add_argument(
+        '--disable_resubmission',
+        action='store_true',
+        default=False,
+        help='Skip Phase 0 entirely: rejected papers are never resubmitted '
+             '(influx2x2 experiment). Default off = existing behavior.'
+    )
+
+    # ---- Scale-expansion experiment (all default-off; off = byte-identical legacy path) ----
+    parser.add_argument(
+        '--papers_per_project',
+        type=int,
+        default=1,
+        help='Papers submitted per completed project (scale experiment factor S). 1 (default) '
+             '= legacy single-paper submission. k>1 asks the author to pick up to k distinct '
+             'candidate papers in one prompt; costs are unchanged (LLM lowers marginal cost). '
+             'Requires a batching LLM backend (vLLM).'
+    )
+    parser.add_argument(
+        '--funding_budget_mode',
+        type=str,
+        default='track',
+        choices=['track', 'fixed'],
+        help='Agency budget regime (factor R). "track" (default) = legacy: winners per program '
+             '= int(n_apps x rate), so agency spending tracks applications. "fixed" = annual '
+             'agency slots anchored to the initial university population and split across '
+             'programs in proportion to application counts (largest-remainder).'
+    )
+    parser.add_argument(
+        '--funding_budget_slots_frac',
+        type=float,
+        default=None,
+        help='Fraction f of the INITIAL university population funded per year under '
+             '--funding_budget_mode fixed (slots = round(f x N0)). Required when mode is fixed.'
+    )
+    parser.add_argument(
+        '--reviewer_capacity',
+        type=int,
+        default=None,
+        help='Per-reviewer annual review cap c (factor K). None (default) = legacy unlimited, '
+             '3 random reviewers per paper. When set, reviews per paper = '
+             'min(reviews_per_paper, floor(c x N_reviewers / N_submissions)) with a hard floor of 1; '
+             'assignment fails fast if any paper would receive zero reviews.'
+    )
+    parser.add_argument(
+        '--reviews_per_paper',
+        type=int,
+        default=3,
+        help='Target reviews per paper (default 3 = legacy).'
+    )
+    parser.add_argument(
+        '--reviewer_matching',
+        type=str,
+        default='random',
+        choices=['random', 'topic'],
+        help='Reviewer assignment: "random" (default, legacy) or "topic" (prefer reviewers whose '
+             'expertise topics overlap the paper topics; only active with --reviewer_capacity).'
+    )
+    parser.add_argument(
+        '--review_policy',
+        type=str,
+        default='persona',
+        choices=['persona', 'standardized'],
+        help='Evaluation scheme (factor E). "persona" (default) = legacy heterogeneous reviewer '
+             'prompt (institution persona + memory). "standardized" = one frozen standardized '
+             'review policy replaces persona/memory; same paper block, scale, and JSON schema.'
+    )
+    parser.add_argument(
+        '--review_score_mode',
+        type=str,
+        default='int',
+        choices=['int', 'float'],
+        help='"int" (default, legacy) truncates the reviewer score with int(); "float" keeps the '
+             'decimal score the prompt already allows (e.g. 2.5).'
+    )
+    parser.add_argument(
+        '--acceptance_tiebreak',
+        type=str,
+        default='stable',
+        choices=['stable', 'seeded'],
+        help='Tie-breaking among equal mean scores at the acceptance cutoff. "stable" (default, '
+             'legacy) keeps submission order; "seeded" uses a deterministic per-(conference, year) '
+             'random key derived from --seed.'
+    )
+    parser.add_argument(
+        '--acceptance_mode',
+        type=str,
+        default='rate',
+        choices=['rate', 'fixed_slots'],
+        help='"rate" (default, legacy): accept round(n x acceptance_rate) per conference-year. '
+             '"fixed_slots": freeze each conference\'s accepted count at its year-1 value, so the '
+             'realised acceptance rate falls as submissions grow (venue-capacity sensitivity).'
+    )
 
     args = parser.parse_args(argv)
 
@@ -278,6 +382,19 @@ def parse_arguments(argv=None):
         if not all(0 < r <= 1 for r in rates):
             raise ValueError(f'Acceptance rates must be in (0, 1] after parsing, got {rates}')
         args.acceptance_rate_schedule = rates
+
+    if args.annual_influx_rate not in (0.0, 0.1):
+        raise ValueError('--annual_influx_rate: only 0.0 (off) and 0.1 (staggered '
+                         '+30/year schedule) are implemented')
+
+    if args.papers_per_project < 1:
+        raise ValueError('--papers_per_project must be >= 1')
+    if args.funding_budget_mode == 'fixed' and not args.funding_budget_slots_frac:
+        raise ValueError('--funding_budget_mode fixed requires --funding_budget_slots_frac > 0')
+    if args.reviewer_capacity is not None and args.reviewer_capacity < 1:
+        raise ValueError('--reviewer_capacity must be >= 1')
+    if args.reviews_per_paper < 1:
+        raise ValueError('--reviews_per_paper must be >= 1')
 
     if args.experiment_stage:
         # Canonical layout: one experiment_id across outputs/{logs,checkpoints,visual,docs}
@@ -301,7 +418,11 @@ def parse_arguments(argv=None):
         # Composition override (E4b): counts "e,x,c" -> explicit strategy list
         args.strategy_mix_list = None
         mix_tag = ''
-        if args.strategy_mix:
+        if args.strategy_mix == 'balanced':
+            # Scale experiment: no exploration-strategy prior for anyone
+            args.strategy_mix_list = ['balanced'] * args.researchers_per_institution
+            mix_tag = '_mixbal'
+        elif args.strategy_mix:
             counts = [int(c) for c in args.strategy_mix.split(',')]
             assert len(counts) == 3 and sum(counts) == args.researchers_per_institution, (
                 f"--strategy_mix must be 3 counts summing to {args.researchers_per_institution}, "
@@ -315,10 +436,34 @@ def parse_arguments(argv=None):
             mix_tag += f"_cost{args.funding_application_cost}"
 
         n_researchers = args.num_institutions * args.researchers_per_institution
-        args.experiment_id = (
-            f"explore_{args.experiment_stage}_{model_tag}_{mechanism}_"
-            f"i{args.num_institutions}_n{n_researchers}_y{args.num_years}_seed{args.seed}{mix_tag}"
-        )
+        if args.experiment_stage == 'scale':
+            # Scale-expansion cells: tag encodes the four design factors (+ sensitivities)
+            cell = (f"k{args.papers_per_project}_budget{args.funding_budget_mode}"
+                    f"_cap{args.reviewer_capacity if args.reviewer_capacity is not None else 'none'}"
+                    f"_{args.review_policy}")
+            if args.review_score_mode != 'int':
+                cell += '_float'
+            if args.acceptance_tiebreak != 'stable':
+                cell += '_tieseed'
+            if args.acceptance_mode != 'rate':
+                cell += '_slots'
+            if args.reviewer_matching != 'random':
+                cell += '_topicmatch'
+            if args.disable_resubmission:
+                cell += '_noresub'
+            # population tag: synthetic university-only worlds carry i/n; the paper-baseline
+            # default population (30 universities + 30 companies x 5) is tagged popdefault
+            pop_tag = (f"i{args.num_institutions}_n{n_researchers}" if args.population_mode == 'university_only'
+                       else 'popdefault')
+            args.experiment_id = (
+                f"scale_{model_tag}_{cell}_"
+                f"{pop_tag}_y{args.num_years}_seed{args.seed}{mix_tag}"
+            )
+        else:
+            args.experiment_id = (
+                f"explore_{args.experiment_stage}_{model_tag}_{mechanism}_"
+                f"i{args.num_institutions}_n{n_researchers}_y{args.num_years}_seed{args.seed}{mix_tag}"
+            )
         base = args.output_dir  # repository-relative 'outputs'
         args.log_dir = os.path.join(base, 'logs', args.experiment_id)
         args.checkpoint_dir = os.path.join(base, 'checkpoints', args.experiment_id)
@@ -349,7 +494,10 @@ def parse_arguments(argv=None):
     args.log_dir = args.output_dir
     args.docs_dir = args.output_dir
     args.checkpoint_dir = args.output_dir
-    args.data_cache_dir = os.path.join('data', 'cache')
+    # Env override lets concurrent legacy-layout runs use disjoint cache dirs
+    # (mirrors the experiment_stage branch above; unset = unchanged behavior).
+    args.data_cache_dir = os.environ.get('UTOPIA_DATA_CACHE_DIR',
+                                         os.path.join('data', 'cache'))
     args.experiment_id = args.experiment_name
 
     os.makedirs(args.output_dir, exist_ok=True)

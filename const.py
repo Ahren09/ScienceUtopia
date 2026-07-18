@@ -28,3 +28,12 @@ IMPORTANT_NOTES = """
 """
 
 COI_NOTE = "(NOTE: This paper is from your own institution ({institution}). Potential conflict of interest: they may be competing for the same funding sources as you.)"
+# Frozen standardized reviewer policy (identical to review-replay prereg_v1
+# prompt_construction.policy_text_A). Used by --review_policy standardized: it
+# replaces the reviewer's persona/memory block; paper block, scale and JSON
+# schema are unchanged.
+STANDARDIZED_REVIEW_POLICY = (
+    "You apply the conference's standard review policy: weigh methodological soundness, "
+    "novelty, clarity, significance, and feasibility evenly. Base your score only on the "
+    "paper's content as presented, applying the scoring rubric consistently and impartially."
+)

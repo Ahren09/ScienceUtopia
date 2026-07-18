@@ -31,6 +31,8 @@ from utopia.visual.plot_exploration_strategies import (
     DEFAULT_OUT_DIR, DEFAULT_RUNS_GLOB, LABELS, PALETTE, STRATEGIES,
     load_run_tables)
 
+ANNOT_FS = 8  # in-axes annotation type (n-count, trend-line note)
+
 
 def risk_return_subplot(ax, sub: pd.DataFrame, strat: str, n_bins: int = 8):
     """One strategy's papers: scatter plus novelty-octile mean trend.
@@ -63,7 +65,7 @@ def risk_return_subplot(ax, sub: pd.DataFrame, strat: str, n_bins: int = 8):
             markeredgewidth=0.5, zorder=3)
     ax.set_title(LABELS[strat], pad=4, color=PALETTE[strat])
     ax.annotate(f'n = {len(sub):,} papers', xy=(0.03, 0.96),
-                xycoords='axes fraction', va='top', fontsize=5.5, color=MUTED)
+                xycoords='axes fraction', va='top', fontsize=ANNOT_FS, color=MUTED)
     ax.grid(axis='y', linewidth=0.5, color=GRID)
     ax.set_axisbelow(True)
 
@@ -81,19 +83,28 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     nature_style()
-    # Double-column width, one panel per strategy, shared axes.
-    fig, axes = plt.subplots(1, 3, figsize=(7.09, 2.2), sharex=True,
+    # This figure spans the full double-column width but is short, so the shared
+    # 6-7 pt type prints too small. Bump type up for THIS figure only (the shared
+    # nature_style is untouched) and give the panels more height so the larger
+    # labels are not cramped.
+    plt.rcParams.update({
+        'font.size': 9, 'axes.labelsize': 9, 'axes.titlesize': 9.5,
+        'xtick.labelsize': 8, 'ytick.labelsize': 8,
+    })
+    # Double-column width, one panel per strategy, shared axes; taller than the
+    # original 1.76 in so the enlarged labels breathe.
+    fig, axes = plt.subplots(1, 3, figsize=(6.8, 1.9), sharex=True,
                              sharey=True)
     for ax, strat in zip(axes, STRATEGIES):
         risk_return_subplot(ax, pa[pa.strategy == strat], strat)
     axes[0].set_ylabel('log(1+citations) at age 3')
-    axes[1].set_xlabel('Paper novelty scores')
+    axes[1].set_xlabel('Research shift score', labelpad=-0.5)
     # Under the explorer panel's n-count, where the point cloud leaves space.
-    axes[0].annotate('Lines: mean per novelty octile', xy=(0.03, 0.87),
-                     xycoords='axes fraction', va='top', fontsize=5.5,
-                     color=MUTED)
+    # axes[0].annotate('Lines: mean per novelty octile', xy=(0.03, 0.85),
+    #                  xycoords='axes fraction', va='top', fontsize=ANNOT_FS,
+    #                  color=MUTED)
     sns.despine(fig)
-    fig.tight_layout(w_pad=1.0)
+    fig.tight_layout(w_pad=0.3)
 
     for ext in {'pdf'}:
         path = out_dir / f'fig_exploration_paper_novelty_scores.{ext}'

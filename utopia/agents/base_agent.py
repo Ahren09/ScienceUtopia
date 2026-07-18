@@ -14,7 +14,7 @@ from pydantic import BaseModel
 import networkx as nx
 from langchain_core.documents import Document
 from enum import Enum
-from const import REVIEW_CRITERIA, IMPORTANT_NOTES
+from const import REVIEW_CRITERIA, IMPORTANT_NOTES, STANDARDIZED_REVIEW_POLICY
 from utopia.agents.conference import Conference
 from utopia.agents.research_direction import ResearchDirection
 from utopia.agents.conference import ARXIV_CATEGORY_NAMES
@@ -429,19 +429,25 @@ Respond in JSON format. An example response is below (DO NOT directly copy the e
         }
         return prompt, response_format
     
-    def get_review_prompt(self, paper: Dict, author_info: Dict = None) -> Tuple[str, Dict]:
+    def get_review_prompt(self, paper: Dict, author_info: Dict = None,
+                          review_policy: str = 'persona') -> Tuple[str, Dict]:
         """Build review prompt for a paper (without calling LLM)
 
         Args:
             paper: Paper dictionary with 'title', 'content', 'topics', etc.
             author_info: Optional dict with author identity for non-blind review.
                 Keys: 'author_name', 'institution', 'network_relationship'.
+            review_policy: 'persona' (default, legacy: reviewer memory shown) or
+                'standardized' (memory dropped; the frozen STANDARDIZED_REVIEW_POLICY
+                block is inserted before '## Review Instructions'). The 'persona'
+                prompt is byte-identical to the pre-flag template.
 
         Returns:
             Prompt string for review generation, response format
         """
+        assert review_policy in ('persona', 'standardized'), review_policy
         expertise = [e.topic if hasattr(e, 'topic') else str(e) for e in getattr(self, 'expertise', [])]
-        memory_context = self.get_memory_context()
+        memory_context = self.get_memory_context() if review_policy == 'persona' else ""
 
         if memory_context:
             memory_context = f"""## Your Recent Experiences
@@ -492,6 +498,11 @@ Provide a comprehensive review with:
 }
 ```
 """
+        if review_policy == 'standardized':
+            anchor = "## Review Instructions"
+            assert prompt.count(anchor) == 1, "review-prompt anchor not unique"
+            prompt = prompt.replace(
+                anchor, f"## Your Review Approach\n{STANDARDIZED_REVIEW_POLICY}\n\n{anchor}")
         response_format = {
             'type': 'json_schema',
             'json_object': {
@@ -714,7 +725,8 @@ If you choose not to resubmit, respond with a json file that contains an empty l
 
     def get_paper_submission_prompt(self, candidate_papers: List[Document], year: int, conferences: List[Conference],
                                     direction: ResearchDirection, paper_tracker: PaperTracker, max_papers: int = 10,
-                                    previous_papers: List[str] = None) -> str:
+                                    previous_papers: List[str] = None, max_submissions: int = 1,
+                                    force_list: bool = False) -> str:
         """
         Get research idea prompt for this agent
 
@@ -723,16 +735,31 @@ If you choose not to resubmit, respond with a json file that contains an empty l
             conferences: List of conferences to submit to
             max_papers: Maximum number of candidate papers to show
             previous_papers: Optional list of preview strings for previously accepted papers
+            max_submissions: papers to pick in this prompt (scale experiment factor S).
+                1 (default) is the legacy single-paper prompt/schema, byte-identical to the
+                pre-flag template. k>1 asks for up to k DISTINCT papers and returns
+                {"submissions": [{id, arxiv_id, conference, reason}, ...]}.
+            force_list: use the list prompt/schema even when max_submissions == 1 (retries
+                inside a k>1 batch must share the batch's response_format).
         """
+        assert max_submissions >= 1, max_submissions
+        use_list = max_submissions > 1 or force_list
         prompt = self._get_personality_prompt(include_exploration_strategy=True, include_funding_situation=True) + f"""
         
 ## Your Research Direction in This Round
 Detailed Focus: {direction['detailed_focus']}
 Keywords: {', '.join(direction['direction'].keywords)}
 
-## Your Task
+"""
+        if not use_list:
+            prompt += """## Your Task
 You plan to do a research project and submit a paper to a conference.
 From the following candidate papers, please give me a paper ID that you want to submit. Then, give a conference name that you want to submit to.
+"""
+        else:
+            prompt += f"""## Your Task
+You plan to do a research project and submit up to {max_submissions} papers to conferences this round.
+From the following candidate papers, please give me up to {max_submissions} DISTINCT paper IDs that you want to submit. For each paper, give a conference name that you want to submit to.
 """
 
         if year >= 2:
@@ -779,6 +806,65 @@ Below are the candidate conferences you can submit to. You MUST CHOOSE EXACTLY O
         for conference in conferences:
             prompt += f"""- \"{conference.conference_id}\": primary topics: {', '.join(conference.topics[:3])} | less preferred topics: {', '.join(conference.topics[3:])}
 """
+        # Generate Conference enum dynamically from available conferences
+        Conference = Enum('Conference', {cid: cid for cid in candidate_conference_ids}, type=str)
+
+        if use_list:
+            prompt += f"""
+## Your Task
+Based on the detailed focus of your research direction, respond with a list of up to {max_submissions} DISTINCT papers you want to submit. For each, give the paper ID (the FULL URL) and its conference abbreviation name (e.g. "NeurIPS" or "AAAI"). Do not list the same arXiv ID twice.
+
+NOTE: You can also choose to submit fewer papers or none at all, but this must be due to funding issues or competition being too fierce. Reasons such as "no paper matches my expertise" is not a valid reason.
+
+## Sample Response
+
+If you choose to submit, respond with the following JSON format:
+```json
+{{
+    "submissions": [
+        {{
+            "id": 1,
+            "arxiv_id": "https://arxiv.org/abs/2407.00005v1", <- MUST be the full URL, including the "https://", prefix
+            "conference": "NeurIPS",  <- MUST be one of the candidate conferences listed above
+            "reason": "..." <- Reason for submitting this particular paper to this particular conference
+        }},
+        {{
+            "id": 3,
+            "arxiv_id": "https://arxiv.org/abs/2407.00012v2",
+            "conference": "AAAI",
+            "reason": "..."
+        }}
+    ]
+}}
+```
+
+If you choose not to submit anything (only due to funding issues), respond with an empty list:
+```json
+{{
+    "submissions": []
+}}
+```
+"""
+
+            class PaperSubmissionEntry(BaseModel):
+                id: int
+                arxiv_id: str
+                conference: Conference
+                reason: str
+
+            class PaperSubmissionList(BaseModel):
+                submissions: List[PaperSubmissionEntry]
+
+            response_format = {
+                'type': 'json_schema',
+                'json_object': {
+                    'name': 'paper_submission_list',
+                    'strict': True,
+                    'schema': PaperSubmissionList.model_json_schema()
+                },
+            }
+            return prompt, response_format
+
         prompt += """
 ## Your Task
 Based on the detailed focus of your research direction, respond with a paper ID you want to submit (the FULL URL) and its conference abbreviation name (e.g. "NeurIPS" or "AAAI"). 
@@ -807,9 +893,6 @@ If you choose not to submit (only due to funding issues), explain using factors 
 }
 ```
 """
-
-        # Generate Conference enum dynamically from available conferences
-        Conference = Enum('Conference', {cid: cid for cid in candidate_conference_ids}, type=str)
 
         class PaperSubmission(BaseModel):
             id: int

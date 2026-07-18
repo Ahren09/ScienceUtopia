@@ -420,3 +420,9 @@ If a model-related change was made, explicitly state:
 * Whether LoRA adapters were used
 * Whether any full model checkpoints were created
 * Where LoRA adapters were stored or loaded from
+
+
+IMPORTANT NOTES
+
+* DO NOT mention stuff like "co-authored by XXX" anywhere in the commit message
+* DO NOT 1) use long dashes or 2) use ";" to separate sentences in your writeups
