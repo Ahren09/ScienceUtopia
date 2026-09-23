@@ -16,7 +16,7 @@ whether extra novelty pays off within each strategy, not just between
 strategies. Axes are shared across panels.
 
 Run:
-    python -m utopia.visual.plot_exploration_risk_return
+    python -m utopia.visual.plot_exploration_paper_novelty_scores
 """
 import argparse
 from pathlib import Path
@@ -98,7 +98,7 @@ def main():
     for ax, strat in zip(axes, STRATEGIES):
         risk_return_subplot(ax, pa[pa.strategy == strat], strat)
     axes[0].set_ylabel('log(1+citations) at age 3')
-    axes[1].set_xlabel('Research shift score', labelpad=-0.5)
+    axes[1].set_xlabel('Topical departure', labelpad=-0.5)
     # Under the explorer panel's n-count, where the point cloud leaves space.
     # axes[0].annotate('Lines: mean per novelty octile', xy=(0.03, 0.85),
     #                  xycoords='axes fraction', va='top', fontsize=ANNOT_FS,

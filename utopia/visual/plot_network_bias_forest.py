@@ -53,9 +53,14 @@ panels read left-to-right as a decomposition, (a) + (b) = (c))
         reviewer going from blind to fully informed actually shifts by. Because
         the proximity channel is ~0, this tracks the identity channel -- largest
         and only resolved at distance 2.
-    Dashed line at zero; shaded band = pre-registered +/-0.12-point practical-
-    equivalence bound. Open (white) marker = 95% bootstrap CI crosses zero;
-    filled = CI excludes zero. Accent color flags the resolved identity signal.
+    Dashed line at zero; pale cool-gray band = pre-registered
+    +/-0.12-point practical-equivalence bound. Each 95% bootstrap CI is drawn
+    twice over the SAME interval: a pale capsule under a thin crisp line.
+    Open (white) cobalt marker = CI crosses zero; filled red marker with a bold
+    red value label = CI excludes zero (the resolved identity signal).
+    Colors are the vivid accent pair shared with the resubmission figure
+    (VIVID_WARM / VIVID_COOL in utopia.utils.visual_utils). Rows sit at the same height in
+    every panel so the same author distance lines up across (a), (b), (c).
 
 Row meanings 每一栏含义(y 轴用大白话,括号里的 d2/d3/far 是技术标注)
     "Network distance" = number of co-authorship steps between reviewer and
@@ -93,17 +98,36 @@ import argparse
 import json
 from pathlib import Path
 
-import matplotlib as mpl
 import matplotlib.pyplot as plt
 import seaborn as sns
+from matplotlib.colors import to_rgb
+from matplotlib.legend_handler import HandlerTuple
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 
-from utopia.utils.visual_utils import GRID, INK, MUTED, nature_style
+from utopia.utils.visual_utils import MUTED, VIVID_COOL, VIVID_WARM, nature_style
 
 DEFAULT_RESULTS = 'outputs/docs/network_review_bias_final/results.json'
 DEFAULT_OUT_DIR = 'outputs/visual/network_review_bias_final'
 
-BLUE, ACCENT = '#2a78d6', '#d1495b'
+# Cobalt = 95% CI crosses zero, red = CI excludes zero (resolved). The pale
+# cool-gray band marks the "region of practical zero" and lets both colors pop.
+NULL_COLOR, RESOLVED_COLOR = VIVID_COOL, VIVID_WARM
+BAND_FILL = '#EDF2F7'
 EQUIV_BOUND = 0.12  # pre-registered practical-equivalence bound (score points)
+
+# Two-layer CI glyph: a thick pale capsule and a thin crisp line over the SAME
+# interval. Butt caps so both layers stop exactly at ci_lo / ci_hi.
+CAPSULE_LW, CAPSULE_TINT, CI_LW = 5.0, 0.3, 1.0
+MARKER_SIZE = {'stratum': 5.2, 'summary': 5.0}  # circle vs. diamond (visually matched)
+
+
+def _tint(color, amount):
+    """Opaque mix of `color` with white (amount=1 -> color, 0 -> white).
+
+    Opaque rather than alpha so the capsule never muddies over the sand band.
+    """
+    return tuple(1 - amount * (1 - c) for c in to_rgb(color))
 
 
 def _e(d, est_key='estimate'):
@@ -133,19 +157,19 @@ def build_channels(res: dict):
     channel_a = [
         ('2-hop', *_e(p['primary_d2_minus_far']), 'stratum'),     # (C-B)@d2 - (C-B)@far | 共享一个合作者,相对陌生人
         ('3-hop', *_e(s['S1_d3_minus_far']), 'stratum'),              # (C-B)@d3 - (C-B)@far | 隔两步,相对陌生人
-        (r'$\geq$ 4-hop',                                                 # far comparator check | 陌生人内部:松散相连 vs 完全无连接
+        (r'$\geq$4-hop',                                                 # far comparator check | 陌生人内部:松散相连 vs 完全无连接
          *_e(s['S3_far_connected_vs_disconnected']['disconnected']), 'stratum'),
     ]
     channel_b = [
         ('2-hop', *_e(s4['by_stratum']['d2']), 'stratum'),        # identity effect at d2 | 共享一个合作者(显著)
         ('3-hop', *_e(s4['by_stratum']['d3']), 'stratum'),            # identity effect at d3 | 隔两步
-        (r'$\geq$ 4-hop', *_e(s4['by_stratum']['far']), 'stratum'),                # identity effect at far | 陌生人
+        (r'$\geq$4-hop', *_e(s4['by_stratum']['far']), 'stratum'),                # identity effect at far | 陌生人
         ('All', *_e(s4['pooled']), 'summary'),                        # distance-pooled summary | 各距离平均(菱形)
     ]
     channel_c = [
         ('2-hop', *_e(s9['by_stratum']['d2']), 'stratum'),        # total effect at d2 | 共享一个合作者(显著)
         ('3-hop', *_e(s9['by_stratum']['d3']), 'stratum'),            # total effect at d3 | 隔两步
-        (r'$\geq$ 4-hop', *_e(s9['by_stratum']['far']), 'stratum'),                # total effect at far | 陌生人
+        (r'$\geq$4-hop', *_e(s9['by_stratum']['far']), 'stratum'),                # total effect at far | 陌生人
         ('All', *_e(s9['pooled']), 'summary'),                        # distance-pooled summary | 各距离平均(菱形)
     ]
     return channel_a, channel_b, channel_c
@@ -165,44 +189,63 @@ def robustness_range(res: dict):
     return min(ests), max(ests)
 
 
-def forest_panel(ax, rows, title, xlabel):
+def _ci_glyph(color, resolved, kind):
+    """Artist kwargs for one CI row: (capsule, CI line, marker).
+
+    Shared by the panels and the legend keys so both always match.
+    """
+    capsule = dict(color=_tint(color, CAPSULE_TINT), linewidth=CAPSULE_LW,
+                   solid_capstyle='butt')
+    line = dict(color=color, linewidth=CI_LW, solid_capstyle='butt')
+    # Filled markers get a white halo so they pop off the capsule. Open markers
+    # keep a colored ring on a white face.
+    marker = dict(marker='D' if kind == 'summary' else 'o', linestyle='none',
+                  markersize=MARKER_SIZE[kind],
+                  markerfacecolor=color if resolved else 'white',
+                  markeredgecolor='white' if resolved else color,
+                  markeredgewidth=0.8 if resolved else 1.1)
+    return capsule, line, marker
+
+
+def forest_panel(ax, rows, title, xlabel, n_slots):
     """Draw one channel as a mini forest; accent-flag CIs that exclude zero.
 
+    Rows fill the top `n_slots` slots so the same author distance sits at the
+    same height in every panel (panel a has no pooled row).
     中文:画一条通道的森林图;置信区间不含 0 的点用实心+强调色标出。
-    `xlabel` 让两个面板各写各自的 x 轴含义(相对陌生人 / 揭示身份的绝对效应)。
+    `xlabel` 让各面板各写各自的 x 轴含义(相对陌生人 / 揭示身份的绝对效应)。
     """
-    ys = list(range(len(rows)))[::-1]  # first row at the top
-    ax.axvspan(-EQUIV_BOUND, EQUIV_BOUND, color=GRID, alpha=0.55, linewidth=0)
-    ax.axvline(0, color=MUTED, linewidth=0.7, linestyle=(0, (3, 2)))
+    ys = [n_slots - 1 - i for i in range(len(rows))]  # first row at the top
+    ax.axvspan(-EQUIV_BOUND, EQUIV_BOUND, facecolor=BAND_FILL, linewidth=0, zorder=0)
+    ax.axvline(0, color=MUTED, linewidth=0.6, linestyle=(0, (3, 2)), zorder=1)
 
     for y, (label, est, lo, hi, kind) in zip(ys, rows):
         resolved = lo > 0 or hi < 0  # CI excludes zero -> a resolved effect
-        color = ACCENT if resolved else BLUE
-        marker = 'D' if kind == 'summary' else 'o'
-        ax.errorbar(est, y, xerr=[[est - lo], [hi - est]], fmt=marker,
-                    color=color, ecolor=color, elinewidth=1.2, capsize=2,
-                    capthick=1.2, markersize=4.5 if kind == 'summary' else 4,
-                    markerfacecolor=color if resolved else 'white',
-                    markeredgecolor=color, markeredgewidth=0.9)
+        color = RESOLVED_COLOR if resolved else NULL_COLOR
+        capsule, line, marker = _ci_glyph(color, resolved, kind)
+        ax.plot([lo, hi], [y, y], zorder=2, **capsule)
+        ax.plot([lo, hi], [y, y], zorder=3, **line)
+        ax.plot(est, y, zorder=4, **marker)
         # Flag resolved (accent) effects with a dagger -> raw-significant only,
-        # not robust to multiple-comparison correction (see the figure footnote).
+        # not robust to multiple-comparison correction (see the figure caption).
         label_txt = f'{est:+.3f}' + ('$^{\\dagger}$' if resolved else '')
         ax.annotate(label_txt, xy=(hi, y), xytext=(4, 0),
                     textcoords='offset points', ha='left', va='center',
-                    fontsize=5.5, color=MUTED)
+                    fontsize=6, color=RESOLVED_COLOR if resolved else MUTED,
+                    fontweight='bold' if resolved else 'normal')
 
     # Separator above any pooled-summary row.
     summary_ys = [y for y, r in zip(ys, rows) if r[4] == 'summary']
     if summary_ys:
-        ax.axhline(max(summary_ys) + 0.5, color=MUTED, linewidth=0.5, linestyle=':')
+        ax.axhline(max(summary_ys) + 0.5, color=MUTED, linewidth=0.5,
+                   linestyle=(0, (1, 1.5)), zorder=1)
 
     ax.set_yticks(ys, [r[0] for r in rows])
-    ax.set_ylim(-0.7, len(rows) - 0.3)
+    ax.tick_params(axis='y', length=0, pad=3)  # left spine is removed
+    ax.set_ylim(-0.6, n_slots - 0.4)
     ax.set_xlabel(xlabel)
-    ax.set_title(title, pad=0)
-    ax.grid(axis='x', linewidth=0.5, color=GRID)
-    ax.set_axisbelow(True)
-    ax.margins(x=0.18)  # room for the effect-size labels past the CI caps
+    ax.set_title(title, pad=4)
+    ax.margins(x=0.18)  # room for the effect-size labels past the CI ends
 
 
 def main():
@@ -222,16 +265,17 @@ def main():
     # left-to-right as a decomposition: (a) proximity + (b) identity = (c) total
     # disclosure. Titles and x-labels are in plain language; y ticks name the
     # closeness level.
-    fig, (ax_a, ax_b, ax_c) = plt.subplots(1, 3, figsize=(6.6, 2.2))
+    fig, (ax_a, ax_b, ax_c) = plt.subplots(1, 3, figsize=(6.6, 1.8))
+    n_slots = max(len(channel_a), len(channel_b), len(channel_c))
     forest_panel(ax_a, channel_a,
                  'Inform that the author\nis network-close',
-                 'Score change vs. a stranger author')
+                 'Score change vs. a stranger author', n_slots)
     forest_panel(ax_b, channel_b,
                  'Revealed author\nidentity',
-                 'Score change from revealing identity')
+                 'Score change from revealing identity', n_slots)
     forest_panel(ax_c, channel_c,
                  'Full disclosure of\nidentity and relationship',
-                 'Score change vs. blind review')
+                 'Score change vs. blind review', n_slots)
 
     # Shared x-range so the three channels are directly comparable.
     axes = (ax_a, ax_b, ax_c)
@@ -246,32 +290,31 @@ def main():
         ax.text(-0.12, 1.13, letter, transform=ax.transAxes, fontsize=8.5,
                 fontweight='bold', va='bottom', ha='right')
 
+    # Legend keys stack the same three layers as the data rows (capsule, CI
+    # line, marker) via HandlerTuple.
     handles = [
-        mpl.lines.Line2D([], [], color=BLUE, marker='o', markersize=4,
-                         markerfacecolor='white', markeredgecolor=BLUE,
-                         linewidth=1.2, label='CI crosses zero'),
-        mpl.lines.Line2D([], [], color=ACCENT, marker='o', markersize=4,
-                         markerfacecolor=ACCENT, markeredgecolor=ACCENT,
-                         linewidth=1.2, label='CI excludes zero (raw)$^{\\dagger}$'),
-        mpl.lines.Line2D([], [], color=GRID, marker='s', markersize=6,
-                         markerfacecolor=GRID, markeredgecolor=GRID, linewidth=0,
-                         label=f'$\\pm${EQUIV_BOUND:.2f}-pt equivalence'),
+        tuple(Line2D([], [], **kw) for kw in _ci_glyph(NULL_COLOR, False, 'stratum')),
+        tuple(Line2D([], [], **kw) for kw in _ci_glyph(RESOLVED_COLOR, True, 'stratum')),
+        Patch(facecolor=BAND_FILL, linewidth=0),
     ]
+    labels = ['CI crosses zero', 'CI excludes zero (raw)$^{\\dagger}$',
+              f'±{EQUIV_BOUND:.2f}-pt equivalence']
     # Plain-language definition so the y-tick tags (d2/d3/far) are self-contained.
     # fig.text(0.5, 0.115,
     #          'Network distance d = distance on the co-authorship between reviewer and author '
     #          '(d2 = share one collaborator; d3 = two steps; far = no close link).',
     #          ha='center', va='bottom', fontsize=5.6, color=MUTED)
-    fig.legend(handles=handles, frameon=False, loc='lower center', ncol=3,
-               bbox_to_anchor=(0.5, 0.05), handlelength=1.4, columnspacing=1.2,
-               fontsize=8)
+    fig.legend(handles, labels, handler_map={tuple: HandlerTuple(ndivide=1, pad=0)},
+               frameon=False, loc='lower center', ncol=3,
+               bbox_to_anchor=(0.5, 0.02), handlelength=2.2, handleheight=0.9,
+               columnspacing=2.0, handletextpad=0.7)
     # fig.text(0.5, 0.0,
     #          '$^{\\dagger}$Raw-significant only: the identity effect does not survive '
     #          'multiple-comparison (Benjamini-Hochberg) correction (pooled '
     #          '$p_\\mathrm{adj}=0.078$).',
     #          ha='center', va='bottom', fontsize=5.6, color=MUTED)
-    sns.despine(fig)
-    fig.tight_layout(rect=(0, 0.14, 1, 1), w_pad=0.1)
+    sns.despine(fig, left=True)
+    fig.tight_layout(rect=(0, 0.1, 1, 1), w_pad=0.0)
 
     for ext in ('pdf', 'png'):
         path = out_dir / f'fig_network_bias_forest.{ext}'

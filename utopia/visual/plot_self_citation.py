@@ -9,7 +9,7 @@ Experiment
     the citation Gini essentially unchanged (delta <= 0.0005).
 
 Panels (1x2, double-column halves; house dot-and-whisker style matching
-fig_career_outcomes / fig_novelty_selection_gate)
+fig_exploration_strategies panel (c) / fig_novelty_selection_gate)
     (a) Forest-style dot-and-whisker: self-citation rate by the citing
         author's strategy, pooled over the three seeds with Wilson 95% CIs
         and direct value labels. Exploiters self-cite at 0.57%, cautious

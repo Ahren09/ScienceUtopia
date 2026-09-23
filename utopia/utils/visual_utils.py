@@ -24,6 +24,10 @@ STRATEGY_NICE = {'explorer': 'Explorer', 'exploiter': 'Exploiter',
 # Accent pair for two-series figures (e.g., dual-axis panels)
 ACCENT_WARM, ACCENT_COOL = '#E76254', '#1E466E'
 
+# Vivid accent trio for the resubmission and review-bias figures (Figs 7/8):
+# cobalt / NPG red / gold, brighter than the Hiroshige pair, still CVD-safe.
+VIVID_COOL, VIVID_WARM, VIVID_GOLD = '#1F6FB5', '#E5493A', '#E8A33D'
+
 
 def nature_style():
     """Nature-journal seaborn theme shared by all paper figures.

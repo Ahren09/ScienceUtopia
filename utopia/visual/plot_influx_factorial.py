@@ -7,9 +7,9 @@ with manuscript resubmission (Phase 0 enabled/disabled). Single seed 42,
 B = influx only, C = recycling only (paper-baseline twin), D = both (flagship).
 
 Factorial visual encoding (so the 2x2 design is legible at a glance):
-    COLOR     = recycling  (deep steel blue #376795 = off, warm coral #E76254 = on)
+    COLOR     = recycling  (cobalt #1F6FB5 = off, NPG red #E5493A = on)
     LINESTYLE = influx     (dashed = off, solid = on)
-Hiroshige-family tones shared with the exploration figures (visual_utils).
+Vivid accent trio shared with the review-bias figure (visual_utils.VIVID_*).
 No error bars: results are one seed-matched counterfactual set.
 
 Main figure (fig_influx_factorial):
@@ -40,7 +40,8 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from utopia.utils.visual_utils import GRID, INK, MUTED, nature_style
+from utopia.utils.visual_utils import (GRID, INK, MUTED, VIVID_COOL, VIVID_GOLD,
+                                       VIVID_WARM, nature_style)
 
 DEFAULT_STATS = {
     'A': 'outputs/docs/resubmission_stats_influx2x2_A_noinflux_noresub_seed42/resubmission_stats.json',
@@ -51,7 +52,7 @@ DEFAULT_STATS = {
 DEFAULT_OUT_DIR = 'outputs/visual/influx2x2_qwen3_32b_seed42'
 
 # Factorial encoding: color = recycling, linestyle = influx (see docstring).
-COOL, WARM = '#376795', '#E76254'      # Hiroshige steel blue / warm coral
+COOL, WARM = VIVID_COOL, VIVID_WARM    # cobalt / NPG red
 CELL_ORDER = ['A', 'B', 'C', 'D']
 CELL_STYLE = {
     'A': {'color': COOL, 'linestyle': (0, (4, 2))},
@@ -60,13 +61,13 @@ CELL_STYLE = {
     'D': {'color': WARM, 'linestyle': '-'},
 }
 CELL_NICE = {
-    'A': 'No growth, no recycling',
+    'A': 'No growth, no resubmission',
     'B': 'Population growth only',
-    'C': 'Recycling only',
-    'D': 'Growth + recycling',
+    'C': 'Resubmission only',
+    'D': 'Growth + resubmission',
 }
-# Panel-b stack: first submissions in amber, resubmissions in the recycling coral.
-FIRST_COLOR, RESUB_COLOR = '#F2A65A', '#E76254'
+# Panel-b stack: first submissions in gold, resubmissions in the recycling red.
+FIRST_COLOR, RESUB_COLOR = VIVID_GOLD, VIVID_WARM
 
 
 def _series(stats: dict, field: str, years) -> list:
@@ -97,7 +98,7 @@ def volume_panel(ax, stats_by_cell: dict, years):
                 lambda v: f'{v:,.0f}', {'A': -2, 'B': 0, 'C': 2, 'D': 0})
     ax.set_xlabel('Year', labelpad=1)
     ax.set_ylabel('Submission events')
-    ax.set_title('Growth and recycling amplify submissions', pad=2)
+    ax.set_title('Submissions compound', pad=2)
     ax.set_xticks(years[::3])
     ax.set_xlim(years[0] - 0.3, years[-1] + 1.6)
     ax.grid(axis='y', linewidth=0.5, color=GRID)
@@ -121,7 +122,7 @@ def composition_panel(ax, stats: dict, years):
     ax.margins(y=0.12)
     ax.set_xlabel('Year', labelpad=1)
     ax.set_ylabel('Submission events')
-    ax.set_title('Recycled papers dominate late years', pad=2)
+    ax.set_title('Resubmissions dominate', pad=2)
     ax.set_xticks(years[::3])
     ax.legend(fontsize=6, frameon=False, loc='upper left')
     ax.grid(axis='y', linewidth=0.5, color=GRID)
@@ -134,7 +135,7 @@ def burden_panel(ax, stats_by_cell: dict, years):
                 lambda v: f'{v:.2f}', {'A': 4, 'B': -4, 'C': 2, 'D': -2})
     ax.set_xlabel('Year', labelpad=1)
     ax.set_ylabel('Reviews per active reviewer')
-    ax.set_title('Recycling, not growth, drives burden', pad=2)
+    ax.set_title('Resubmission drives workload', pad=2)
     ax.set_xticks(years[::3])
     ax.set_xlim(years[0] - 0.3, years[-1] + 1.9)
     ax.grid(axis='y', linewidth=0.5, color=GRID)

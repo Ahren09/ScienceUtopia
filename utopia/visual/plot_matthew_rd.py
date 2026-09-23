@@ -80,7 +80,8 @@ from matplotlib.colors import to_rgba
 from utopia.analysis.matthew_rd_analysis import (_binned_means,
                                                  local_linear_fit_band,
                                                  local_linear_rd)
-from utopia.utils.visual_utils import GRID, INK, MUTED, nature_style
+from utopia.utils.visual_utils import (GRID, INK, MUTED, VIVID_COOL,
+                                       VIVID_GOLD, VIVID_WARM, nature_style)
 
 DEFAULT_APPLICATIONS = ('/workingdir/yjin328/ScienceUtopia/data/matthew_rd/'
                         'applications.parquet')
@@ -91,24 +92,33 @@ DEFAULT_PREVIEW_DIR = 'outputs/visual/matthew_rd_final'
 
 Y = 'cumulative_subsequent_funding_3y'
 X_MAX = 5           # bins shown per side; the funded side ends at +4.5
-BLUE = '#2a78d6'    # funded side and forest markers (repo series accent)
-UNFUNDED = MUTED    # unfunded side: neutral grey, a null needs no red/green
+BLUE = VIVID_COOL
+UNFUNDED = MUTED
+# Color denotes outcome family, never the sign or significance of an effect.
+OUTCOME_COLORS = {
+    'primary': BLUE,
+    'pubs_written_3y': VIVID_WARM,
+    'pubs_accepted_3y': VIVID_WARM,
+    'citations_age2_matched': VIVID_GOLD,
+    'any_award_3y': BLUE,
+    'exploration_distance_3y': '#159B8E',
+}
 # Type sizes one step above nature_style(), since the figure is scaled down to
 # the paper's text width.
 LABEL_FS, TICK_FS, NOTE_FS, LETTER_FS = 8.5, 7.5, 7, 10
 
 # Forest rows: (rd_results key, parquet column, row label, raw-unit label).
 OUTCOMES = [
-    ('primary', Y, 'Later funding', lambda t: f'{t:+.1f} units'),
-    ('pubs_written_3y', 'pubs_written_3y', 'Papers written',
+    ('primary', Y, 'Funding received', lambda t: f'{t:+.1f} units'),
+    ('pubs_written_3y', 'pubs_written_3y', 'Papers produced',
      lambda t: f'{t:+.2f} papers'),
-    ('pubs_accepted_3y', 'pubs_accepted_3y', 'Papers accepted',
+    ('pubs_accepted_3y', 'pubs_accepted_3y', 'Accepted papers',
      lambda t: f'{t:+.2f} papers'),
     ('citations_age2_matched', 'citations_age2_matched', 'Citations',
      lambda t: f'{t:+.1f} cites'),
-    ('any_award_3y', 'any_award_3y', 'Any later award',
+    ('any_award_3y', 'any_award_3y', 'Probability of\nlater funding',
      lambda t: f'{100 * t:+.0f} pp'),
-    ('exploration_distance_3y', 'exploration_distance_3y', 'Exploration',
+    ('exploration_distance_3y', 'exploration_distance_3y', 'Distance from\nprior research',
      lambda t: f'{t:+.2f}'),
 ]
 
@@ -125,10 +135,10 @@ def rd_panel(ax, df: pd.DataFrame, primary: dict):
     for side, color in ((-1, UNFUNDED), (1, BLUE)):
         sub = df[np.sign(df['x']) == side]
         xs, ms, ses = _binned_means(sub, Y, max_x=X_MAX)
-        ax.errorbar(xs, ms, yerr=1.96 * ses, fmt='o', ms=3.2, color=color,
-                    ecolor=to_rgba(color, 0.5), elinewidth=0.6, capsize=1.2,
-                    capthick=0.6, markeredgecolor='white',
-                    markeredgewidth=0.4, zorder=3)
+        ax.errorbar(xs, ms, yerr=1.96 * ses, fmt='o', ms=4.6, color=color,
+                    ecolor=to_rgba(color, 0.75), elinewidth=1.2, capsize=2.2,
+                    capthick=1.1, markeredgecolor='white',
+                    markeredgewidth=0.55, zorder=3)
         grid, yhat, lo, hi = local_linear_fit_band(df, Y, h, side)
         ax.fill_between(grid, lo, hi, color=color, alpha=0.15, linewidth=0,
                         zorder=1)
@@ -143,7 +153,7 @@ def rd_panel(ax, df: pd.DataFrame, primary: dict):
 
     # Cutoff line runs from above the two-line estimate block at the bottom to
     # just below its "Funding cutoff" label at the top.
-    ax.axvline(0, ymin=0.21, ymax=0.9, color=INK, linewidth=0.8,
+    ax.axvline(0, ymin=0.21, ymax=0.9, color=INK, linewidth=1.5,
                linestyle=(0, (3, 2)), zorder=2)
     ax.set_xlim(-X_MAX - 0.4, X_MAX + 0.4)
     ax.set_xticks([-4, -2, 0, 2, 4])
@@ -152,6 +162,7 @@ def rd_panel(ax, df: pd.DataFrame, primary: dict):
     ax.set_yticks([0, 10, 20, 30])
     ax.set_xlabel('Rank relative to funding cutoff ($X$)')
     ax.set_ylabel('Funding in next 3 years (units)')
+    ax.xaxis.set_label_coords(0.5, -0.16)
     daf = ('data', 'axes fraction')
     ax.annotate('Funding cutoff', xy=(0, 1.0), xycoords=daf, ha='center',
                 va='top', fontsize=NOTE_FS, color=INK)
@@ -161,11 +172,14 @@ def rd_panel(ax, df: pd.DataFrame, primary: dict):
     ax.annotate('Funded', xy=(0, 0.88), xycoords=daf, xytext=(4, 0),
                 textcoords='offset points', ha='left', va='top',
                 fontsize=NOTE_FS, color=BLUE)
-    ax.annotate(f"$\\tau$ = {primary['tau']:.2f}, 95% CI "
-                f"[{primary['ci_lo']:.1f}, {primary['ci_hi']:.1f}]",
-                xy=(0, 0.11), xycoords=daf, ha='center', va='bottom',
-                fontsize=NOTE_FS, color=MUTED)
-    ax.annotate(f"fit window $|X| \\leq {h}$, N = {primary['n']}",
+    # ax.annotate(f"$\\tau$ = {primary['tau']:.2f}, 95% CI "
+    #             f"[{primary['ci_lo']:.1f}, {primary['ci_hi']:.1f}]",
+    #             xy=(0, 0.11), xycoords=daf, ha='center', va='bottom',
+    #             fontsize=NOTE_FS, color=MUTED)
+    # ax.annotate(f"fit window $|X| \\leq {h}$, N = {primary['n']}",
+    #             xy=(0, 0.02), xycoords=daf, ha='center', va='bottom',
+    #             fontsize=NOTE_FS, color=MUTED)
+    ax.annotate(f"Narrow winners/losers $|X| \\leq {h}$",
                 xy=(0, 0.02), xycoords=daf, ha='center', va='bottom',
                 fontsize=NOTE_FS, color=MUTED)
     ax.grid(axis='y', linewidth=0.5, color=GRID)
@@ -180,7 +194,8 @@ def standardized_rows(df: pd.DataFrame, results: dict) -> list:
     for key, col, label, fmt in OUTCOMES:
         r = results['primary'] if key == 'primary' else results['secondary'][key]
         sd = float(ctrl[col].std())
-        rows.append({'label': label, 'tau': r['tau'], 'sd': sd,
+        rows.append({'label': label, 'color': OUTCOME_COLORS[key],
+                     'primary': key == 'primary', 'tau': r['tau'], 'sd': sd,
                      'est': r['tau'] / sd, 'lo': r['ci_lo'] / sd,
                      'hi': r['ci_hi'] / sd, 'raw': fmt(r['tau']),
                      'p_bh': r.get('p_bh', np.nan)})
@@ -188,33 +203,50 @@ def standardized_rows(df: pd.DataFrame, results: dict) -> list:
 
 
 def outcome_forest_panel(ax, rows: list):
-    """Standardized RD estimates per outcome; open marker = CI crosses zero.
-
-    面板 b:六个结果的标准化效应森林图,空心点表示 95% 区间跨零,
-    区间右侧标注原始单位的估计值。
-    """
+    """Outcome-colored estimates with open markers and an aligned raw-effect column."""
     ys = list(range(len(rows)))[::-1]
-    ax.axvline(0, color=MUTED, linewidth=0.7, linestyle=(0, (3, 2)))
-    for i, (y, r) in enumerate(zip(ys, rows)):
+    # Keep the numerical column outside the quantitative plotting area.
+    effect_min, effect_max = -0.7, 0.7
+    value_x = 1.23
+    guide_top = ys[0] + 0.36
+    for x in (-0.5, 0.5):
+        ax.vlines(x, -0.45, guide_top, color=GRID, linewidth=0.5, zorder=0)
+    ax.vlines(0, -0.45, guide_top, color=INK, linewidth=0.8,
+              linestyle=(0, (3, 2.5)), zorder=1)
+    ax.text(0, ys[0] + 0.73, 'Estimate (95% CI)', ha='center', va='center',
+            fontsize=NOTE_FS, color=MUTED)
+    ax.text(value_x, ys[0] + 0.73, 'Raw effect', ha='right', va='center',
+            fontsize=NOTE_FS, color=MUTED)
+    ax.vlines(0.72, -0.43, guide_top, color=GRID, linewidth=0.55, zorder=0)
+    for y, r in zip(ys, rows):
         resolved = r['lo'] > 0 or r['hi'] < 0
-        ax.errorbar(r['est'], y, xerr=[[r['est'] - r['lo']], [r['hi'] - r['est']]],
-                    fmt='o', color=BLUE, ecolor=BLUE, elinewidth=1.2,
-                    capsize=2, capthick=1.2, markersize=4.6 if i == 0 else 4,
-                    markerfacecolor=BLUE if resolved else 'white',
-                    markeredgecolor=BLUE, markeredgewidth=0.9)
-        ax.annotate(r['raw'], xy=(r['hi'], y), xytext=(4, 0),
-                    textcoords='offset points', ha='left', va='center',
-                    fontsize=NOTE_FS, color=MUTED)
-    # Primary endpoint above the rule, the secondary family below it.
-    ax.axhline(ys[0] - 0.5, color=MUTED, linewidth=0.5, linestyle=(0, (1, 2)))
-    ax.set_yticks(ys, [r['label'] for r in rows])
-    ax.tick_params(axis='y', length=0)
-    ax.set_ylim(-0.6, len(rows) - 0.4)
-    ax.set_xlim(-0.8, 1.2)  # room for the raw-unit labels past the CI caps
-    ax.set_xticks([-0.5, 0, 0.5, 1])
+        assert effect_min <= r['lo'] <= r['est'] <= r['hi'] <= effect_max
+        ax.errorbar(r['est'], y,
+                    xerr=[[r['est'] - r['lo']], [r['hi'] - r['est']]],
+                    fmt='D' if r['primary'] else 'o', color=r['color'],
+                    ecolor=r['color'], elinewidth=1.45, capsize=2.6,
+                    capthick=1.15, markersize=5.1 if r['primary'] else 4.6,
+                    markerfacecolor=r['color'] if resolved else 'white',
+                    markeredgecolor=r['color'], markeredgewidth=1.2, zorder=3)
+        ax.text(value_x, y, r['raw'], ha='right', va='center',
+                fontsize=TICK_FS,
+                color=tuple(channel * 0.68 for channel in to_rgba(r['color'])[:3]),
+                fontweight='bold' if r['primary'] else 'normal')
+    # The primary endpoint remains visually distinct from secondary outcomes.
+    ax.axhline(ys[0] - 0.5, color=GRID, linewidth=0.65, zorder=0)
+    ax.set_yticks(ys, [r['label'] for r in rows], fontsize=TICK_FS - 1)
+    for label, row in zip(ax.get_yticklabels(), rows):
+        label.set_color(INK)
+        label.set_fontweight('bold' if row['primary'] else 'normal')
+    ax.tick_params(axis='y', length=0, pad=6)
+    ax.set_ylim(-0.6, len(rows) + 0.08)
+    ax.set_xlim(-0.8, 1.30)
+    ax.set_xticks([-0.5, 0, 0.5])
     ax.set_xlabel('Effect of narrowly winning (SD units)')
-    ax.grid(axis='x', linewidth=0.5, color=GRID)
-    ax.set_axisbelow(True)
+    ax.xaxis.set_label_coords((0 - (-0.8)) / (1.30 - (-0.8)), -0.16)
+    ax.spines['bottom'].set_bounds(effect_min, effect_max)
+    ax.spines['left'].set_visible(False)
+    ax.grid(False)
 
 
 def panel_letters(fig, axes):
@@ -225,7 +257,7 @@ def panel_letters(fig, axes):
     y-tick labels (panel b's outcome names are wide).
     """
     for letter, ax, dx in zip('ab', axes, (-0.17, -0.33)):
-        fig.text(dx, 1.04, letter, transform=ax.transAxes,
+        fig.text(dx, 1.02, letter, transform=ax.transAxes,
                  fontsize=LETTER_FS, fontweight='bold', ha='left', va='baseline')
 
 
@@ -265,12 +297,13 @@ def main():
     plt.rcParams.update({'axes.labelsize': LABEL_FS, 'xtick.labelsize': TICK_FS,
                          'ytick.labelsize': TICK_FS})
     fig, (ax_a, ax_b) = plt.subplots(
-        1, 2, figsize=(6.9, 2.0), gridspec_kw={'width_ratios': [1.2, 1.0]})
+        1, 2, figsize=(7.2, 1.90), gridspec_kw={'width_ratios': [1.13, 1.08]})
     rd_panel(ax_a, df, primary)
     rows = standardized_rows(df, results)
     outcome_forest_panel(ax_b, rows)
-    sns.despine(fig)
-    fig.tight_layout(w_pad=1.6)
+    sns.despine(ax=ax_a)
+    sns.despine(ax=ax_b, left=True)
+    fig.tight_layout(w_pad=1.8)
     panel_letters(fig, (ax_a, ax_b))
     for ax in (ax_a, ax_b):
         assert_texts_inside(fig, ax)

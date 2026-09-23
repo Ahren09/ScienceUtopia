@@ -1,10 +1,10 @@
-"""Paper figure: topic diversity (a, b) and the research-shift review gate (c) on one row.
+"""Paper figure: topic diversity (a, b) and the topical-departure review gate (c) on one row.
 
 Panels (a, b): ecosystem strategy composition causally controls topic diversity
     The composition-intervention many-world experiment: 10 common-seed paired
     sets (seeds 2001-2006, 2009, 2010, 2013, 2014), each simulated under three
     counterfactual within-institution strategy compositions -- explorer-dominant
-    (3 explorers / 1 exploiter / 1 cautious), exploiter-dominant (1/4/0), and
+    (3 explorers / 1 exploiter / 1 cautious explorer), exploiter-dominant (1/4/0), and
     cautious-dominant (1/1/3) -- with identical institutions, expertise, corpus,
     venues, funding rules, prompts, and seeds. 30 worlds of 100 institutions x
     500 researchers x 10 years; ONLY the composition differs within a set.
@@ -210,7 +210,7 @@ def draw_selection_gate(ax_l, run_prefix=RUN_PREFIX):
     ax_l.set_xticks(x)
     ax_l.set_xticklabels(BIN_LABELS)
     ax_l.set_xlim(-0.45, len(BIN_LABELS) - 0.55)
-    ax_l.set_xlabel('Research shift (distance from own recent work)')
+    ax_l.set_xlabel('Topical departure from own recent work')
 
     sns.despine(ax=ax_l, right=False)
     sns.despine(ax=ax_r, top=True, left=True, bottom=True, right=False)
@@ -229,7 +229,7 @@ def main():
                              gridspec_kw={'width_ratios': [1., 1., 1.3]})
     handles = draw_diversity(axes[:2])
     draw_selection_gate(axes[2], args.run_prefix)
-    axes[2].set_title('c  Acceptance and impact by research shift', pad=0)
+    axes[2].set_title('c  Acceptance and impact by topical departure', pad=0)
 
     fig.tight_layout(w_pad=1.6, rect=(0, 0, 1, 0.92))
     # The condition legend belongs to (a) and (b) only, so center it over those two panels
