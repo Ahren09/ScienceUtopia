@@ -16,6 +16,7 @@ from PIL import Image
 from openai import AzureOpenAI, OpenAI
 from const import IMPORTANT_NOTES
 from utopia.config import SIMULATION_CONFIG
+from utopia.models.structured_outputs import build_vllm_extra_body
 
 logger = logging.getLogger(__name__)
 
@@ -544,6 +545,8 @@ class VLLMServerModel(BaseLLM):
         # Run seed: when set, every request gets a deterministic per-request seed
         # derived from (run_seed, seed_ctx..., item_index, attempt).
         self.run_seed = run_seed
+        from utopia.models.request_audit import active_audit_for
+        self.request_audit = active_audit_for(model_name)
         # Cumulative call statistics for the run manifest and fallback-rate gates
         self.call_stats = {
             'n_prompts': 0,
@@ -575,14 +578,20 @@ class VLLMServerModel(BaseLLM):
         return derive_seed(self.run_seed, *(seed_ctx or ('noctx',)), idx, attempt)
         
     def _build_extra_body(self, response_format: Optional[Dict] = None) -> dict:
-        """Translate response_format to vLLM guided decoding extra_body"""
-        extra_body = {}
+        """Translate internal response_format to vLLM 0.12 structured outputs."""
+        schema = None
         if response_format and response_format.get('type') == 'json_schema':
             json_object = response_format.get('json_object', {})
             schema = json_object.get('schema')
-            if schema:
-                extra_body['guided_json'] = schema
-        return extra_body
+        return build_vllm_extra_body(schema, enable_thinking=self.enable_thinking)
+
+    def _create_completion(self, *, seed_ctx=None, item_index=0, attempt=0, **payload):
+        audit = self.request_audit
+        if audit is None:
+            return self.client.chat.completions.create(**payload)
+        return audit.create(
+            self.client.chat.completions.create, seed_ctx=seed_ctx,
+            item_index=item_index, attempt=attempt, **payload)
 
     def generate(
         self,
@@ -614,13 +623,12 @@ class VLLMServerModel(BaseLLM):
             messages.append({"role": "user", "content": prompt})
 
         extra_body = self._build_extra_body(response_format)
-        if self.enable_thinking:
-            extra_body['chat_template_kwargs'] = {"enable_thinking": True}
         request_seed = self._request_seed(seed_ctx, 0, 0)
         if request_seed is not None:
             extra_body['seed'] = request_seed
 
-        response = self.client.chat.completions.create(
+        response = self._create_completion(
+            seed_ctx=seed_ctx,
             model=self.model_name,
             messages=messages,
             temperature=temperature,
@@ -663,8 +671,6 @@ class VLLMServerModel(BaseLLM):
             return []
 
         base_extra_body = self._build_extra_body(response_format)
-        if self.enable_thinking:
-            base_extra_body['chat_template_kwargs'] = {"enable_thinking": True}
 
         max_retries = 3
 
@@ -687,7 +693,8 @@ class VLLMServerModel(BaseLLM):
                     request_seed = self._request_seed(seed_ctx, idx, attempt)
                     if request_seed is not None:
                         extra_body['seed'] = request_seed
-                    resp = self.client.chat.completions.create(
+                    resp = self._create_completion(
+                        seed_ctx=seed_ctx, item_index=idx, attempt=attempt,
                         model=self.model_name,
                         messages=msgs,
                         temperature=temperature,
