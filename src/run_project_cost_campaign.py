@@ -32,6 +32,8 @@ from run_james_ec2_queue import (
 from run_scale_expansion import STAGES, build_command, experiment_id_for
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 PROTOCOL = {
     "question": "Does k=2 versus k=1 change allocation and review workload when direct production "
                 "and resubmission fees are both zero?",
