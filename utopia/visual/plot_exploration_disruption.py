@@ -11,9 +11,10 @@ Experiment
     worlds as panel (c) of fig_topic_diversity_selection_gate. Another run
     family can be selected with --run_prefix.
 
-Main figure (single subplot, fig_exploration_disruption)
+Main figure (single subplot, fig_exploration_disruption; the same draw() also
+renders panel (d) of fig_topic_diversity_selection_gate)
     x: topical departure of the paper, in the same five equal-width bins as the
-       selection-gate figure. Topical departure = 1 - cosine(e_paper, c_author),
+       selection-gate figure (ticks at the bin edges). Topical departure = 1 - cosine(e_paper, c_author),
        the embedding distance between the paper's abstract and the author's
        career centroid (the novelty_score column, utopia/metrics/embedding_tracker.py).
     y: share of disruptive papers, i.e. papers with CD > 0 at paper age three.
@@ -62,7 +63,8 @@ import seaborn as sns
 
 from utopia.analysis.exploration_cross_seed import discover_runs, load_table, validate_runs
 from utopia.utils.visual_utils import GRID, INK, MUTED, STRATEGY_NICE, STRATEGY_PALETTE, nature_style
-from utopia.visual.plot_topic_diversity_selection_gate import BIN_LABELS, BINS, RUN_PREFIX, wilson_ci
+from utopia.visual.plot_topic_diversity_selection_gate import (BIN_LABELS, BINS, EDGE_LABELS, EDGE_TICKS,
+                                                               RUN_PREFIX, wilson_ci)
 
 DODGE = {'explorer': -0.1, 'cautious_explorer': 0.0, 'exploiter': 0.1}  # keeps whiskers apart
 XLABEL = 'Topical departure from own recent work'
@@ -120,8 +122,12 @@ def uptake_table(papers):
     return table.reset_index()
 
 
-def draw(ax, table):
-    """Pooled line in the background, then one line per strategy with CIs and sized markers."""
+def draw(ax, table, legend=True):
+    """Pooled line in the background, then one line per strategy with CIs and sized markers.
+
+    Returns the strategy legend handles. legend=False leaves them to the caller
+    (the combined figure draws one legend for its whole row).
+    """
     table = table.assign(x=table.shift_bin.cat.codes + table.strategy.map(DODGE).fillna(0))
     pooled = table[table.strategy == 'all']
     ax.plot(pooled.x, pooled.disruptive_pct, color=MUTED, lw=3.2, alpha=0.25,
@@ -140,21 +146,23 @@ def draw(ax, table):
         ax.scatter(sub.x, sub.disruptive_pct, s=area(sub.n_papers), color=STRATEGY_PALETTE[strategy],
                    edgecolor='white', linewidth=0.4, zorder=3)
 
-    # add_artist clips to the axes, so it holds the in-axes size key and the strategy row
-    # above the axes stays the regular legend
     size_key = [ax.scatter([], [], s=area(n), color=MUTED, edgecolor='white', linewidth=0.4,
                            label=f'{n:,}') for n in (100, 1000)]
-    ax.add_artist(ax.legend(handles=size_key, title='Papers', loc='lower right', frameon=False,
-                            ncol=2, title_fontsize=6, handletextpad=0.2, columnspacing=0.8))
+    size_legend = ax.legend(handles=size_key, title='Papers', loc='lower right', frameon=False,
+                            title_fontsize=6, handletextpad=0.2, labelspacing=0.3)
     handles = [plt.Line2D([], [], color=STRATEGY_PALETTE[s], lw=1.1, marker='o', ms=3.5,
                           markeredgecolor='white', markeredgewidth=0.4, label=STRATEGY_NICE[s])
                for s in DODGE]
     handles.append(plt.Line2D([], [], color=MUTED, lw=3.2, alpha=0.25, label='All papers'))
-    ax.legend(handles=handles, loc='lower center', bbox_to_anchor=(0.5, 1.0), ncol=4,
-              frameon=False, handlelength=1.5, handletextpad=0.4, columnspacing=1.0)
+    if legend:
+        # add_artist keeps the in-axes size key once the strategy row above the axes
+        # becomes the regular legend
+        ax.add_artist(size_legend)
+        ax.legend(handles=handles, loc='lower center', bbox_to_anchor=(0.5, 1.0), ncol=4,
+                  frameon=False, handlelength=1.5, handletextpad=0.4, columnspacing=1.0)
 
-    ax.set_xticks(range(len(BIN_LABELS)), BIN_LABELS)
-    ax.set_xlim(-0.4, len(BIN_LABELS) - 0.6)
+    ax.set_xticks(EDGE_TICKS, EDGE_LABELS)
+    ax.set_xlim(-0.5, len(BIN_LABELS) - 0.5)
     ax.set_ylim(-3, 72)
     ax.set_yticks([0, 20, 40, 60])
     ax.set_xlabel(XLABEL)
@@ -162,6 +170,7 @@ def draw(ax, table):
     ax.grid(axis='y', color=GRID, lw=0.5)
     ax.set_axisbelow(True)
     sns.despine(ax=ax)
+    return handles
 
 
 def draw_uptake(axes, papers, table):

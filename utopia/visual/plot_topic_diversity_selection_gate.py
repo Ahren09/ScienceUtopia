@@ -1,4 +1,9 @@
-"""Paper figure: topic diversity (a, b) and the topical-departure review gate (c) on one row.
+"""Paper figure: topic diversity (a, b), the topical-departure review gate (c), and
+disruption by strategy (d) on one 1x4 row.
+
+One shared legend above the row: colors mark the dominant strategy of each world in
+(a, b) and the author's strategy in (d). Panel (c) pools all papers and uses its own
+teal / violet pair so it is not read as a strategy.
 
 Panels (a, b): ecosystem strategy composition causally controls topic diversity
     The composition-intervention many-world experiment: 10 common-seed paired
@@ -33,25 +38,30 @@ Panel (c): the novelty penalty operates at the review gate, not at impact
     preceding three simulated years (before the first paper, the mean embedding
     of the author's initial expertise directions). Novelty runs from ~0
     (continuation of the author's own recent work) to ~1 (unrelated to it).
-    Papers are binned into five equal-width novelty bins.
-    Dual y-axes with color-matched axes. LEFT axis (coral): acceptance rate per
-    submission with Wilson 95% CIs -- falls monotonically 48.0% -> 21.8%.
-    RIGHT axis (navy): mean citations by paper age 3 AMONG ACCEPTED papers with
-    bootstrap 95% CIs -- rises 0.95 -> 1.98. The endpoint value of each series
-    is printed next to its marker; the full per-bin table is printed to stdout.
+    Papers are binned into five equal-width novelty bins (x ticks at the bin edges).
+    Dual y-axes with color-matched axes, 95% CIs drawn as soft ribbons. LEFT axis
+    (teal): acceptance rate per submission with Wilson 95% CIs -- falls
+    monotonically 48.0% -> 21.8%. RIGHT axis (violet): mean citations by paper
+    age 3 AMONG ACCEPTED papers with bootstrap 95% CIs -- rises 0.95 -> 1.98.
+    The endpoint value of each series is printed next to its marker; the full
+    per-bin table is printed to stdout.
     Acceptance rate is over submission attempts (resubmissions count as
     separate attempts); age-3 citations = citation-graph in-degree by the end
     of the 3rd simulated year post-publication (papers published by year 7
     only, so every paper has a complete window; the paper_age table holds
     accepted papers only).
 
+Panel (d): share of disruptive papers (CD > 0 at age 3) per strategy in the same
+    worlds and bins, drawn by utopia.visual.plot_exploration_disruption.draw
+    (see that module for the CD index and the marker-size key).
+
 Data provenance (read-only inputs)
     (a, b) outputs/docs/explore_manyworld_qwen3_32b_neutral_i100_n500_y10_seed<S>_mix<M>/
                ecosystem_year.parquet (year, topic_entropy_normalized) for
                S in {2001-2006, 2009, 2010, 2013, 2014}, M in {311, 140, 113}.
-    (c)    outputs/docs/<run_prefix>_seed<S>/
+    (c, d) outputs/docs/<run_prefix>_seed<S>/
                paper.parquet      (paper_id, accepted, review_score, novelty_score)
-               paper_age.parquet  (paper_id, age, citations, novelty_score)
+               paper_age.parquet  (paper_id, age, citations, cd, novelty_score)
 
 Run
     python -m utopia.visual.plot_topic_diversity_selection_gate
@@ -66,8 +76,7 @@ import pandas as pd
 import seaborn as sns
 
 from utopia.analysis.exploration_cross_seed import discover_runs, validate_runs, load_table
-from utopia.utils.visual_utils import (nature_style, INK, MUTED, STRATEGY_PALETTE,
-                                       ACCENT_WARM, ACCENT_COOL)
+from utopia.utils.visual_utils import nature_style, INK, MUTED, STRATEGY_PALETTE
 
 # Panels (a, b): composition-intervention worlds
 SETS = [2001, 2002, 2003, 2004, 2005, 2006, 2009, 2010, 2013, 2014]
@@ -81,8 +90,13 @@ ORDER = ['Exploiter-dominant', 'Explorer-dominant', 'Cautious-dominant']
 RUN_PREFIX = 'explore_confirmatory_qwen3_32b_neutral_i1000_n5000_y10'
 BINS = [0, .2, .4, .6, .8, 1.01]
 BIN_LABELS = ['0-0.2', '0.2-0.4', '0.4-0.6', '0.6-0.8', '0.8-1']
-ACCENT = ACCENT_WARM  # warm coral: acceptance (left axis)
-TEAL = ACCENT_COOL    # deep navy: conditional impact (right axis)
+# Bin i is drawn at x = i, so its edges (the tick positions) sit at i -/+ 0.5
+EDGE_TICKS = [i - 0.5 for i in range(len(BINS))]
+EDGE_LABELS = ['0', '0.2', '0.4', '0.6', '0.8', '1']
+XLABEL = 'Topical departure\nfrom own recent work'
+# Teal / violet, hues kept apart from the strategy colors of panels (a, b, d)
+ACCEPT_COLOR = '#00A087'  # acceptance (left axis)
+IMPACT_COLOR = '#7E4FA5'  # conditional impact (right axis)
 
 
 def load_diversity():
@@ -113,7 +127,7 @@ def boot_ci(values, n_boot=2000, seed=0):
 
 
 def draw_diversity(axes):
-    """Draw panels (a) and (b) on two axes; returns the condition legend handles."""
+    """Draw panels (a) and (b) on two axes."""
     df = load_diversity()
     auc = (df.sort_values('year').groupby(['seed', 'condition'])['entropy']
            .apply(lambda s: np.trapezoid(s.dropna())).reset_index(name='auc'))
@@ -142,19 +156,19 @@ def draw_diversity(axes):
     contrast = float((auc[auc.condition == 'Cautious-dominant'].set_index('seed')['auc']
                       - (auc[auc.condition == 'Explorer-dominant'].set_index('seed')['auc']
                          + auc[auc.condition == 'Exploiter-dominant'].set_index('seed')['auc']) / 2).mean())
-    axes[1].text(0.03, 0.42, f'planned contrast:\n+{contrast:.2f} AUC\n(10/10 sets)',
-                 transform=axes[1].transAxes, fontsize=5.2, color=INK, va='top')
+    # lower right stays clear of the within-seed connectors
+    axes[1].text(0.97, 0.04, f'planned contrast:\n+{contrast:.2f} AUC\n(10/10 sets)',
+                 transform=axes[1].transAxes, fontsize=6, color=INK, ha='right', va='bottom')
     axes[1].set_title('b  Paired entropy AUC', pad=0)
     axes[1].set_xlabel('Researcher Type')
     axes[1].set_ylabel('Entropy AUC')
-    # short tick names: the full condition names live in the figure-level legend
+    # short tick names: the colors are keyed in the figure-level legend
     axes[1].set_xticks(list(xpos.values()))
     axes[1].set_xticklabels([c.split('-')[0] for c in ORDER])
-    axes[1].tick_params(axis='x', labelsize=5.2)
+    axes[1].set_xlim(-0.35, len(ORDER) - 0.65)
 
     for ax in axes:
         sns.despine(ax=ax)
-    return [plt.Line2D([], [], color=PALETTE[c], lw=1.4, label=c) for c in ORDER]
 
 
 def draw_selection_gate(ax_l, run_prefix=RUN_PREFIX):
@@ -185,32 +199,34 @@ def draw_selection_gate(ax_l, run_prefix=RUN_PREFIX):
     ax_r = ax_l.twinx()
     x = np.arange(len(BIN_LABELS))
 
-    ax_l.errorbar(x - 0.06, rate, yerr=[rate - lo, hi - rate], fmt='o-', color=ACCENT,
-                  ms=3, lw=1.2, capsize=1.5, elinewidth=0.7, zorder=3)
-    ax_r.errorbar(x + 0.06, means, yerr=[means - cis[:, 0], cis[:, 1] - means],
-                  fmt='s--', color=TEAL, ms=2.8, lw=1.1, capsize=1.5, elinewidth=0.7, zorder=3)
+    # 95% CIs as soft ribbons under solid lines with white-edged markers
+    for ax, y, low, high, color, marker in [(ax_l, rate, lo, hi, ACCEPT_COLOR, 'o'),
+                                           (ax_r, means, cis[:, 0], cis[:, 1], IMPACT_COLOR, 's')]:
+        ax.fill_between(x, low, high, color=color, alpha=0.18, lw=0, zorder=1)
+        ax.plot(x, y, color=color, lw=1.4, marker=marker, ms=3.6,
+                markeredgecolor='white', markeredgewidth=0.5, zorder=3)
 
     # Endpoint values beside their markers (the numbers quoted in the caption)
-    lab = dict(textcoords='offset points', ha='center', fontsize=5.5)
-    ax_l.annotate(f'{rate[0]:.1f}%', (x[0] - 0.06, hi[0]), xytext=(0, 3), va='bottom', color=ACCENT, **lab)
-    ax_l.annotate(f'{rate[-1]:.1f}%', (x[-1] - 0.06, lo[-1]), xytext=(0, -3), va='top', color=ACCENT, **lab)
-    ax_r.annotate(f'{means[0]:.2f}', (x[0] + 0.06, cis[0, 0]), xytext=(0, -3), va='top', color=TEAL, **lab)
-    ax_r.annotate(f'{means[-1]:.2f}', (x[-1] + 0.06, cis[-1, 1]), xytext=(0, 3), va='bottom', color=TEAL, **lab)
+    # (first-bin labels extend right, last-bin labels extend left, so both stay inside the spines)
+    lab = dict(textcoords='offset points', fontsize=6)
+    ax_l.annotate(f'{rate[0]:.1f}%', (x[0], hi[0]), xytext=(-4, 3), ha='left', va='bottom', color=ACCEPT_COLOR, **lab)
+    ax_l.annotate(f'{rate[-1]:.1f}%', (x[-1], lo[-1]), xytext=(4, -3), ha='right', va='top', color=ACCEPT_COLOR, **lab)
+    ax_r.annotate(f'{means[0]:.2f}', (x[0], cis[0, 0]), xytext=(-4, -3), ha='left', va='top', color=IMPACT_COLOR, **lab)
+    ax_r.annotate(f'{means[-1]:.2f}', (x[-1], cis[-1, 1]), xytext=(4, 3), ha='right', va='bottom', color=IMPACT_COLOR, **lab)
 
     # Color-matched axes so each curve maps unambiguously
-    ax_l.set_ylabel('Acceptance rate (%)', color=ACCENT)
-    ax_l.tick_params(axis='y', colors=ACCENT)
+    ax_l.set_ylabel('Acceptance rate (%)', color=ACCEPT_COLOR)
+    ax_l.tick_params(axis='y', colors=ACCEPT_COLOR)
     ax_l.set_ylim(15, 57)
-    ax_l.spines['left'].set_color(ACCENT)
-    ax_r.set_ylabel('Mean citations by age 3', color=TEAL)
-    ax_r.tick_params(axis='y', colors=TEAL)
+    ax_l.spines['left'].set_color(ACCEPT_COLOR)
+    ax_r.set_ylabel('Mean citations by age 3', color=IMPACT_COLOR)
+    ax_r.tick_params(axis='y', colors=IMPACT_COLOR)
     ax_r.set_ylim(0.6, 2.4)
-    ax_r.spines['right'].set_color(TEAL)
+    ax_r.spines['right'].set_color(IMPACT_COLOR)
 
-    ax_l.set_xticks(x)
-    ax_l.set_xticklabels(BIN_LABELS)
-    ax_l.set_xlim(-0.45, len(BIN_LABELS) - 0.55)
-    ax_l.set_xlabel('Topical departure from own recent work')
+    ax_l.set_xticks(EDGE_TICKS, EDGE_LABELS)
+    ax_l.set_xlim(-0.5, len(BIN_LABELS) - 0.5)
+    ax_l.set_xlabel(XLABEL)
 
     sns.despine(ax=ax_l, right=False)
     sns.despine(ax=ax_r, top=True, left=True, bottom=True, right=False)
@@ -223,20 +239,23 @@ def main():
                     'Paper_ScienceUtopia/figures/fig_topic_diversity_selection_gate.pdf')
     ap.add_argument('--run_prefix', default=RUN_PREFIX)
     args = ap.parse_args()
+    # Imported here because plot_exploration_disruption imports this module's bins
+    from utopia.visual.plot_exploration_disruption import disruption_table, draw, load_papers
 
     nature_style()
-    fig, axes = plt.subplots(1, 3, figsize=(7.0, 1.9), dpi=300,
-                             gridspec_kw={'width_ratios': [1., 1., 1.3]})
-    handles = draw_diversity(axes[:2])
+    # Constrained layout sizes each gap to its own labels (c's right axis needs the widest one)
+    fig, axes = plt.subplots(1, 4, figsize=(6.75, 2.05), dpi=300, layout='constrained',
+                             gridspec_kw={'width_ratios': [0.85, 1.0, 1.05, 1.05]})
+    draw_diversity(axes[:2])
     draw_selection_gate(axes[2], args.run_prefix)
-    axes[2].set_title('c  Acceptance and impact by topical departure', pad=0)
+    axes[2].set_title('c  Acceptance and impact', pad=0)
+    handles = draw(axes[3], disruption_table(load_papers(args.run_prefix)[0]), legend=False)
+    axes[3].set_xlabel(XLABEL)
+    axes[3].set_title('d  Disruption by strategy', pad=0)
 
-    fig.tight_layout(w_pad=1.6, rect=(0, 0, 1, 0.92))
-    # The condition legend belongs to (a) and (b) only, so center it over those two panels
-    center = (axes[0].get_position().x0 + axes[1].get_position().x1) / 2
-    fig.legend(handles=handles, loc='lower center', ncol=3, frameon=False,
-               bbox_to_anchor=(center, 0.905), columnspacing=1.2,
-               handlelength=1.4, handletextpad=0.4)
+    # One legend for the row: strategy colors are shared by (a, b, d)
+    fig.legend(handles=handles, loc='outside upper center', ncol=4, frameon=False,
+               columnspacing=1.2, handlelength=1.5, handletextpad=0.4)
     fig.savefig(args.out, bbox_inches='tight')
     print(f'wrote {args.out}')
 
