@@ -179,3 +179,18 @@ def test_wrong_child_python_rejected_before_source_or_gpu_inspection():
         with pytest.raises(RuntimeError, match="interpreter"):
             campaign.runtime_check({"python": "/different/environment/python"})
         source.assert_not_called()
+
+
+def test_cpu_training_controller_still_reserves_its_gpu(tmp_path):
+    for pid, args in ((11, ["python", "-m", "src.unified.run_plan", "--gpu", "3"]),
+                      (12, ["python", "ordinary_cpu_script.py"])):
+        directory = tmp_path / str(pid)
+        directory.mkdir()
+        (directory / "cmdline").write_bytes(b"\0".join(arg.encode() for arg in args))
+    assert campaign.pending_training_gpus(tmp_path) == {3}
+    with (patch.object(campaign, "pending_training_gpus", return_value={3}),
+          patch.object(campaign, "query_gpus",
+                       return_value=[SimpleNamespace(index=3), SimpleNamespace(index=4)])):
+        assert [gpu.index for gpu in campaign.available_gpus()] == [4]
+    (tmp_path / "11/cmdline").write_bytes(b"python\0-m\0src.unified.run_plan\0--gpu\0unknown")
+    assert campaign.pending_training_gpus(tmp_path) == set(range(8))

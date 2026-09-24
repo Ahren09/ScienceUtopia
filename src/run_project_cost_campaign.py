@@ -167,6 +167,38 @@ def server_command(plan, port):
     ]
 
 
+def pending_training_gpus(proc_root=Path("/proc")):
+    """Respect EC2's existing DLM jobs during CPU preparation between GPU phases.
+
+    Those controllers explicitly carry ``--gpu N`` before allocating CUDA.
+    Zero memory at that moment does not mean the device is available to us.
+    """
+    claimed = set()
+    for process in proc_root.iterdir():
+        if not process.name.isdigit():
+            continue
+        try:
+            parts = (process / "cmdline").read_bytes().split(b"\0")
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            continue
+        if b"src.unified.run_plan" not in parts:
+            continue
+        try:
+            device = int(parts[parts.index(b"--gpu") + 1])
+            require(0 <= device < 8, "Unknown training GPU assignment")
+            claimed.add(device)
+        except (ValueError, IndexError, RuntimeError):
+            # An active recognized controller with an unknown assignment may
+            # claim any GPU. Do not guess from its current CUDA memory usage.
+            claimed.update(range(8))
+    return claimed
+
+
+def available_gpus():
+    claimed = pending_training_gpus()
+    return [gpu for gpu in query_gpus() if gpu.index not in claimed]
+
+
 class Campaign:
     def __init__(self, plan, plan_path):
         self.plan, self.path = plan, plan_path
@@ -248,8 +280,8 @@ class Campaign:
                   "plan_sha256": self.state["plan_sha256"], "launch_command": command}
         atomic_write(reservation_path(self.lock_root, gpu.uuid), json_bytes(intent))
         self.save()
-        fresh = {item.uuid: item for item in query_gpus()}
-        require(fresh[gpu.uuid].idle, "GPU became busy before launch")
+        fresh = {item.uuid: item for item in available_gpus()}
+        require(gpu.uuid in fresh and fresh[gpu.uuid].idle, "GPU became busy or claimed before launch")
         process, identity = self.spawn(command, self.environment(str(gpu.index)),
                                        self.directory / f"server-gpu{gpu.index}-{port}.log")
         server["process"] = process
@@ -407,7 +439,8 @@ class Campaign:
                             self.start_job(server, queue.pop(0))
                     desired = min(8, len(queue) + sum(s["client"] is not None for s in self.servers))
                     if len(self.servers) < desired:
-                        reserved = reserve_pair(query_gpus(), self.lock_root, device_count=1)
+                        reserved = reserve_pair(available_gpus(), self.lock_root,
+                                                query=available_gpus, device_count=1)
                         if reserved:
                             self.start_server(reserved)
                     self.state["status"] = "running" if any(s["client"] for s in self.servers) else "waiting_for_idle_gpu_or_server"
