@@ -125,6 +125,8 @@ class MultiAgentEcosystem:
                 'project_end_year': agent.project_end_year,
                 'newest_direction': newest_direction,
             }
+            if getattr(agent, 'production_cost_entries', None):
+                agent_dict['production_cost_entries'] = agent.production_cost_entries
 
             if isinstance(agent, UniversityResearcher):
                 agent_dict['university_name'] = agent.university_name
@@ -310,6 +312,7 @@ class MultiAgentEcosystem:
             else:
                 continue
 
+            agent.production_cost_entries = agent_data.get('production_cost_entries', {})
             ecosystem.add_agent(agent)
 
         return ecosystem
@@ -331,18 +334,31 @@ class SimulationAgent:
         self.newest_direction = None
         self.max_retries = max_retries
 
-    def update_resources(self, delta: float):
-        """Update researcher resources"""
+    def update_resources(self, delta: float, *, category=None, year=None, project=None,
+                         paper=None, program=None, reason=None):
+        """Native clipping/deactivation, with optional classified audit events.
+
+        Unclassified changes fail before mutation when a ledger is attached.
+        Replaying an identical event returns False and does not mutate resources.
+        """
         assert isinstance(delta, (int, float)), "changes in funding level must be a valid number"
+        ledger = getattr(self, 'resource_ledger', None)
+        if ledger is not None:
+            event = ledger.prepare(self, delta, category=category, year=year, project=project,
+                                   paper=paper, program=program, reason=reason)
+            if event is None:
+                return False
         original_resources = self.resources
         if self.resources + delta < 0:
             logger.warning(f"[Resource] {self.id} runs out of funding - {original_resources} -> {self.resources} is negative.")
             self.resources = 0
             self.is_active = False
-            return
-        
-        self.resources += delta
-        logger.debug(f"[Resource] {self.id} - {original_resources} -> {self.resources}")
+        else:
+            self.resources += delta
+            logger.debug(f"[Resource] {self.id} - {original_resources} -> {self.resources}")
+        if ledger is not None:
+            ledger.record(self, event)
+            return True
 
     def add_conflict_of_interest(self, other_researcher_names: Union[Set[str], List[str], str]):
         """Add conflict of interest with other researchers"""
@@ -427,6 +443,7 @@ Respond in JSON format. An example response is below (DO NOT directly copy the e
                 'schema': RoundIntention.model_json_schema()
             },
         }
+        prompt += self._production_resource_statement(year)
         return prompt, response_format
     
     def get_review_prompt(self, paper: Dict, author_info: Dict = None,
@@ -590,12 +607,17 @@ Provide a comprehensive review with:
         })
 
     def get_resubmission_prompt(self, rejected_papers: Dict[str, Dict], conferences: List[Conference],
-                                resubmission_cost: int = SIMULATION_CONFIG['conference']['resubmission_cost']) -> Tuple[str, Dict]:
+                                resubmission_cost: float = None) -> Tuple[str, Dict]:
         """Build prompt for resubmission decision WITHOUT calling LLM.
 
         Returns:
             Tuple of (prompt_str, response_format)
         """
+        if resubmission_cost is None:
+            resubmission_cost = SIMULATION_CONFIG['conference']['resubmission_cost']
+        # Preserve the historical integer-formatted prompt for the default fee.
+        if float(resubmission_cost).is_integer():
+            resubmission_cost = int(resubmission_cost)
         papers_info = []
         for idx, (arxiv_id, p) in enumerate(rejected_papers.items()):
             paper_info = f"""### Paper {idx}
@@ -674,13 +696,15 @@ If you choose not to resubmit, respond with a json file that contains an empty l
         return prompt, response_format
 
     def decide_resubmission(self, rejected_papers: Dict[str, Dict], conferences: List[Conference],
-                            resubmission_cost: int = SIMULATION_CONFIG['conference']['resubmission_cost']) -> List[str]:
-        """Decide which rejected papers to resubmit (costs 5 each)
+                            resubmission_cost: float = None) -> List[str]:
+        """Decide which rejected papers to resubmit at the resolved fee.
 
         Returns:
             List of paper IDs to resubmit
         """
-        if self.resources < 5 or not rejected_papers:
+        if resubmission_cost is None:
+            resubmission_cost = SIMULATION_CONFIG['conference']['resubmission_cost']
+        if self.resources < resubmission_cost or not rejected_papers:
             return []
 
         prompt, response_format = self.get_resubmission_prompt(rejected_papers, conferences, resubmission_cost)
@@ -702,6 +726,21 @@ If you choose not to resubmit, respond with a json file that contains an empty l
         return prompt
 
     # Helper methods (private)
+
+    def _production_resource_statement(self, year):
+        """Only opt-in projects change prompts. Balance is already net of the fee."""
+        if getattr(self, 'production_cost_mode', 'per_paper') != 'per_project':
+            return ''
+        from src.project_cost_accounting import project_id
+        entry = getattr(self, 'production_cost_entries', {}).get(project_id(self))
+        if not entry or not entry['admitted'] or entry['year'] != year:
+            raise ValueError(f"Production prompt without a paid project: {self.id}/{year}")
+        return (f"\nA fixed production fee of {entry['fee']:g} units has already been paid "
+                f"for this completed project. Your remaining funding is {self.resources:g}. "
+                "Selecting any number of outputs from this project costs no additional funding. "
+                "The fee is not refunded for fewer outputs or no outputs. "
+                "Do not withhold an additional output because of its production cost. "
+                "Annual research costs remain unchanged.\n")
 
     def _record_authoring_experience(self, idea: Dict, paper_output: Dict, year: int):
         """Record paper authoring experience"""
@@ -744,6 +783,7 @@ If you choose not to resubmit, respond with a json file that contains an empty l
         """
         assert max_submissions >= 1, max_submissions
         use_list = max_submissions > 1 or force_list
+        production_statement = self._production_resource_statement(year)
         prompt = self._get_personality_prompt(include_exploration_strategy=True, include_funding_situation=True) + f"""
         
 ## Your Research Direction in This Round
@@ -863,6 +903,11 @@ If you choose not to submit anything (only due to funding issues), respond with 
                     'schema': PaperSubmissionList.model_json_schema()
                 },
             }
+            if production_statement:
+                prompt = prompt.replace("funding issues or competition being too fierce",
+                                        "competition being too fierce")
+                prompt = prompt.replace("only due to funding issues", "due to competition being too fierce")
+                prompt += production_statement
             return prompt, response_format
 
         prompt += """
@@ -910,6 +955,12 @@ If you choose not to submit (only due to funding issues), explain using factors 
                 'schema': PaperSubmission.model_json_schema()
             },
         }
+        if production_statement:
+            prompt = prompt.replace("funding issues or competition being too fierce",
+                                    "competition being too fierce")
+            prompt = prompt.replace("only due to funding issues", "due to competition being too fierce")
+            prompt = prompt.replace("factors such as funding, competition, etc.", "competition")
+            prompt += production_statement
         return prompt, response_format
 
     def get_citation_prompt(self, paper: Dict, direction: ResearchDirection, candidate_papers: List[Dict], max_papers: int = 10, citing_institution: str = None) -> Tuple[str, Dict]:

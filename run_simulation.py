@@ -275,6 +275,7 @@ def charge_application_costs(university_applications: List[Dict], app_cost: int,
     Mutates `university_applications` in place (withdrawn apps removed) and
     returns per-application financial event records.
     """
+    from src.project_cost_accounting import apply_resource_change, stable_id
     events = []
     if app_cost <= 0:
         return events
@@ -285,7 +286,17 @@ def charge_application_costs(university_applications: List[Dict], app_cost: int,
                 continue
             agent = app_data['author']
             pre_balance = agent.resources
-            if pre_balance < app_cost:
+            ledger = getattr(agent, 'resource_ledger', None)
+            prior = (ledger.event(stable_id(year, agent.id, 'funding_application_cost',
+                                            None, None, program_id, None))
+                     if ledger is not None else None)
+            if prior is not None:
+                pre_balance = prior['balance_before']
+            if prior is None and pre_balance < app_cost:
+                if getattr(agent, 'resource_ledger', None) is not None:
+                    apply_resource_change(
+                        agent, 0, category='funding_application_cost', year=year,
+                        program=program_id, reason='withdrawn_unaffordable')
                 del apps_dict[program_id]
                 events.append({
                     'year': year, 'applicant_id': agent.id,
@@ -294,12 +305,13 @@ def charge_application_costs(university_applications: List[Dict], app_cost: int,
                     'withdrawn_unaffordable': True,
                 })
                 continue
-            agent.update_resources(delta=-app_cost)
+            apply_resource_change(agent, -app_cost, category='funding_application_cost',
+                                  year=year, program=program_id)
             events.append({
                 'year': year, 'applicant_id': agent.id,
                 'program_id': program_id, 'pre_balance': pre_balance,
                 'cost_charged': app_cost,
-                'post_cost_balance': agent.resources,
+                'post_cost_balance': prior['balance_after'] if prior is not None else agent.resources,
                 'withdrawn_unaffordable': False,
             })
     return events
@@ -360,6 +372,9 @@ class Simulation:
         # ---- Scale-expansion design factors (all default = legacy behaviour) ----
         _a = args if args is not None else argparse_namespace_placeholder()
         self.papers_per_project = int(getattr(_a, 'papers_per_project', 1) or 1)
+        from src.project_cost_accounting import resolve_cost_policy, ResourceLedger
+        self.cost_policy = resolve_cost_policy(_a, SIMULATION_CONFIG)
+        self.resource_ledger = ResourceLedger() if self.cost_policy['log_resource_ledger'] else None
         self.funding_budget_mode = getattr(_a, 'funding_budget_mode', 'track') or 'track'
         self.funding_budget_slots_frac = getattr(_a, 'funding_budget_slots_frac', None)
         self.reviewer_capacity = getattr(_a, 'reviewer_capacity', None)
@@ -1757,6 +1772,54 @@ class Simulation:
                     f"(population={len(self.ecosystem.agent_population)})")
         return entrant_ids
 
+    def _account_resources(self, agent, delta, *, category, year, project=None,
+                           paper=None, program=None, reason=None):
+        from src.project_cost_accounting import apply_resource_change
+        return apply_resource_change(
+            agent, delta, category=category, year=year, project=project,
+            paper=paper, program=program, reason=reason)
+
+    def _resubmission_fee(self):
+        override = getattr(self.args, 'resubmission_cost', None)
+        return SIMULATION_CONFIG['conference']['resubmission_cost'] if override is None else override
+
+    def _prepare_project_production(self, year, active_authors):
+        """Completed lead projects pay before any selection, including failed selection."""
+        from src.project_cost_accounting import enter_project_production
+        policy = getattr(self, 'cost_policy', None)
+        if policy is None or policy['production_cost_mode'] == 'per_paper':
+            return active_authors
+        admitted = []
+        for agent in active_authors:
+            agent.production_cost_mode = policy['production_cost_mode']
+            if enter_project_production(agent, year, policy, self.funding_tracker):
+                admitted.append(agent)
+        return admitted
+
+    def _record_output_cost(self, agent, paper_dict, year):
+        """The native baseline debits no per-paper fee. Link each output to its project."""
+        from src.project_cost_accounting import project_id, cost_policy_enabled
+        policy = getattr(self, 'cost_policy', None)
+        if policy is None or not cost_policy_enabled(policy):
+            return
+        pid = project_id(agent)
+        paper_dict['project_id'] = pid
+        if getattr(agent, 'resource_ledger', None) is not None:
+            self._account_resources(agent, 0, category='production_submission_cost',
+                                    year=year, project=pid, paper=paper_dict['id'],
+                                    reason='output_included')
+
+    def _charge_resubmission(self, agent, paper_dict, year):
+        from src.project_cost_accounting import stable_id
+        pid = paper_dict.get('project_id')
+        if pid is None and all(k in paper_dict for k in ('project_start_year', 'project_end_year')):
+            pid = stable_id('project', self._get_lead_author_id(paper_dict),
+                            paper_dict['project_start_year'], paper_dict['project_end_year'])
+        fee = self._resubmission_fee()
+        if self._account_resources(agent, -fee, category='resubmission_cost', year=year,
+                                   project=pid, paper=paper_dict['id']):
+            self.funding_tracker.record_funding_consumption(year, fee, agent.get_type())
+
     def _setup_year(self, year: int) -> Dict:
         """Setup year: (influx2x2) inject junior cohort, log start, reset funding
         tracker, reset conferences
@@ -1774,6 +1837,8 @@ class Simulation:
         # resources count in the year's opening total and they participate in
         # every phase of their entry year (no-op when the flag is off).
         influx_entrants = self._apply_annual_influx(year)
+        if getattr(self, 'resource_ledger', None) is not None:
+            self.resource_ledger.start_year(year, self.ecosystem.agent_population)
 
         # Reset all fundings to 0 at start of cycle
         total_funding = self.funding_tracker.start_cycle(year, self.ecosystem.agent_population)
@@ -1827,10 +1892,11 @@ class Simulation:
                     continue
 
                 rejected_papers = {paper.id: paper.to_dict() for paper in papers if paper.status == 'reject'}
-                if agent.resources < 5 or not rejected_papers:
+                if agent.resources < self._resubmission_fee() or not rejected_papers:
                     continue
 
-                prompt, response_format = agent.get_resubmission_prompt(rejected_papers, self.conference_system.conferences)
+                prompt, response_format = agent.get_resubmission_prompt(
+                    rejected_papers, self.conference_system.conferences, self._resubmission_fee())
                 batch_prompts.append(prompt)
                 batch_metadata.append({
                     'agent': agent,
@@ -1889,9 +1955,7 @@ class Simulation:
 
                             resubmissions_list.append(paper_dict)
                             self.paper_tracker.add_or_update_paper(paper_dict)
-                            resubmission_cost = SIMULATION_CONFIG['conference']['resubmission_cost']
-                            agent.update_resources(-resubmission_cost)
-                            self.funding_tracker.record_funding_consumption(year, resubmission_cost, agent.get_type())
+                            self._charge_resubmission(agent, paper_dict, year)
                             resubmissions_paper_ids.add(arxiv_id)
                         else:
                             logger.error(f"[Resubmission] Paper {arxiv_id} already resubmitted for year {year}")
@@ -1914,10 +1978,11 @@ class Simulation:
                     agent = retry_info['agent']
                     remaining_rejected = retry_info['rejected_papers']
 
-                    if agent.resources < 5 or not remaining_rejected:
+                    if agent.resources < self._resubmission_fee() or not remaining_rejected:
                         continue
 
-                    prompt, response_format = agent.get_resubmission_prompt(remaining_rejected, self.conference_system.conferences)
+                    prompt, response_format = agent.get_resubmission_prompt(
+                        remaining_rejected, self.conference_system.conferences, self._resubmission_fee())
                     batch_prompts.append(prompt)
                     batch_metadata.append({
                         'agent': agent,
@@ -1942,7 +2007,8 @@ class Simulation:
                 if not rejected_papers:
                     continue
 
-                resubmissions_of_author = agent.decide_resubmission(rejected_papers, self.conference_system.conferences)
+                resubmissions_of_author = agent.decide_resubmission(
+                    rejected_papers, self.conference_system.conferences, self._resubmission_fee())
 
                 for metadata in resubmissions_of_author:
                     if metadata['arxiv_id'] not in resubmissions_paper_ids:
@@ -1959,9 +2025,7 @@ class Simulation:
 
                         resubmissions_list.append(paper_dict)
                         self.paper_tracker.add_or_update_paper(paper_dict)
-                        resubmission_cost = SIMULATION_CONFIG['conference']['resubmission_cost']
-                        agent.update_resources(-resubmission_cost)
-                        self.funding_tracker.record_funding_consumption(year, resubmission_cost, agent.get_type())
+                        self._charge_resubmission(agent, paper_dict, year)
                         resubmissions_paper_ids.add(metadata['arxiv_id'])
                     else:
                         logger.error(f"[Resubmission] Paper {metadata['arxiv_id']} already resubmitted for year {year}")
@@ -2135,6 +2199,8 @@ class Simulation:
             active_authors = [a for a in active_authors if a.id not in co_author_ids]
             logger.info(f"Phase 2: {original_count - len(active_authors)} agents are co-authors this round, "
                         f"{len(active_authors)} agents will submit as lead authors")
+
+        active_authors = self._prepare_project_production(year, active_authors)
 
         # ---- Load RAG index if needed (before intention generation) ----
         if year == 1:
@@ -2367,6 +2433,7 @@ class Simulation:
                             'maturity': directions[agent.id]['direction'].years,
                             'status': 'pending'
                         }
+                        self._record_output_cost(agent, paper_dict, year)
                         self._apply_coauthorship(paper_dict, agent, year)
 
                         message_history_dict[agent.id] = message_history
@@ -2470,6 +2537,7 @@ class Simulation:
                             'maturity': directions[agent.id]['direction'].years,
                             'status': 'pending'
                         }
+                        self._record_output_cost(agent, paper_dict, year)
                         self._apply_coauthorship(paper_dict, agent, year)
 
                         message_history_dict[agent.id] = fallback_info['message_history']
@@ -2572,6 +2640,7 @@ class Simulation:
                         'maturity': directions[agent.id]['direction'].years,
                         'status': 'pending'
                     }
+                    self._record_output_cost(agent, paper_dict, year)
                     self._apply_coauthorship(paper_dict, agent, year)
 
                     message_history_dict[agent.id] = message_history
@@ -3001,8 +3070,10 @@ class Simulation:
                 if agent.project_end_year >= year:
                     # Agent is working on a project
                     annual_cost = SIMULATION_CONFIG['conference']['annual_cost']
-                    agent.update_resources(-annual_cost)
-                    self.funding_tracker.record_funding_consumption(year, annual_cost, agent.get_type())
+                    from src.project_cost_accounting import project_id
+                    if self._account_resources(agent, -annual_cost, category='annual_research_cost',
+                                               year=year, project=project_id(agent)):
+                        self.funding_tracker.record_funding_consumption(year, annual_cost, agent.get_type())
 
     def _run_phase_3_peer_review(self, year: int, year_results: Dict) -> Dict[str, Dict[str, float]]:
         """Phase 3: Conduct peer reviews
@@ -3507,8 +3578,9 @@ class Simulation:
                         weighted_funding_assignment=True
                     )
                     if new_budget > 0:
-                        agent.update_resources(delta=int(new_budget))
-                        self.funding_tracker.record_funding_allocation(year, new_budget, 'industry')
+                        if self._account_resources(agent, int(new_budget), category='industry_income',
+                                                   year=year, paper=paper['id']):
+                            self.funding_tracker.record_funding_allocation(year, new_budget, 'industry')
 
 
                 # Count citations for each accepted paper
@@ -3816,7 +3888,10 @@ class Simulation:
 
                 funding_to_researcher = academic_funding_per_unit
 
-                agent.update_resources(delta=funding_to_researcher)
+                applied = self._account_resources(agent, funding_to_researcher, category='grant_income',
+                                                  year=year, program=program_id)
+                if not applied:
+                    continue
                 self.funding_tracker.record_funding_allocation(year, funding_to_researcher, 'university')
                 if not program_id in agent.funding_success_history:
                     agent.funding_success_history[program_id] = []
@@ -4049,6 +4124,9 @@ class Simulation:
 
         # Get conference statistics
         year_results['conference_statistics'] = self.conference_system.get_all_statistics()
+        if getattr(self, 'resource_ledger', None) is not None:
+            year_results['resource_balances'] = self.resource_ledger.close_year(
+                year, self.ecosystem.agent_population)
         self.wandb_logger.log_phase(year, 5, year_results, self)
 
         return year_results
@@ -4065,9 +4143,13 @@ class Simulation:
         logger.info(f"Configuration: {self.num_years} years")
 
         docs_dir = getattr(self.args, 'docs_dir', self.output_dir)
+        from copy import deepcopy
+        resolved_config = deepcopy(SIMULATION_CONFIG)
+        resolved_config['project_cost_accounting'] = self.cost_policy
+        resolved_config['conference']['resubmission_cost'] = self.cost_policy['resubmission_cost']
         write_run_manifest(
             docs_dir, status='running', args=self.args,
-            resolved_config=SIMULATION_CONFIG,
+            resolved_config=resolved_config,
             extra={'experiment_id': getattr(self.args, 'experiment_id', self.experiment_name),
                    'model_id': getattr(self.llm, 'model_name', 'unknown'),
                    'run_seed': getattr(self.args, 'seed', None)})
@@ -4170,6 +4252,8 @@ class Simulation:
             year: Year number
         """
         checkpoint_path = os.path.join(self.output_dir, f"checkpoint_year_{year}.json")
+        if getattr(self, 'resource_ledger', None) is not None:
+            self.resource_ledger.reconcile(year, self.ecosystem.agent_population, require_closed=True)
 
         # Serialize everything to JSON-compatible format
         checkpoint_data = {
@@ -4188,6 +4272,10 @@ class Simulation:
             'initial_university_count': self.initial_university_count,
             'initial_industry_count': self.initial_industry_count,
         }
+        if hasattr(self, 'cost_policy'):
+            checkpoint_data['project_cost_policy'] = self.cost_policy
+        if getattr(self, 'resource_ledger', None) is not None:
+            checkpoint_data['resource_ledger'] = self.resource_ledger.to_dict()
 
         # Save exploration experiment trackers if enabled
         if self.is_exploration_experiment:
@@ -4216,11 +4304,14 @@ class Simulation:
         if getattr(self.args, 'experiment_stage', None) in ('calibration', 'confirmatory', 'manyworld', 'mechanism', 'matthew_rd', 'matthew_rd_cost'):
             import gzip
             checkpoint_path += '.gz'
-            with gzip.open(checkpoint_path, 'wt') as f:
+            with gzip.open(checkpoint_path + '.tmp', 'wt') as f:
                 json.dump(checkpoint_data, f)
         else:
-            with open(checkpoint_path, 'w') as f:
+            with open(checkpoint_path + '.tmp', 'w') as f:
                 json.dump(checkpoint_data, f, indent=2)
+        os.replace(checkpoint_path + '.tmp', checkpoint_path)
+        if getattr(self, 'resource_ledger', None) is not None:
+            self.resource_ledger.write(self.output_dir)
 
         logger.info(f"Checkpoint saved for year {year}: {checkpoint_path}")
 
@@ -4246,6 +4337,21 @@ class Simulation:
             logger.warning(f"Checkpoint not found: {checkpoint_path}(.gz)")
             return False
 
+        from src.project_cost_accounting import resolve_cost_policy, cost_policy_enabled, ResourceLedger
+        current_policy = getattr(self, 'cost_policy', resolve_cost_policy(self.args, SIMULATION_CONFIG))
+        saved_policy = checkpoint_data.get('project_cost_policy')
+        if saved_policy is not None and saved_policy != current_policy:
+            raise ValueError("Checkpoint cost policy differs from requested policy")
+        if saved_policy is None and cost_policy_enabled(current_policy):
+            raise ValueError("Cannot resume a legacy checkpoint under a new cost/audit policy")
+        if cost_policy_enabled(current_policy) and checkpoint_data.get('phase', 5) != 5:
+            raise ValueError("Cost accounting supports the native end-of-year checkpoints only")
+        if current_policy['log_resource_ledger'] and 'resource_ledger' not in checkpoint_data:
+            raise ValueError("Audit checkpoint is missing its resource ledger")
+        self.cost_policy = current_policy
+        self.resource_ledger = (ResourceLedger(checkpoint_data['resource_ledger'])
+                                if current_policy['log_resource_ledger'] else None)
+
         self.current_year = checkpoint_data['year']
 
         # Reconstruct ecosystem with LLM from serialized data
@@ -4253,6 +4359,11 @@ class Simulation:
             checkpoint_data['ecosystem_data'],
             llm=self.llm
         )
+        if self.resource_ledger is not None:
+            self.resource_ledger.attach(self.ecosystem.agent_population)
+            self.resource_ledger.reconcile(year, self.ecosystem.agent_population, require_closed=True)
+            # A crash may leave newer exports than the last committed checkpoint.
+            self.resource_ledger.write(self.output_dir)
 
         # Reconstruct conference system
         self.conference_system = ConferenceSystem.from_dict(checkpoint_data['conference_system'])

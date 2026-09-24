@@ -67,12 +67,23 @@ CELLS = {
     # counterfactual: cut the resubmission channel in the pressure world (mechanism sufficiency)
     'S1R1_noresub': dict(k=2, budget='fixed', cap=False, std=False, slots=False, noresub=True),
 }
+# Cost control keeps the actual legacy production debit (zero) and waives the
+# per-paper resubmission fee. Resubmission decisions and review workload remain.
+# The configured funding_cost_per_paper=15 is unused in the legacy code, so
+# activating it here would add a new expense rather than remove a confound.
+for _base in ('S0R0', 'S1R0', 'S0R1', 'S1R1'):
+    CELLS[_base + '_costcontrol'] = {
+        **CELLS[_base], 'production_cost_mode': 'per_paper',
+        'resubmission_cost': 0, 'log_resource_ledger': True,
+    }
 STAGES = {
     'smoke': ['S0R0'],
     'a': ['S0R0', 'S1R0', 'S0R1', 'S1R1'],
     'b': ['S1R1', 'S1R1_K1', 'S1R1_E1', 'S1R1_K1E1', 'S0R0_E1'],
     'sens': ['S1R0_slots'],
     'counterfactual': ['S1R1_noresub'],
+    'costcontrol': [cell + '_costcontrol' for cell in ('S0R0', 'S1R0', 'S0R1', 'S1R1')],
+    'costpilot': ['S0R0_costcontrol', 'S1R0_costcontrol', 'S0R1_costcontrol', 'S1R1_costcontrol'],
 }
 
 
@@ -122,6 +133,11 @@ def build_command(cell: str, seed: int, args, vllm_url: str = None) -> list:
         cmd += ['--acceptance_mode', 'fixed_slots']
     if spec.get('noresub'):
         cmd.append('--disable_resubmission')
+    if 'production_cost_mode' in spec:
+        cmd += ['--production_cost_mode', spec['production_cost_mode'],
+                '--resubmission_cost', str(spec['resubmission_cost'])]
+    if spec.get('log_resource_ledger'):
+        cmd.append('--log_resource_ledger')
     if not args.legacy_scoring:
         cmd += ['--review_score_mode', 'float', '--acceptance_tiebreak', 'seeded']
     if args.always_rerun:
@@ -307,9 +323,9 @@ def main():
             args.num_years = 10 if args.population == 'default' else 8
         if args.num_conferences is None:
             args.num_conferences = 10 if args.population == 'default' else 6
-        if args.stage == 'smoke':
+        if args.stage in ('smoke', 'costpilot'):
             args.num_institutions = min(args.num_institutions, 5)
-            args.num_years = min(args.num_years, 1)
+            args.num_years = min(args.num_years, 2 if args.stage == 'costpilot' else 1)
     args.func(args)
 
 

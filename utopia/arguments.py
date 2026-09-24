@@ -285,8 +285,29 @@ def parse_arguments(argv=None):
         default=1,
         help='Papers submitted per completed project (scale experiment factor S). 1 (default) '
              '= legacy single-paper submission. k>1 asks the author to pick up to k distinct '
-             'candidate papers in one prompt; costs are unchanged (LLM lowers marginal cost). '
+             'candidate papers in one prompt. Production charges follow --production_cost_mode. '
              'Requires a batching LLM backend (vLLM).'
+    )
+    parser.add_argument(
+        '--production_cost_mode', choices=['per_paper', 'per_project'], default='per_paper',
+        help='per_paper preserves the historical submission flow (the configured per-paper '
+             'fee is unused in base 2bb7e69). per_project charges that configured fee once '
+             'when a completed lead project enters Phase 2, even if it produces zero papers.'
+    )
+    parser.add_argument(
+        '--project_production_cost', type=float, default=None,
+        help='Optional finite nonnegative fixed fee for per_project mode. None uses '
+             'the existing configured paper fee. 0 permits cost-free production.'
+    )
+    parser.add_argument(
+        '--resubmission_cost', type=float, default=None,
+        help='Optional finite nonnegative override of the conference resubmission fee. '
+             'Set 0 in BOTH matched k1/k2 cost-control worlds. Positive fees are sensitivity cells.'
+    )
+    parser.add_argument(
+        '--log_resource_ledger', action='store_true',
+        help='Persist categorized transactions and all researcher/year balances. Fail on '
+             'unexplained residuals. Logging consumes no RNG and requires auditing from year 1.'
     )
     parser.add_argument(
         '--funding_budget_mode',
@@ -396,6 +417,10 @@ def parse_arguments(argv=None):
     if args.reviews_per_paper < 1:
         raise ValueError('--reviews_per_paper must be >= 1')
 
+    from src.project_cost_accounting import resolve_cost_policy, cost_policy_tag
+    from utopia.config import SIMULATION_CONFIG
+    cost_tag = cost_policy_tag(resolve_cost_policy(args, SIMULATION_CONFIG))
+
     if args.experiment_stage:
         # Canonical layout: one experiment_id across outputs/{logs,checkpoints,visual,docs}
         from utopia.config import SIMULATION_CONFIG
@@ -464,6 +489,7 @@ def parse_arguments(argv=None):
                 f"explore_{args.experiment_stage}_{model_tag}_{mechanism}_"
                 f"i{args.num_institutions}_n{n_researchers}_y{args.num_years}_seed{args.seed}{mix_tag}"
             )
+        args.experiment_id += cost_tag
         base = args.output_dir  # repository-relative 'outputs'
         args.log_dir = os.path.join(base, 'logs', args.experiment_id)
         args.checkpoint_dir = os.path.join(base, 'checkpoints', args.experiment_id)
@@ -480,12 +506,12 @@ def parse_arguments(argv=None):
             os.makedirs(d, exist_ok=True)
         return args
 
-    # Legacy layout (experiment_stage absent): unchanged behavior
+    # Default retains the historical layout. Opt-in policies get disjoint paths.
     if args.debug:
-        args.output_dir = os.path.join(args.output_dir, 'debug', args.experiment_name)
+        args.output_dir = os.path.join(args.output_dir, 'debug', args.experiment_name + cost_tag)
 
     elif args.experiment_name:
-        args.output_dir = os.path.join(args.output_dir, args.experiment_name)
+        args.output_dir = os.path.join(args.output_dir, args.experiment_name + cost_tag)
 
     else:
         raise ValueError("Please specify the `experiment_name` or enable debug mode.")
@@ -498,7 +524,7 @@ def parse_arguments(argv=None):
     # (mirrors the experiment_stage branch above; unset = unchanged behavior).
     args.data_cache_dir = os.environ.get('UTOPIA_DATA_CACHE_DIR',
                                          os.path.join('data', 'cache'))
-    args.experiment_id = args.experiment_name
+    args.experiment_id = args.experiment_name + cost_tag
 
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(args.visual_dir, exist_ok=True)
