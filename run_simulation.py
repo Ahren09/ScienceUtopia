@@ -4276,6 +4276,15 @@ class Simulation:
             checkpoint_data['project_cost_policy'] = self.cost_policy
         if getattr(self, 'resource_ledger', None) is not None:
             checkpoint_data['resource_ledger'] = self.resource_ledger.to_dict()
+            # Bind the checkpoint itself to its cell, independently of its path
+            # or a neighboring manifest. Transport endpoints may change on resume.
+            import subprocess
+            checkpoint_data['cost_experiment_binding'] = {
+                'args': dict(vars(self.args)),
+                'git_commit': subprocess.check_output(
+                    ['git', 'rev-parse', 'HEAD'],
+                    cwd=os.path.dirname(os.path.abspath(__file__)), text=True).strip(),
+            }
 
         # Save exploration experiment trackers if enabled
         if self.is_exploration_experiment:
@@ -4348,6 +4357,13 @@ class Simulation:
             raise ValueError("Cost accounting supports the native end-of-year checkpoints only")
         if current_policy['log_resource_ledger'] and 'resource_ledger' not in checkpoint_data:
             raise ValueError("Audit checkpoint is missing its resource ledger")
+        if current_policy['log_resource_ledger']:
+            binding = checkpoint_data.get('cost_experiment_binding')
+            if not binding:
+                raise ValueError("Audit checkpoint is missing its experiment binding")
+            from src.analyze_project_cost import scientific_arguments
+            if scientific_arguments(binding['args']) != scientific_arguments(vars(self.args)):
+                raise ValueError("Checkpoint scientific arguments differ from requested experiment")
         self.cost_policy = current_policy
         self.resource_ledger = (ResourceLedger(checkpoint_data['resource_ledger'])
                                 if current_policy['log_resource_ledger'] else None)

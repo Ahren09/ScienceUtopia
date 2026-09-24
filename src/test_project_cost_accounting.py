@@ -13,11 +13,13 @@ from contextlib import contextmanager, redirect_stdout, redirect_stderr
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
+import gzip
 import io
 import json
 import os
 from pathlib import Path
 import random
+import re
 import subprocess
 import sys
 import tempfile
@@ -47,6 +49,7 @@ def policy(**overrides):
 
 def namespace(ref=None):
     ns = native.original_namespace()
+    ns["__file__"] = str(ROOT / "run_simulation.py")
     ns.update(Enum=Enum, IMPORTANT_NOTES=IMPORTANT_NOTES, traceback=traceback,
               dataclass=dataclass, field=field, Path=Path)
     native.original_definitions("utopia/agents/base_agent.py", ["RoundIntention"], ns)
@@ -249,6 +252,99 @@ class TestPrimaryAndLegacy(unittest.TestCase):
                 output_events = sim.resource_ledger.transactions
                 self.assertEqual(len([e for e in output_events if e["paper_id"]]), k)
                 self.assertEqual({e["project_id"] for e in output_events}, {project_id(agent)})
+
+    def test_primary_no_income_eight_year_survival_bound_and_ledger_continuity(self):
+        """Native money/exit paths, mocked papers and no-income funding decisions.
+
+        Every founder works all eight years, attaining the maximum annual debit:
+        100 - 8 * 10 = 20 > the native Phase 5 exit threshold of 10. Any
+        nonnegative funding or fewer research years can only raise that bound.
+        This is a structural invariant test, not a model/survival-effect estimate.
+        """
+        class NoIncomeLLM:
+            def generate_batch(self, prompts, seed_ctx, **kwargs):
+                if seed_ctx[0] != "phase5_funding_apps":
+                    raise AssertionError("No-income fixture must never evaluate awards")
+                return [({"submit": False, "research_proposal": "No-income bound fixture.",
+                          "relevant_projects": []}, []) for _ in prompts]
+
+        self.assertEqual(SIMULATION_CONFIG["conference"]["annual_cost"], 10)
+        final_balances = []
+        for k in (1, 2):
+            with self.subTest(k=k), tempfile.TemporaryDirectory() as directory:
+                sim, founders, _ = native.make_simulation(
+                    directory, base=True, balance=100, cost=0, num_authors=300)
+                sim.args.production_cost_mode = "per_paper"
+                sim.args.resubmission_cost = 0
+                sim.args.log_resource_ledger = True
+                sim.args.papers_per_project = sim.papers_per_project = k
+                sim.cost_policy = resolve_cost_policy(sim.args, SIMULATION_CONFIG)
+                self.assertEqual(sim.cost_policy["legacy_effective_per_paper_cost"], 0)
+                self.assertEqual(sim.cost_policy["resubmission_cost"], 0)
+                self.assertEqual(sim.args.funding_application_cost, 0)
+                sim.resource_ledger = ResourceLedger()
+                sim.llm = NoIncomeLLM()
+                sim.conference_system.reset_all_for_new_year = lambda year: None
+                population = sim.ecosystem.agent_population
+                previous_papers = []
+
+                for year in range(1, 9):
+                    year_results = sim._setup_year(year)
+                    # Native resubmission debit boundary, using last year's papers.
+                    for agent, paper in previous_papers:
+                        sim._charge_resubmission(agent, paper, year)
+                    for agent in founders:
+                        agent.project_start_year = agent.project_end_year = year
+                    self.assertEqual(sim._prepare_project_production(year, founders), founders)
+                    previous_papers = []
+                    for agent in founders:
+                        for output in range(k):
+                            paper = {
+                                "id": f"{agent.id}/year{year}/output{output}", "author_id": agent.id,
+                                "project_start_year": year, "project_end_year": year,
+                            }
+                            sim._record_output_cost(agent, paper, year)
+                            previous_papers.append((agent, paper))
+                    sim._charge_annual_costs(year)
+                    # Executes native zero application cost, no-award processing,
+                    # and the actual resource-based researcher removal condition.
+                    with redirect_stdout(io.StringIO()):
+                        sim._run_phase_5_update_funding(year, [], year_results)
+                    rows = sim.resource_ledger.close_year(year, population)
+                    self.assertEqual(len(rows), 300)
+                    for row in rows:
+                        self.assertEqual(row["opening_balance"], 100 - 10 * (year - 1))
+                        self.assertEqual(row["closing_balance"], 100 - 10 * year)
+                        self.assertEqual(row["annual_research_cost"], 10)
+                        self.assertTrue(row["founder"] and row["closing_active"])
+                        for category in set(CATEGORIES) - {"annual_research_cost"}:
+                            self.assertEqual(row[category], 0)
+                        self.assertEqual(row["residual"], 0)
+                        self.assertEqual(row["uncollected_cost"], 0)
+                    # Opening the same ledger year again must not erase its history
+                    # or permit a second annual charge. No full-year replay assumed.
+                    before = sim.resource_ledger.to_dict()
+                    sim.resource_ledger.start_year(year, population)
+                    sim._charge_annual_costs(year)
+                    self.assertEqual(sim.resource_ledger.to_dict(), before)
+                    if year == 4:
+                        sim.resource_ledger = ResourceLedger(json.loads(json.dumps(before)))
+                        sim.resource_ledger.attach(population)
+                        self.assertEqual(sim.resource_ledger.to_dict(), before)
+
+                self.assertEqual(len(sim.resource_ledger.years), 8)
+                transactions = sim.resource_ledger.transactions
+                self.assertEqual(len({e["event_id"] for e in transactions}), len(transactions))
+                debits = [e for e in transactions if e["delta"] < 0]
+                self.assertEqual(len(debits), 300 * 8)
+                self.assertEqual({(e["category"], e["delta"]) for e in debits},
+                                 {("annual_research_cost", -10)})
+                self.assertFalse(any(e["delta"] > 0 for e in transactions))
+                balances = [a.resources for a in founders]
+                self.assertEqual(min(balances), 20)
+                self.assertTrue(all(a.is_active and a.resources > 10 for a in founders))
+                final_balances.append(balances)
+        self.assertEqual(final_balances[0], final_balances[1])
 
     def test_legacy_submission_and_logging_match_base_state_prompts_and_rng(self):
         baseline = namespace("2bb7e69")
@@ -498,6 +594,61 @@ class TestLedgerReconciliation(unittest.TestCase):
                     sim.resource_ledger.start_year(2, sim.ecosystem.agent_population)
                     rows = sim.resource_ledger.close_year(2, sim.ecosystem.agent_population)
                     self.assertEqual(rows[0]["opening_balance"], balance)
+
+
+@unittest.skipUnless(os.environ.get("JAMES_ACTUAL_MODULE_TESTS") == "1",
+                     "Requires the isolated full-dependency CPU environment and real data cache")
+class TestActualPrimaryLedger(unittest.TestCase):
+    """Real modules, RAG, rounds and checkpoints. Only LLM transport is scripted."""
+    setUpClass = classmethod(native.TestActualSimulator.setUpClass.__func__)
+    tearDownClass = classmethod(native.TestActualSimulator.tearDownClass.__func__)
+    make_actual = native.TestActualSimulator.make_actual
+
+    def test_two_year_primary_ledger_checkpoint_and_independent_audit(self):
+        from src.analyze_project_cost import validate_ledger
+
+        class PrimaryScriptedLLM(native.FullYearScriptedLLM):
+            def generate_batch(self, prompts, seed_ctx, **kwargs):
+                if seed_ctx[0] != "phase0_resubmit":
+                    return super().generate_batch(prompts, seed_ctx, **kwargs)
+                self.calls.append((deepcopy(prompts), seed_ctx, deepcopy(kwargs)))
+                return [({"resubmitted_papers": [
+                    {"arxiv_id": pid,
+                     "conference": re.search(r'^- "([^"]+)": primary topics:', prompt, re.M)[1]}
+                    for pid in re.findall(r'^arXiv ID: "([^"]+)"', prompt, re.M)
+                ]}, []) for prompt in prompts]
+
+        sim, researchers = self.make_actual("primary-ledger")
+        try:
+            sim.args.production_cost_mode = "per_paper"
+            sim.args.resubmission_cost = sim.args.funding_application_cost = 0
+            sim.args.log_resource_ledger = True
+            sim.cost_policy = resolve_cost_policy(sim.args, SIMULATION_CONFIG)
+            sim.resource_ledger = ResourceLedger()
+            sim.llm = PrimaryScriptedLLM()
+            for agent in sim.ecosystem.agent_population.values():
+                agent.llm = sim.llm
+            founders = {a.id for a in researchers}
+            self.assertEqual(len(founders), 12)
+            for year in (1, 2):
+                sim.yearly_results.append(sim.run_one_round(year))
+                sim._save_checkpoint(year, phase=5)
+                path = Path(sim.output_dir) / f"checkpoint_year_{year}.json"
+                opener = path.open if path.exists() else lambda mode: gzip.open(str(path) + ".gz", mode)
+                with opener("rt") as stream:
+                    checkpoint = json.load(stream)
+                self.assertEqual(len(validate_ledger(checkpoint, year, founders)), 12 * year)
+                self.assertEqual(checkpoint["project_cost_policy"], sim.cost_policy)
+                self.assertEqual(checkpoint["cost_experiment_binding"]["args"], vars(sim.args))
+                self.assertTrue(sim.load_checkpoint(year))
+                self.assertEqual(sim.resource_ledger.to_dict(), checkpoint["resource_ledger"])
+            resubmissions = [e for e in sim.resource_ledger.transactions
+                            if e["category"] == "resubmission_cost"]
+            self.assertTrue(resubmissions)
+            self.assertTrue(all(e["requested_delta"] == e["delta"] == 0 for e in resubmissions))
+            self.assertFalse(self.torch.cuda.is_initialized())
+        finally:
+            sim.wandb_logger.finish()
 
 
 class TestCostConfiguration(unittest.TestCase):

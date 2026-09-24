@@ -21,7 +21,8 @@ import time
 from types import SimpleNamespace
 import uuid
 
-from analyze_project_cost import analyze, validate_run
+from analyze_project_cost import analyze, scientific_arguments, validate_run
+from copy import deepcopy
 from james_server_profiles import tp1_server_spec
 from run_james_ec2_queue import (
     Lock, atomic_write, boot_id, constrained_output_probe, endpoint_ready,
@@ -32,7 +33,7 @@ from run_scale_expansion import STAGES, build_command, experiment_id_for
 
 ROOT = Path(__file__).resolve().parents[1]
 PROTOCOL = {
-    "question": "Does k=2 versus k=1 change survival and allocation when direct production "
+    "question": "Does k=2 versus k=1 change allocation and review workload when direct production "
                 "and resubmission fees are both zero?",
     "baseline_commit": "2bb7e6917418f2722b2217cc5453188f51734662",
     "historical_commit": "9ee31940c33f6c01a245f132ebcb489992921b47",
@@ -44,12 +45,17 @@ PROTOCOL = {
     "start_year": 2016, "conferences": 6, "funding_panel_max_apps": 25,
     "fixed_budget_slots_fraction": 0.2, "review_score_mode": "float",
     "acceptance_tiebreak": "seeded",
-    "primary_endpoint": "Year-8 active share among all original founders.",
+    "primary_endpoints": ["Share of original founders receiving any grant by year 8",
+                          "Share of all reviews spent on resubmissions"],
+    "survival_invariant": "Initial endowment 100 minus at most 8*10 research costs leaves "
+                          "20, above the exit threshold. With zero direct and application fees "
+                          "and nonnegative income, every founder must remain active. This is "
+                          "a structural invariant, not an empirical test of no survival effect.",
     "primary_contrasts": ["k2-k1 under track", "k2-k1 under fixed",
                           "(k2-k1 under fixed) - (k2-k1 under track)"],
     "inference": "Pair all comparisons by seed. Report individual seed effects and descriptive "
                  "paired bootstrap intervals. Exact paired sign-flip diagnostics have minimum "
-                 "two-sided p=0.0625 with five seeds. Holm adjustment across three survival contrasts. "
+                 "two-sided p=0.0625 with five seeds. Holm adjustment across six primary contrasts. "
                  "Other endpoints are exploratory. Do not pool historical runs.",
     "scope": "Direct-output-cost sensitivity. Annual research costs and research duration follow "
              "the original rules. Realized total career spending is not held equal.",
@@ -78,6 +84,8 @@ def source_identity():
 
 
 def make_plan(args):
+    require(args.python.absolute() == Path(sys.executable).absolute(),
+            "Create and run the plan using its selected Python environment")
     commit, sources = source_identity()
     directory = args.directory.resolve()
     directory.mkdir(parents=True, exist_ok=True)
@@ -94,9 +102,19 @@ def make_plan(args):
             for cell in STAGES[stage]:
                 command = build_command(cell, seed, launch_args)
                 command[0] = str(args.python.absolute())
+                from utopia.arguments import parse_arguments
+                from utopia.config import SIMULATION_CONFIG
+                from project_cost_accounting import resolve_cost_policy
+                resolved_args = parse_arguments(command[2:])
+                resolved_config = deepcopy(SIMULATION_CONFIG)
+                policy = resolve_cost_policy(resolved_args, resolved_config)
+                resolved_config["project_cost_accounting"] = policy
+                resolved_config["conference"]["resubmission_cost"] = policy["resubmission_cost"]
                 jobs.append({"stage": stage, "cell": cell, "seed": seed,
                              "years": years, "population": institutions * 5,
-                             "experiment_id": experiment_id_for(command), "command": command})
+                             "experiment_id": experiment_id_for(command), "command": command,
+                             "scientific_args": scientific_arguments(vars(resolved_args)),
+                             "resolved_config": resolved_config})
     inputs = ["outputs/cache_scievo.pkl", "outputs/thenlper_gte-small/cache_embeddings.pt"]
     plan = {
         "schema_version": 1, "created_utc": utc(), "directory": str(directory),
@@ -116,6 +134,8 @@ def make_plan(args):
 
 
 def runtime_check(plan):
+    require(Path(plan["python"]).absolute() == Path(sys.executable).absolute(),
+            "Controller interpreter differs from selected child interpreter")
     commit, sources = source_identity()
     require(commit == plan["git_commit"] and sources == plan["source_sha256"],
             "Frozen source state changed")
@@ -247,10 +267,21 @@ class Campaign:
         env = self.environment("")
         env["PYTHONHASHSEED"] = str(job["seed"])
         env["UTOPIA_DATA_CACHE_DIR"] = str(ROOT / "data/cache" / job["experiment_id"])
-        atomic_write(log_dir / "campaign_command.json", json_bytes(
-            {"command": command, "git_commit": self.plan["git_commit"],
-             "plan_sha256": self.state["plan_sha256"], "gpu": server["gpu"].index,
-             "runtime": self.plan["server_spec"]}))
+        receipt_path = log_dir / "campaign_command.json"
+        if receipt_path.exists():
+            prior = json.loads(receipt_path.read_text())
+            require(prior["git_commit"] == self.plan["git_commit"]
+                    and prior["plan_sha256"] == self.state["plan_sha256"],
+                    "Existing artifacts belong to another frozen campaign")
+        else:
+            for directory in ("docs", "checkpoints"):
+                existing = ROOT / "outputs" / directory / job["experiment_id"]
+                require(not existing.exists() or not any(existing.iterdir()),
+                        "Existing world has no matching campaign receipt")
+            atomic_write(receipt_path, json_bytes(
+                {"command": command, "git_commit": self.plan["git_commit"],
+                 "plan_sha256": self.state["plan_sha256"], "gpu": server["gpu"].index,
+                 "runtime": self.plan["server_spec"]}), exclusive=True)
         # State precedes the fork. A crash in this small window requires an
         # explicit restart inspection rather than guessing whether it launched.
         entry = {**job, "status": "launch_intent", "identity": None, "started": time.time(),
@@ -293,18 +324,36 @@ class Campaign:
         self.state["used_gpu_ids"] = prior.get("used_gpu_ids", [])
 
     def cleanup(self):
+        errors = []
         for server in self.servers:
             record = server["record"]
-            for identity in (record.get("client_identity"), record.get("identity")):
-                if identity:
-                    require(not stop_owned(identity), "Owned child could not stop")
-            if record.get("identity"):
-                self.reservation(server, "released")
-                record["status"] = "released"
-            # No identity leaves an uncertain launch intent quarantined.
-            for lock in server["locks"]:
-                lock.close()
+            stopped = True
+            try:
+                for identity in (record.get("client_identity"), record.get("identity")):
+                    if not identity:
+                        continue
+                    try:
+                        require(not stop_owned(identity), "Owned child could not stop")
+                    except Exception as error:
+                        stopped = False
+                        errors.append(str(error))
+                if record.get("identity") and stopped:
+                    try:
+                        self.reservation(server, "released")
+                        record["status"] = "released"
+                    except Exception as error:
+                        errors.append(str(error))
+                # Uncertain or live owned sessions retain their durable record.
+            finally:
+                for lock in server["locks"]:
+                    try:
+                        lock.close()
+                    except Exception as error:
+                        errors.append(str(error))
+        if errors:
+            self.state.update(status="cleanup_failed", cleanup_errors=errors)
         self.save()
+        require(not errors, "Cleanup incomplete: " + "; ".join(errors))
 
     def run(self):
         lock = Lock(self.directory / "controller.lock")
