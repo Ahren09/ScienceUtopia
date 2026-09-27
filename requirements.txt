@@ -1,0 +1,18 @@
+-c constraints-linux-py311.txt
+# Python 3.11. Local inference server dependencies are in requirements-vllm.txt.
+numpy==2.2.6
+pandas==2.2.3
+scipy==1.15.3
+scikit-learn==1.7.2
+networkx==3.4.2
+torch==2.9.0
+transformers==4.57.3
+sentence-transformers==5.1.2
+huggingface-hub==0.36.2
+datasets==4.8.4
+pyarrow==21.0.0
+langchain-core==0.3.79
+openai==2.41.1
+pydantic==2.13.3
+jsonschema==4.25.1
+tqdm==4.67.1

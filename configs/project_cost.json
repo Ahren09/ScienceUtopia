@@ -1,0 +1,19 @@
+{
+  "model": "Qwen/Qwen3-32B",
+  "seed": 42,
+  "num_institutions": 20,
+  "researchers_per_institution": 5,
+  "num_years": 8,
+  "num_conferences": 6,
+  "start_year": 2016,
+  "batch_size": 32,
+  "initial_funding": 100,
+  "slots_frac": 0.2,
+  "cases": {
+    "S0R0_costcontrol": {},
+    "S1R0_costcontrol": {},
+    "S0R1_costcontrol": {},
+    "S1R1_costcontrol": {}
+  },
+  "family": "project_cost"
+}

@@ -1,0 +1,169 @@
+{
+  "prereg_version": 1,
+  "study": "reviewer_monoculture_review_replay_pilot",
+  "status": "prospective_public_configuration",
+  "design_summary": "Paired paper-review replay of stored submissions from the supplied completed simulations under regime A (one standardized reviewer policy) vs regime B (heterogeneous reviewer-priority profiles). Primary causal estimand = A - B with all other reviewer attributes held fixed. Regime C = original stored reviews as zero-cost ecological reference (replayed only on the smoke set for reconstruction sanity; never a causal comparison).",
+  "global_seed": 42,
+  "samples": {
+    "smoke": {
+      "n_papers": 24,
+      "purpose": "engineering validation only; disjoint from pilot; never enters any pilot hypothesis test",
+      "allocation": "roughly 5/5/5/5/4 per source seed, sampled by the same stratified procedure before pilot sampling, then removed from the eligible pool"
+    },
+    "pilot": {
+      "n_papers": 300,
+      "per_source_seed": 60
+    },
+    "stability_subset": {
+      "n_papers": 60,
+      "rule": "from the 300 pilot papers, stratify by strategy (explorer/exploiter/cautious_explorer) x novelty tercile (within pilot sample) x original decision (2); allocate 60 proportionally to cell counts by deterministic largest-remainder; within-cell selection ordered by paper_id with rng seeded derive_seed(42,'stability_subset'); receives a second blind panel (panel=2) in regimes A and B only"
+    }
+  },
+  "sampling_design": {
+    "eligibility": "row in paper.parquet with a matching review round in the submission-year checkpoint (matched on year and conference; loud failure on ambiguity), exactly 3 reviewer entries whose reviewer_ids resolve to agents in ecosystem_data.agents of that checkpoint, non-empty abstract",
+    "initial_cell": "source_seed x year_tercile x distance_bucket x accepted",
+    "year_terciles": "years 1-3, 4-6, 7-10 of the 10 simulated years",
+    "collapse_algorithm": [
+      "A cell is sparse if its eligible count < 8 or below its largest-remainder allocation",
+      "step 1: merge adjacent year terciles within the same source_seed x distance_bucket x accepted class (1-3 with 4-6 first, then with 7-10 if still sparse)",
+      "step 2: if still sparse, merge distance buckets (near->mid->far adjacency) within the same source_seed x accepted class",
+      "never merge accepted with rejected papers",
+      "never merge across source seeds"
+    ],
+    "quota_allocation": "fixed 60 papers per source seed allocated proportionally to final-cell eligible counts by deterministic largest-remainder; within-cell selection ordered by paper_id with rng seeded derive_seed(42,'corpus_sample',source_seed)",
+    "inclusion_probability": "P(selected | source_seed, final collapsed cell) = selected_in_cell / eligible_in_cell; stored per paper with original cell id, final cell id, eligible N, selected n, and IPW weight = 1/inclusion_probability",
+    "effective_sample_size": "reported as (sum w)^2 / sum w^2 over pilot papers"
+  },
+  "regimes": {
+    "A_standardized": "one common policy block for every slot of every paper",
+    "B_heterogeneous": "one of six frozen priority profiles per slot; 3 distinct profiles per paper chosen by derive_seed('profile_assign', paper_id, slot); fixed per (paper, slot) across panels and arms",
+    "C_reference": "original stored reviews from checkpoints (all 300 pilot papers, zero cost); C replay (reconstructed original agents, year-filtered memory, unmodified prompt path) executed only for the 24 smoke papers as a reconstruction sanity check"
+  },
+  "manipulation_table": {
+    "held_fixed_across_A_B": [
+      "paper title/abstract/topics",
+      "reviewer-slot domain expertise = original slot reviewer's expertise topic list",
+      "memory policy (empty memory bank; memory block omitted)",
+      "1-5 scoring scale and REVIEW_CRITERIA text",
+      "output schema PaperReview",
+      "model, revision, temperature, max_tokens, thinking mode",
+      "prestige metadata (identical author identifier, institution strings, relationship sentence per arm)",
+      "prompt template and insertion point of the policy block"
+    ],
+    "manipulated_A_vs_B": [
+      "reviewer-policy block text only: one standardized balanced policy (A) vs slot-specific priority profile (B)"
+    ],
+    "request_seeds": "deterministic but regime-specific (seed_ctx = ('review_replay', corpus_version, chunk_index) with fixed task ordering and fixed 512-task chunks); NO claim of common-random-number pairing across regimes"
+  },
+  "prompt_construction": {
+    "base": "unmodified SimulationAgent.get_review_prompt(paper, author_info) called on a SimulationAgent carrying the slot expertise and empty memory_bank",
+    "policy_block_insertion": "pure adapter inserts '## Your Review Approach\\n{policy_text}\\n\\n' immediately before the literal anchor '## Review Instructions' (anchor unique in the template)",
+    "policy_text_A": "You apply the conference's standard review policy: weigh methodological soundness, novelty, clarity, significance, and feasibility evenly. Base your score only on the paper's content as presented, applying the scoring rubric consistently and impartially.",
+    "policy_texts_B": {
+      "rigor": "As a reviewer you prioritize methodological rigor above all: scrutinize the soundness of methods, the validity of experiments, and whether the claims are fully supported by the evidence.",
+      "novelty": "As a reviewer you prioritize novelty and originality above all: reward genuinely new ideas, unexpected combinations, and departures from established approaches, and be less moved by incremental polish.",
+      "feasibility": "As a reviewer you prioritize practicality and feasibility above all: assess whether the approach is realistic, reproducible, and implementable with the stated resources.",
+      "impact": "As a reviewer you prioritize potential impact above all: weigh how much the work could change the field or enable important applications if adopted.",
+      "clarity": "As a reviewer you prioritize clarity and presentation above all: assess whether the problem, method, and evidence are communicated precisely and accessibly.",
+      "interdisciplinarity": "As a reviewer you prioritize interdisciplinary value above all: reward work that bridges fields, transfers methods across domains, or speaks to audiences beyond its home area."
+    }
+  },
+  "prestige_intervention": {
+    "name": "synthetic institutional-prestige cue intervention",
+    "scope_statement": "measures the effect of a synthetic institutional-standing cue only; not author-identity bias, status bias in general, preferential attachment, or real institutional prestige",
+    "arms": [
+      "blind (author_info=None)",
+      "prestige_high",
+      "prestige_low"
+    ],
+    "author_identifier_both_arms": "Researcher R-471",
+    "relationship_both_arms": "You have no prior relationship with this author.",
+    "institution_high": "Northlake Institute of Technology, a research university widely regarded as one of the leading institutions in this field",
+    "institution_low": "Westbrook State University, a university with a modest standing in this field",
+    "difference_constraint": "the two arm prompts differ only in the institution string above (standing only; no resources, quality, productivity, funding, career stage, or network differences)",
+    "manipulation_diagnostics": [
+      "exact prompt-diff validation per paper (arms differ only in the frozen prestige block)",
+      "keyword scan of review texts for mentions/apparent use of the prestige cue (no score effect required)",
+      "regime B: profile-assignment balance and a blinded keyword/embedding profile-adherence summary"
+    ]
+  },
+  "task_grid": {
+    "pilot": "300 papers x 2 regimes (A,B) x 3 arms (blind, prestige_high, prestige_low) x 3 slots = 5400 calls",
+    "smoke": "24 papers x same grid = 432 calls (+ optional C replay <= 144 calls)",
+    "stability": "60 papers x 2 regimes x 1 blind arm x 3 slots (panel=2) = 360 calls"
+  },
+  "primary_endpoints": [
+    {
+      "id": "P1_dispersion",
+      "endpoint": "within-paper reviewer-score dispersion: SD (ddof=1) of the 3 raw slot scores, blind arm, per paper per regime",
+      "estimand": "mean over papers of (SD_A_i - SD_B_i)",
+      "hypothesized_direction": "negative (standardized policy reduces dispersion)",
+      "test": "two-sided, paper-level paired bootstrap (10000), BH family",
+      "minimal_interesting_effect": 0.15
+    },
+    {
+      "id": "P2_rationale_diversity",
+      "endpoint": "within-paper rationale semantic diversity: mean pairwise cosine distance among MiniLM (all-MiniLM-L6-v2, snapshot 1110a243) embeddings of the 3 blind-arm justifications, per paper per regime",
+      "estimand": "mean over papers of (div_A_i - div_B_i)",
+      "hypothesized_direction": "negative (standardized policy reduces rationale diversity)",
+      "test": "two-sided, paper-level paired bootstrap (10000), BH family; length-adjusted sensitivity (residualize on mean justification length); longer text is never interpreted as more diverse by itself",
+      "minimal_interesting_effect": 0.05
+    },
+    {
+      "id": "P3_novelty_interaction",
+      "endpoint": "novelty-by-regime interaction, paired paper-level: delta_score_i = mean3(raw blind A) - mean3(raw blind B); weighted model delta_score_i = b0 + b1*novelty_i using frozen IPW weights; b1 is the estimand",
+      "hypothesized_direction": "negative (heterogeneous panels containing a novelty-prioritizing profile reward novelty more, so A-B declines with novelty)",
+      "test": "two-sided, IPW-weighted paper-level bootstrap (10000) for b1, BH family; stacked A/B and review-level clustered models are sensitivity only",
+      "minimal_interesting_effect": 0.3,
+      "mie_units": "score points per unit novelty_score (novelty_score in [0,1])"
+    },
+    {
+      "id": "P4_prestige_did",
+      "endpoint": "synthetic institutional-prestige cue difference-in-differences: d_i^R = mean3(raw prestige_high) - mean3(raw prestige_low) within regime R; estimand = mean over papers of (d_A_i - d_B_i)",
+      "hypothesized_direction": "two-sided (no frozen sign; monoculture may amplify or uniformly suppress the cue)",
+      "test": "two-sided, paper-level paired bootstrap (10000), BH family",
+      "minimal_interesting_effect": 0.15
+    }
+  ],
+  "multiplicity": "Benjamini-Hochberg across the 4 primary endpoints at alpha=0.05; all other analyses secondary/exploratory with internal BH per family",
+  "score_conventions": {
+    "primary_continuous_outcome": "raw structured float overall_score",
+    "sensitivity": "int-cast score (matches frozen simulator convention run_simulation.py:2512)",
+    "acceptance_decisions": "int-cast convention",
+    "reporting": "fraction of raw scores with non-zero fractional part; if ~0 state raw and int analyses are effectively equivalent"
+  },
+  "secondary_analyses": [
+    "ICC(1) and interval Krippendorff alpha per regime (only if cleanly implemented and unit-tested; non-blocking)",
+    "lexical distinct-2 redundancy",
+    "acceptance, absolute-score rule: frozen original per-(conference,year) threshold = midpoint between lowest accepted and highest rejected original mean score in the FULL original cohort; applied to every condition; measures score-level shifts",
+    "acceptance, capacity-constrained sensitivity: rank replay papers within condition x conference-year, accept the original venue proportion (0.30); measures decision changes under fixed capacity; never conflated with the absolute rule",
+    "panel stability (60-paper subset): decision flip rate between panel 1 and panel 2 within regime; Jaccard of accepted sets",
+    "strategy disparities (IPW-weighted)",
+    "original-review comparison (C reference): Pearson and Spearman correlation, mean bias, distribution distance (TV and Wasserstein), acceptance-decision agreement, justification-length comparison, slot-level calibration; prompt fidelity reported separately from behavioral fidelity; weak fidelity downgrades C to exploratory and does not affect A-B"
+  ],
+  "inference": "paper-level paired bootstrap (10000 resamples) primary; two-level source_seed->paper bootstrap as robustness (5 seed clusters, limitation stated)",
+  "weighting_rules": {
+    "unweighted": "paired within-paper A-B contrasts (P1, P2, P4) primary; IPW-weighted versions as sensitivity",
+    "ipw_weighted": "P3 primary and all population-level quantities (acceptance rates, novelty slopes, strategy disparities, accepted-paper diversity)",
+    "prohibition": "the balanced-sample acceptance rate is never reported as the E3.5 population acceptance rate"
+  },
+  "missingness_rules": {
+    "slot_level": "a slot failing all retries leaves the paper's other slots intact",
+    "cell_validity": "a (paper, regime, arm) cell is valid if >= 2 of 3 slots parsed; invalid cells exclude the paper from endpoints requiring that cell, counted in the missingness report",
+    "P4_requirement": "all four cells (A/B x high/low) valid",
+    "leakage": "papers with leakage-excluded prompts are replaced at sampling time (before generation); replacements drawn by the same deterministic procedure; recorded in leakage_exclusions.csv"
+  },
+  "blind_leakage_scanner": "section-aware: paper-content section may contain title/abstract/topics; reviewer-memory, reviewer-profile, system-context, author-information and auxiliary sections must not contain author identity, submitting institution, collaboration/funding metadata, original acceptance outcome, future citations, hidden strategy labels, or evidence the reviewer previously saw the current submission; C replay additionally checks for the current title inside reviewer memory; offending section and reason logged",
+  "completion_gate": [
+    "deterministic tests pass",
+    "disjoint smoke passes engineering gate",
+    "prereg v1+v2 frozen and hashed",
+    "one-seed 300-paper pilot complete",
+    "60-paper stability subset complete",
+    "4 primary endpoints reported with effect sizes and clustered CIs",
+    "figures and final report generated",
+    "cost/runtime/leakage/parse/retry/missingness reports complete"
+  ],
+  "recommendation_rule": "validity-based: design validity, CI precision relative to minimal-interesting effects, interpretability, feasibility; statistical significance is never the criterion; effects reported as positive/null/inconclusive",
+  "optional_non_blocking": "seed sensitivity: at most 2 additional global seeds on a fixed preregistered subset of at most 50 pilot papers, run only after the primary pilot and analysis complete, skipped if time-limited, never a completion requirement"
+}

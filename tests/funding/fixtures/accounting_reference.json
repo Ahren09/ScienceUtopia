@@ -1,0 +1,28 @@
+{
+  "source_refs": [
+    "2bb7e69",
+    "cfdf185"
+  ],
+  "format": "sha256 of sorted compact JSON; sets sorted; other non-JSON scalars stringified",
+  "legacy": {
+    "1:False:False": "6f6f29f55733788150a45145697b4337bca35d7452de42dce0956cd7bdf974f0",
+    "2:False:False": "70a055473fca30ef9abed4b7cf620c3d8dbcc0a471eca1b43679e84b458ab398",
+    "1:True:False": "6f6f29f55733788150a45145697b4337bca35d7452de42dce0956cd7bdf974f0",
+    "2:False:True": "eb08eb77deb75cb0e6eb08c4fd47f777a01323b4149a71fe75b95d5175b70cf0"
+  },
+  "citations": {
+    "valid:False:False": "eb688a01bf5e6d70af7d99f59f1437cc55f8afb5c83524987f6b365c940d5845",
+    "retry:False:False": "bd8f15ebbd01459d348a6b66ed58a2aa2064a81339f361ac6f07516be9355b0c",
+    "regular_exhausted:False:False": "76ac2704e9baa92d59c88987b503ed0579f1bdb3eb887f80b24c25a1198357ea",
+    "extended_exhausted:False:False": "32cd4b2c671d9f5c11ec0459c1d7cd068e8c7354ee88ee087532fc4ea073720a",
+    "self_exhausted:False:False": "428bce568b43fab13e233ccc5ac7d2d0df6ebc8c65aec8547ea6f9d6c52b5b50",
+    "empty:False:False": "eb688a01bf5e6d70af7d99f59f1437cc55f8afb5c83524987f6b365c940d5845",
+    "valid:True:False": "0a3096530205d764d0bd1d1699ec1af3eef57fe7527bc9b25ae9cd591fec74d4",
+    "retry:True:False": "24999206fd44daaa73f16e5ff3136cb24c639ab8d0766ef386c88cd7e5a8b78b",
+    "self_exhausted:True:False": "75694ba7057cb58ba935550a31cd84fef46686b062c62c3bf4e0843db5b0cedd",
+    "empty:True:False": "0a3096530205d764d0bd1d1699ec1af3eef57fe7527bc9b25ae9cd591fec74d4",
+    "valid:False:True": "1d8d47ac7b13382612b6072c4c1511c6c218b2a3ec34109b1d6d0bb655a1b86c",
+    "valid:True:True": "24ddc356ad8f93fae063b1b4564651569f898e29e6ef3c0be361a88309da081d"
+  },
+  "resubmissions": "0bfbf9a02727898290e930a20f61ce8a90b5a56340a87d30e59beb8a705363a8"
+}

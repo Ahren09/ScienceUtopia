@@ -1,0 +1,18 @@
+{
+  "model": "Qwen/Qwen3-32B",
+  "seed": 42,
+  "num_institutions": 240,
+  "researchers_per_institution": 5,
+  "num_years": 6,
+  "num_conferences": 6,
+  "start_year": 2016,
+  "batch_size": 32,
+  "initial_funding": 100,
+  "cases": {
+    "P1F1": {},
+    "P0F1": {},
+    "P1F0": {},
+    "P0F0": {}
+  },
+  "family": "funding_feedback"
+}

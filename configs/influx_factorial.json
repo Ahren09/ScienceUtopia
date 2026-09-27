@@ -1,0 +1,26 @@
+{
+  "model": "Qwen/Qwen3-32B",
+  "seed": 42,
+  "num_institutions": 240,
+  "researchers_per_institution": 5,
+  "num_years": 10,
+  "num_conferences": 6,
+  "start_year": 2016,
+  "batch_size": 32,
+  "initial_funding": 100,
+  "industry_researchers": 2,
+  "cases": {
+    "A": {
+      "disable_resubmission": true
+    },
+    "B": {
+      "annual_influx_rate": 0.1,
+      "disable_resubmission": true
+    },
+    "C": {},
+    "D": {
+      "annual_influx_rate": 0.1
+    }
+  },
+  "family": "influx_factorial"
+}

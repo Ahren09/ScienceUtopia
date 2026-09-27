@@ -1,0 +1,18 @@
+{
+  "model": "Qwen/Qwen3-32B",
+  "seed": 42,
+  "num_institutions": 240,
+  "researchers_per_institution": 5,
+  "num_years": 10,
+  "num_conferences": 6,
+  "start_year": 2016,
+  "batch_size": 32,
+  "initial_funding": 100,
+  "cases": {
+    "LN": {},
+    "LF": {},
+    "HN": {},
+    "HF": {}
+  },
+  "family": "switching_propensity"
+}

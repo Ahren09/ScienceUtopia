@@ -1,0 +1,23 @@
+{
+  "model": "Qwen/Qwen3-32B",
+  "seed": 8301,
+  "num_institutions": 24,
+  "researchers_per_institution": 5,
+  "num_years": 8,
+  "num_conferences": 6,
+  "start_year": 2016,
+  "batch_size": 32,
+  "initial_funding": 100,
+  "institutions_per_tier": 8,
+  "cases": {
+    "factorial": {}
+  },
+  "family": "resource_size",
+  "tier_sizes": {
+    "small": 2,
+    "medium": 4,
+    "large": 8
+  },
+  "low_resources": 60,
+  "high_resources": 140
+}

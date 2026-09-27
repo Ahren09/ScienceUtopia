@@ -1,0 +1,2 @@
+-r requirements.txt
+vllm==0.12.0

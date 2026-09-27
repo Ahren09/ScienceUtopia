@@ -1,0 +1,26 @@
+{
+  "model": "Qwen/Qwen3-32B",
+  "seed": 42,
+  "num_institutions": 20,
+  "researchers_per_institution": 5,
+  "num_years": 8,
+  "num_conferences": 6,
+  "start_year": 2016,
+  "batch_size": 32,
+  "initial_funding": 100,
+  "slots_frac": 0.2,
+  "reviewer_capacity": 3,
+  "cases": {
+    "S0R0": {},
+    "S1R0": {},
+    "S0R1": {},
+    "S1R1": {},
+    "S1R1_K1": {},
+    "S1R1_E1": {},
+    "S1R1_K1E1": {},
+    "S0R0_E1": {},
+    "S1R0_slots": {},
+    "S1R1_noresub": {}
+  },
+  "family": "scale_expansion"
+}

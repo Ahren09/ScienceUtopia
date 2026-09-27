@@ -1,0 +1,252 @@
+{
+  "prereg_version": "v1",
+  "study": "network_proximity",
+  "study_title": "Professional-Network Proximity Bias in Peer Review",
+  "status": "prospective_public_configuration",
+  "phenomenon_name_rule": "The review-score effect is called 'professional-network proximity bias in peer review'. 'Preferential attachment' refers only to the source-simulation network-formation mechanism, never to the review-score effect.",
+  "scientific_questions": {
+    "H1_primary": "Revealing a two-hop collaboration-network relationship increases review scores relative to revealing identity+institution alone, more than revealing a far/no relationship does. Direction: mean paper_effect > 0.",
+    "H2_secondary": "The relationship-disclosure effect is smaller at distance 3 than at distance 2 (monotone trend d2 > d3 > far).",
+    "H3_secondary": "The effect is absent or smallest for far or disconnected reviewer-author pairs.",
+    "H4_secondary": "Author and reviewer betweenness centrality moderate the relationship-disclosure effect."
+  },
+  "design_summary": "Paired within reviewer-paper-pair replay. Each matched paper has three expertise-matched reviewers at exact network distance 2, exact distance 3, and a frozen far comparator. Each reviewer-paper pair is evaluated under three information conditions: A (double-blind), B (identity+institution, relationship field 'undisclosed'), C (identity+institution + accurate frozen relationship sentence). Treatment is the content of the relationship field; B and C are byte-identical elsewhere. Primary contrast is paper-level: (C-B at d2) - (C-B at far).",
+  "graph_timing_rule": {
+    "snapshot": "For a review in source year y, network distance and all node metrics use G_{y-1}: only edges with min(edge.years) <= y-1. Future or same-year edges never enter.",
+    "assertion": "extract asserts zero edges with min(years) >= y in any snapshot used for year y; violation count reported in structural_audit.json (must be 0)"
+  },
+  "focal_author_rule": {
+    "definition": "The focal author is the first/corresponding author recorded by the source simulator: paper['author_id'] if scalar, else paper['author_id'][0].",
+    "distance": "Distance strata are reviewer-to-focal-author distances in G_{y-1}.",
+    "disclosure": "Conditions B and C disclose only the focal author's synthetic identifier and institution. Co-author identities never appear in replay prompts.",
+    "stored_fields": [
+      "focal_author_id",
+      "complete_author_list",
+      "reviewer_distance_to_focal",
+      "min_reviewer_distance_to_any_coauthor",
+      "exclusion_reason"
+    ]
+  },
+  "eligibility_and_coi": {
+    "paper_eligibility": "focal author present in G_{y-1} with >=1 pre-review edge; complete title/abstract/topics; review year known; source integrity checks passed",
+    "reviewer_exclusions_screened_against_ALL_authors": [
+      "is any author of the paper",
+      "is a distance-1 collaborator of ANY author in G_{y-1}",
+      "has a recorded conflict_of_interest with ANY author",
+      "belongs to the same institution as ANY author"
+    ],
+    "reviewer_requirements": "active agent with can_review and non-empty expertise",
+    "distance_1_note": "Direct collaborators are excluded from the primary experiment as COI. A d1 condition may appear only as a separately labeled exploratory stress test outside the primary hypothesis family, and only if budget permits after the main experiment."
+  },
+  "distance_strata": {
+    "d2": "exact shortest-path distance 2 to focal author in G_{y-1}",
+    "d3": "exact shortest-path distance 3",
+    "far_connected": "connected with shortest-path distance >= 4",
+    "disconnected": "no path (different components, or reviewer absent from graph)",
+    "far_kind_stored": true
+  },
+  "far_comparator_rule": {
+    "preferred_primary": "connected distance >= 4",
+    "condition": "connected d>=4 is the primary far comparator ONLY IF at least the full final sample target (the configured target of 300, 240, or 200) complete matched papers can be constructed with one d2, one d3, and one connected-d>=4 reviewer under all expertise/COI/timing/reuse constraints",
+    "fallback": "otherwise the pooled far-or-disconnected comparator is primary",
+    "decision_timing": "made at the structural gate from graph availability only, before any replay response is generated; decision and supporting counts recorded in structural_audit.json",
+    "secondary_reporting": "connected-far and disconnected effects always reported separately in secondary analyses"
+  },
+  "expertise_matching": {
+    "embedding_model": "sentence-transformers all-MiniLM-L6-v2, snapshot 1110a243fdf4706b3f48f1d95db1a4f5529b4d41, via utopia.metrics.embedding_tracker.EmbeddingTracker sha256-keyed cache",
+    "paper_text": "title + '\\n' + abstract + '\\n' + ', '.join(topics)",
+    "reviewer_text": "', '.join(sorted(expertise topic strings)) (fixed agent expertise; static over the run \u2014 verified; if any representation were history-derived it would be filtered to < review year)",
+    "similarity": "cosine",
+    "tolerance": "max pairwise similarity gap within a (d2,d3,far) triplet <= 0.10",
+    "exclusion_rule": "papers with no feasible triplet under all constraints are excluded and funnel-logged",
+    "balance_reporting": "per-stratum similarity means, SDs, standardized differences reported in structural_audit.json and report"
+  },
+  "matching_algorithm": {
+    "type": "deterministic bounded greedy, two passes, no iterative re-optimization toward a sample-size target",
+    "paper_processing_order": "sort candidate papers by increasing number of feasible triplets, then by stable lexicographic paper ID",
+    "triplet_objective_in_order": [
+      "1. minimize maximum expertise-similarity gap",
+      "2. minimize sum of current reviewer-use counts",
+      "3. minimize maximum reviewer-use count",
+      "4. lexicographically smallest (d2,d3,far) reviewer-ID tuple"
+    ],
+    "reviewer_reuse_cap": 10,
+    "reuse_cap_fallback": "15, permitted only if the cap of 10 prevents reaching 200 matched papers; must be decided before any review responses are generated and never changed afterwards",
+    "revisiting": "assignments are never revisited; the cap is never exceeded",
+    "second_pass": "exactly one deterministic second pass over papers left unmatched by the first pass, same objective",
+    "determinism_test": "unit test: input-order permutations of papers and candidate lists produce the identical matched corpus"
+  },
+  "samples": {
+    "smoke_papers": 24,
+    "smoke_selection": "deterministic stratified selection of 24 papers from the matched corpus using derive_seed(42,'nrb','smoke_select'); disjoint from main by construction (removed before main sampling)",
+    "main_target_ladder": "300 if >=300 complete matched triplets remain after smoke removal; else 240 if >=240; else 200 if >=200; else stop with insufficient structural support",
+    "main_sampling": "stratify as far as feasible across source seed, source year, original source-review acceptance outcome, paper novelty bucket, and focal-author degree bucket; deterministic proportional largest-remainder allocation; stable tie-breaks by paper ID; eligible and selected counts per cell recorded; inclusion probabilities recorded for population-level descriptive analyses",
+    "stability_papers": 60,
+    "stability_selection": "frozen stratified rule over the same sampling cells applied to the SELECTED main sample using derive_seed(42,'nrb','stability_select'); never the first 60",
+    "no_outcome_dependence": "no sampling step may read replay scores or effects"
+  },
+  "conditions": {
+    "block_format": "## Author Information (Non-Blind Review)\\n- Author: {synthetic_id}\\n- Institution: {institution}\\n- Professional-network relationship: {relationship_value}\\n\\n inserted at the template author-block position (after Paper section, before Review Instructions); built by the replay adapter, never by editing the global simulator prompt",
+    "A_blind": "no author-information block; title/abstract/topics + reviewer expertise + frozen balanced policy + standard rubric only",
+    "B_identity_only": {
+      "relationship_value": "undisclosed for this review."
+    },
+    "C_relationship": {
+      "d2": "You and this author are connected through one intermediary collaborator in the current collaboration network.",
+      "d3": "You and this author are connected by a collaboration-network path of length three.",
+      "far_connected": "You and this author have no collaboration-network path shorter than four steps in the current graph.",
+      "disconnected": "You and this author are in disconnected components of the current collaboration graph."
+    },
+    "synthetic_id": "Researcher {sha256(focal_author_id.encode()).hexdigest()[:8]} \u2014 stable across conditions and panels",
+    "institution": "focal author's university_name from the source ecosystem",
+    "b_c_invariant": "B and C prompts byte-identical outside relationship_value (extract-time assertion + unit test)",
+    "forbidden_phrases": [
+      "close colleague",
+      "trusted collaborator",
+      "distant outsider",
+      "influential author",
+      "prestigious connection"
+    ]
+  },
+  "reviewer_policy_and_memory": {
+    "policy_text": "You apply the conference's standard review policy: weigh methodological soundness, novelty, clarity, significance, and feasibility evenly. Base your score only on the paper's content as presented, applying the scoring rubric consistently and impartially.",
+    "policy_insertion": "'## Your Review Approach\\n{policy_text}\\n\\n' inserted immediately before the unique '## Review Instructions' anchor (existing insert_policy_block)",
+    "memory": "empty memory_bank in all conditions and strata",
+    "held_fixed": [
+      "paper",
+      "reviewer identity/expertise",
+      "policy",
+      "1-5 score scale",
+      "PaperReview JSON schema",
+      "model+revision",
+      "temperature 0.7",
+      "thinking mode on",
+      "batching",
+      "seed policy"
+    ]
+  },
+  "task_identity_and_generation": {
+    "task_uid": "paper_id|reviewer_id|condition|distance_stratum|panel_id with panel_id in {primary, stability}; uniqueness and main/stability disjointness asserted",
+    "grid": "3 conditions x 3 strata = 9 calls per paper per panel",
+    "call_budget": {
+      "smoke": 216,
+      "main_max": 2700,
+      "stability": 540,
+      "max_total_planned": 3456,
+      "plus": "failed-record retries only; no additional full global seeds"
+    },
+    "global_seed": 42,
+    "condition_order_randomization": "per paper-reviewer triplet, the A/B/C execution order is one of the 6 permutations chosen by derive_seed(42,'nrb','order',paper_id,reviewer_id) mod 6; approximately balanced across the corpus; stored as condition_order; execution sort key preserves it exactly on resume; order is a non-primary sensitivity covariate and never changes condition labels",
+    "request_seed_policy": "NO common-random-number claim across A/B/C (vLLM client derives per-request seeds from batch position). Complete task file, ordering, chunk size (512), and chunk boundaries frozen before generation with sha256 in the corpus manifest. Resume skips only fully-completed task UIDs and never compacts partial chunks. attempt-0 request seed recorded per task; retry/tail-sweep seeds distinct and labeled. Post-prereg chunk-size change is rejected with an explicit error.",
+    "stability_seeds": "fresh request seeds via distinct seed_ctx ('nrb', corpus_version, 'stability', chunk_index)"
+  },
+  "primary_endpoint": {
+    "unit": "paper (matched triplet); the reviewer-paper pair is the unit for the within-pair C-B difference",
+    "definition": "delta_i_s = score_C_i_s - score_B_i_s for s in {d2, d3, far}; paper_effect_i = delta_i_d2 - delta_i_far; primary estimand = mean_i(paper_effect_i)",
+    "inclusion": "only papers with complete valid B and C responses for BOTH the d2 reviewer and the frozen far-comparator reviewer enter the primary analysis; completeness funnel reported",
+    "score": "raw numeric overall_score primary; simulator-style int-cast score preregistered sensitivity",
+    "inference": "paper-level nonparametric bootstrap, 10000 resamples, seed derive_seed(42,'nrb','boot_primary'); 95% percentile CI; two-sided p via CI inversion",
+    "robustness_required": [
+      "reviewer-clustered bootstrap",
+      "two-way paper/reviewer clustered inference",
+      "reviewer-pair-level stacked regression (delta ~ stratum indicators, cluster-robust)",
+      "expertise-similarity covariate adjustment",
+      "hierarchical source-seed -> paper resampling"
+    ],
+    "minimal_scientifically_interesting_effect": "0.10 raw score points (1-5 scale) for the primary contrast; effects below this with CI excluding 0.10 are labeled 'statistically detectable but below the minimal interesting magnitude'"
+  },
+  "secondary_family_bh_corrected": [
+    "S1 d3 contrast: mean_i(delta_i_d3 - delta_i_far)",
+    "S2 ordinal distance trend of delta across {2,3,far} (weighted least squares slope, paper-clustered bootstrap)",
+    "S3 connected-far vs disconnected relationship effect",
+    "S4 identity-only effect: mean(score_B - score_A) pooled and by stratum",
+    "S5 author-betweenness moderation: paper_effect_i ~ standardized focal-author betweenness (paper-clustered bootstrap)",
+    "S6 reviewer-betweenness moderation: delta_j ~ standardized reviewer betweenness (stacked, two-way clustered)",
+    "S7 acceptance-decision sensitivity: flip rate of deterministic acceptance rule between B and C by stratum",
+    "S8 stability replication: primary contrast in the 60-paper stability panel, agreement with main"
+  ],
+  "multiplicity": "Benjamini-Hochberg at q=0.05 within the 8-member secondary family; primary tested alone at alpha=0.05",
+  "descriptive_non_blocking": [
+    "relationship-mention rate in C justifications (frozen keyword list: ['collaborat', 'connect', 'network', 'relationship', 'mutual', 'intermediary', 'co-author', 'coauthor', 'path', 'component'])",
+    "rationale positivity via frozen word lists (positive: ['strong','novel','clear','significant','sound','compelling','thorough','promising','rigorous','excellent']; negative: ['weak','unclear','incremental','flawed','limited','insufficient','vague','unconvincing','marginal','poor'])",
+    "network topology (path length, clustering, degree distribution, components, betweenness distribution) \u2014 context only, never evidence of review bias"
+  ],
+  "sensitivities_not_in_bh_family": [
+    "paper fixed effects",
+    "expertise-similarity covariate",
+    "exclude disconnected pairs",
+    "integer-cast scores",
+    "leave-one-source-seed-out (if two seeds)",
+    "condition-order covariate",
+    "IPW to the eligible-paper population using recorded inclusion probabilities (descriptive)"
+  ],
+  "missingness_rules": {
+    "parse_failure": "one in-request retry cycle (client max_retries=3) then one tail-sweep pass with distinct labeled seeds; rows failing after sweep are missing",
+    "primary": "listwise by paper for the primary (complete-triplet requirement on d2 and far B/C cells)",
+    "secondary": "each secondary uses papers complete for the cells it needs; per-analysis Ns reported",
+    "threshold": "if >2% of primary cells are missing after sweep, report as a limitation and run a worst-case bounds sensitivity"
+  },
+  "leakage_and_integrity": {
+    "scanner": "section-aware scan_leakage: legitimate paper section may contain title/abstract/topics; A must contain no synthetic id, institution, or relationship sentence; B must contain identity+institution but no relationship sentence other than the frozen 'undisclosed' placeholder; C may contain exactly the frozen relationship block",
+    "needles": [
+      "synthetic author id",
+      "focal institution string",
+      "all four C relationship sentences",
+      "raw focal_author_id",
+      "original decision/outcome",
+      "future citations",
+      "strategy labels",
+      "funding history"
+    ],
+    "memory": "current paper absent from reviewer memory by construction (empty memory)",
+    "source_integrity": "source checkpoints and ledgers must pass existing integrity checks before extraction"
+  },
+  "structural_gate_criteria": {
+    "file": "data/<study>_<run-name>/structural_audit.json",
+    "timing": "after source generation and matching, before any replay generation",
+    "must_report": [
+      "candidate papers",
+      "per-exclusion funnel with exact reasons",
+      "complete matched triplets",
+      "connected-far and disconnected counts",
+      "far-comparator decision + supporting counts",
+      "expertise-similarity distributions and max gap",
+      "reviewer-reuse distribution, max, effective number of reviewers, reuse by stratum",
+      "source-year balance",
+      "source-seed balance",
+      "same-institution exclusions",
+      "direct-COI exclusions",
+      "future-edge violations (must be 0)"
+    ],
+    "proceed_only_if": [
+      "matched papers >= 200",
+      "all three strata supported",
+      "zero future edges",
+      "zero direct collaborator or COI in primary set",
+      "expertise tolerance met",
+      "reuse cap satisfied"
+    ]
+  },
+  "smoke_gate_13_criteria": [
+    "all three strata represented",
+    "expertise matching within tolerance",
+    "graph snapshots pre-review only",
+    "no d1 COI in primary tasks",
+    "A/B/C information separation exact",
+    "B/C differ only in relationship field",
+    "zero unintended leakage",
+    "parse success >=99% after retry",
+    "first-attempt parse success >=95%",
+    "no unresolved truncation",
+    "resume does not repeat completed UIDs",
+    "projected main runtime <=12h",
+    "all writes in allowed directories"
+  ],
+  "conclusion_labels": [
+    "positive evidence of network-proximity bias",
+    "informative null",
+    "inconclusive due to matching or precision",
+    "invalid due to failed design checks"
+  ],
+  "no_tuning_rule": "distance definitions, matching thresholds, comparator rules, and samples are never tuned to obtain significance; nulls are reported as results, not failures"
+}

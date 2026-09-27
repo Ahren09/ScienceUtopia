@@ -1,0 +1,4 @@
+-r requirements.txt
+# Optional Gemini transport and scalar experiment logging.
+google-generativeai==0.8.5
+wandb==0.22.0
