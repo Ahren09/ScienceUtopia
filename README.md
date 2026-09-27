@@ -4,6 +4,8 @@
 
 ### *A configurable simulation of research, peer review, and scientific funding*
 
+[**Project website**](https://ahren09.github.io/ScienceUtopia/)
+
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.11-3776AB.svg)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.9.0-EE4C2C.svg)](https://pytorch.org/)
@@ -18,7 +20,9 @@
 
 ScienceUtopia models researchers choosing projects, submitting papers, reviewing one another's work, receiving citations, and competing for funding. Language models make structured decisions within an explicit yearly simulation. Researchers retrieve candidate papers from the public [SciEvo dataset](https://huggingface.co/datasets/Ahren09/SciEvo).
 
-This release supports **new experiments**. It contains the simulator, scientific prompts, experiment definitions, numerical estimators, and regression tests. Historical campaign artifacts and their original results are not distributed. Outputs are checkpoints, request audits, manifests, and numerical tables; visualization code and assets are excluded.
+This release supports **new experiments**. It contains the simulator, scientific prompts, experiment definitions, numerical estimators, and regression tests. Historical campaign artifacts and their original results are not distributed. Simulation outputs are checkpoints, request audits, manifests, and numerical tables; experiment plotting and rendering code are excluded.
+
+The [project website](https://ahren09.github.io/ScienceUtopia/) is a static page in `index.html`, with styles in `assets/css/style.css` and the copy-button script in `assets/js/main.js`. Open `index.html` directly in a browser, or view the GitHub Pages site. No backend, package installation, or frontend build is required. GitHub Pages publishes the root of `main`; `.nojekyll` keeps the files static.
 
 ## Highlights
 
@@ -107,6 +111,10 @@ export SCIENCEUTOPIA_GPU="${SCIENCEUTOPIA_GPU:-0}"
 export SCIENCEUTOPIA_PORT="${SCIENCEUTOPIA_PORT:-8000}"
 export CUDA_VISIBLE_DEVICES="$SCIENCEUTOPIA_GPU"
 export OMP_NUM_THREADS=4
+# Runtime IPC needs short paths for both vLLM and the dataset loader.
+# Large downloads and caches remain in HF_HOME and PIP_CACHE_DIR.
+export TMPDIR="$(mktemp -d /tmp/scienceutopia-runtime-XXXXXX)"
+export VLLM_RPC_BASE_PATH="$TMPDIR"
 mkdir -p outputs/logs
 
 # 2) Start the model server. The first launch downloads Qwen3-8B.
@@ -149,9 +157,11 @@ python -B -m utopia \
 
 # 5) Validate all three years and produce a numerical report.
 python -m utopia.analysis.release \
-    --run explore_smoke_qwen3_8b_neutral_i2_n10_y3_seed42 \
+    --run explore_smoke_qwen3_8b_neutral_i2_n10_y3_seed42_costv1_per_paper_resub5_ledger1_acdad001284e \
     --require-activity --out-dir outputs/docs/quickstart-report
 ```
+
+During installation, `TMPDIR` points to the chosen storage volume for package downloads. At runtime, the short `TMPDIR` above prevents Unix-socket path limits in both vLLM and the dataset loader; `VLLM_RPC_BASE_PATH` uses the same directory. `HF_HOME`, `PIP_CACHE_DIR`, generated data caches, and simulation outputs remain on the chosen storage volume. Use these runtime exports for experiment commands too.
 
 The first simulation downloads SciEvo's `arxiv` configuration and builds the retrieval index. This example selects CS papers from 2016–2018 and downloads the small embedding models. Subsequent runs reuse valid caches. Runtime depends on download speed, GPU load, and model response lengths; allow tens of minutes for the full first run.
 
@@ -159,7 +169,7 @@ Inspect `outputs/logs/quickstart.log` for progress. Failed attempts preserve the
 
 ### Expected outputs
 
-The experiment ID is `explore_smoke_qwen3_8b_neutral_i2_n10_y3_seed42`.
+The experiment ID is `explore_smoke_qwen3_8b_neutral_i2_n10_y3_seed42_costv1_per_paper_resub5_ledger1_acdad001284e`.
 
 - `outputs/checkpoints/<experiment_id>/`: complete yearly JSON checkpoints, population blueprint, funding applications, resource ledgers, and final simulation report.
 - `outputs/docs/<experiment_id>/`: run manifest, JSONL request audit and its closed summary, and numerical exploration tables.
