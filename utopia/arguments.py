@@ -1,6 +1,5 @@
 import argparse
 import os
-import sys
 
 
 def parse_arguments(argv=None):
@@ -168,7 +167,7 @@ def parse_arguments(argv=None):
         '--experiment_stage',
         type=str,
         default=None,
-        choices=['smoke', 'pilot', 'scalecheck', 'calibration', 'confirmatory', 'manyworld', 'mechanism', 'matthew_rd', 'matthew_rd_cost', 'scale'],
+        choices=['smoke', 'pilot', 'scalecheck', 'calibration', 'confirmatory', 'manyworld', 'mechanism', 'funding_cutoff', 'funding_cutoff_cost', 'scale'],
         help='Experiment stage. When set, canonical outputs/{logs,checkpoints,visual,docs}/<experiment_id>/ '
              'paths are used and an experiment_id is derived. When absent, legacy layout is preserved.'
     )
@@ -233,7 +232,7 @@ def parse_arguments(argv=None):
         type=int,
         default=0,
         help='Resource units deducted per GRANT APPLICATION at submission time, before '
-             'the funding result is known, for winners and losers alike (matthew_rd_cost '
+             'the funding result is known, for winners and losers alike (funding_cutoff_cost '
              'intervention). 0 (default) reproduces existing behavior exactly. Does NOT '
              'affect paper resubmission mechanics.'
     )
@@ -417,7 +416,7 @@ def parse_arguments(argv=None):
     if args.reviews_per_paper < 1:
         raise ValueError('--reviews_per_paper must be >= 1')
 
-    from src.project_cost_accounting import resolve_cost_policy, cost_policy_tag
+    from utopia.funding.accounting import resolve_cost_policy, cost_policy_tag
     from utopia.config import SIMULATION_CONFIG
     cost_tag = cost_policy_tag(resolve_cost_policy(args, SIMULATION_CONFIG))
 

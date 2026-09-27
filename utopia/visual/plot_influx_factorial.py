@@ -9,7 +9,7 @@ B = influx only, C = recycling only (paper-baseline twin), D = both (flagship).
 Factorial visual encoding (so the 2x2 design is legible at a glance):
     COLOR     = recycling  (cobalt #1F6FB5 = off, NPG red #E5493A = on)
     LINESTYLE = influx     (dashed = off, solid = on)
-Vivid accent trio shared with the review-bias figure (visual_utils.VIVID_*).
+Vivid accent trio shared with the review-bias figure (visual.common.VIVID_*).
 No error bars: results are one seed-matched counterfactual set.
 
 Main figure (fig_influx_factorial):
@@ -40,8 +40,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from utopia.utils.visual_utils import (GRID, INK, MUTED, VIVID_COOL, VIVID_GOLD,
-                                       VIVID_WARM, nature_style)
+from utopia.visual.common import GRID, INK, MUTED, VIVID_COOL, VIVID_GOLD, VIVID_WARM, nature_style
 
 DEFAULT_STATS = {
     'A': 'outputs/docs/resubmission_stats_influx2x2_A_noinflux_noresub_seed42/resubmission_stats.json',

@@ -23,9 +23,8 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
 
-from utopia.utils.visual_utils import GRID, INK, MUTED, nature_style
-from utopia.visual.plot_resubmission_cascades import (
-    DEFAULT_DECLINING, DEFAULT_FIXED, DEFAULT_OUT_DIR, PALETTE, REGIMES)
+from utopia.visual.common import GRID, MUTED, nature_style
+from utopia.visual.plot_resubmission_cascades import DEFAULT_DECLINING, DEFAULT_FIXED, DEFAULT_OUT_DIR, PALETTE, REGIMES
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)

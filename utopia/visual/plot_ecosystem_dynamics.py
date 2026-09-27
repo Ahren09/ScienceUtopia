@@ -15,8 +15,7 @@ Panels (1x4, double-column)
     (c) Researcher attrition: number of still-active researchers, falling as
         agents run out of resources.
     (d) Review scores: yearly mean of all individual reviewer scores with a
-        +-1 SD envelope, against the rubric's accept threshold (3 =
-        borderline accept) and the 2.0-2.5 "borderline reject" band. The
+        +-1 SD envelope, against the score reference at 3 and the 2.0-2.5 "borderline reject" band. The
         mean stays inside that band all decade (2.29 -> 2.40, median pinned
         at 2.0) and the envelope does NOT narrow -- scores do not converge
         (cross-review SD 0.50 -> 0.55, within-panel reviewer disagreement
@@ -67,7 +66,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
 
-from utopia.utils.visual_utils import GRID, INK, MUTED, nature_style
+from utopia.visual.common import GRID, INK, MUTED, nature_style
 
 DEFAULT_TRAJECTORIES = 'outputs/docs/explore_e4a_analysis/ecosystem_trajectories.csv'
 DEFAULT_REVIEW_SCORES = 'outputs/docs/explore_e4a_analysis/review_score_trajectories.csv'
@@ -158,7 +157,7 @@ def main():
     ax_c.set_title('Population attrites', pad=4)
 
     # (d) Review scores: yearly mean of individual reviewer scores with a
-    # +-1 SD envelope, vs. the accept threshold (3) and the 2.0-2.5
+    # +-1 SD envelope, vs. the score reference (3) and the 2.0-2.5
     # borderline-reject band. A non-narrowing envelope = no convergence.
     # (d) 评审分数:单条评审分的年均值 ± 1 SD 包络;包络不收窄 = 分数没有趋同。
     yearly = (scores.groupby('year')[['mean', 'sd']].mean().reset_index())
@@ -169,7 +168,7 @@ def main():
                       color=BLUE, alpha=0.16, linewidth=0)
     m = seed_band(ax_d, scores, 'mean', BLUE)
     end_label(ax_d, m, INK, '{:.2f}')
-    ax_d.annotate('accept threshold', xy=(1, 3.0), xytext=(0, 2),
+    ax_d.annotate('score 3 reference', xy=(1, 3.0), xytext=(0, 2),
                   textcoords='offset points', ha='left', va='bottom',
                   fontsize=5.5, color=MUTED)
     ax_d.annotate('borderline-reject band', xy=(10, 2.05), xytext=(0, 0),

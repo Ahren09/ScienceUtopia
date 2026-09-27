@@ -1,5 +1,4 @@
 # Ahren: newly added
-demo/
 tmp*
 ai_scientist/ideas/
 DOC.md
@@ -16,19 +15,20 @@ extensions
 # Distribution / packaging
 .Python
 build/
-data
+/data/
 develop-eggs/
 dist/
 downloads/
+docs/
 eggs/
 .eggs/
 lib/
 lib64/
-outputs
+/outputs/
 parts/
 sdist/
 var/
-wandb*
+wandb*/
 wheels/
 share/python-wheels/
 *.egg-info/
@@ -194,7 +194,7 @@ review_iclr_bench/generated_paper/
 review_iclr_bench/iclr_parsed/
 
 # Experiment logs
-experiments/
+/experiments/
 aisci_outputs/
 slurm_logs/
 .out
@@ -205,7 +205,10 @@ final_papers/
 # HF
 cache/
 huggingface/
-experiments
+/experiments/
 MultiAgentResearch.md
 ScienceUtopia_260209.md
 Science Utopia.pdf
+
+# Versioned test fixtures are source inputs.
+!tests/support/fixtures/*.json

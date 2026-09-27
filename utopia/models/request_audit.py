@@ -1,10 +1,14 @@
-"""Opt-in request accounting for the prospectively frozen James experiments.
+"""Opt-in request accounting for the prospectively frozen Funding feedback experiments.
 
 No prompts, decoding parameters, request seeds, or retry policies are changed.
 The exact pinned chat tokenizer checks input plus the caller's output reservation
 before HTTP. Deterministic context violations, provenance mismatches and failed
 audit writes escape the simulator's broad ``except Exception`` fallbacks.
 """
+
+from utopia.utils.data_utils import json_sha256
+
+from utopia.utils.data_utils import file_sha256
 
 from contextlib import contextmanager
 import hashlib
@@ -34,7 +38,8 @@ def _json(value):
 
 
 def _sha(value):
-    return hashlib.sha256(_json(value).encode()).hexdigest()
+    return json_sha256(value, ensure_ascii=False, sort_keys=True,
+                       separators=(",", ":"), allow_nan=False)
 
 
 @contextmanager
@@ -102,10 +107,10 @@ class RequestAudit:
                 self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_APPEND
                 | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
             self.identity = {
-                "protocol": "james-request-audit-v1", "model": MODEL,
+                "protocol": "request-audit-v1", "model": MODEL,
                 "model_revision": REVISION, "context_tokens": CONTEXT_TOKENS,
                 "chat_template_sha256": _sha(self.tokenizer.chat_template),
-                "audit_source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                "audit_source_sha256": file_sha256(Path(__file__)),
                 "sdk_retries": 5,
                 "scope": "One event per SDK call; SDK-internal transport retries are not individual events.",
             }

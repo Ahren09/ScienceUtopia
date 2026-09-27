@@ -1,10 +1,8 @@
 import base64
 import json
 import logging
-import math
 import os
 import re
-import sys
 import time
 from io import BytesIO
 from typing import List, Optional, Union, Dict, Tuple
@@ -14,7 +12,7 @@ import google.generativeai as genai
 import numpy as np
 from PIL import Image
 from openai import AzureOpenAI, OpenAI
-from const import IMPORTANT_NOTES
+from utopia.constants import IMPORTANT_NOTES
 from utopia.config import SIMULATION_CONFIG
 from utopia.models.structured_outputs import build_vllm_extra_body
 
@@ -574,7 +572,7 @@ class VLLMServerModel(BaseLLM):
     def _request_seed(self, seed_ctx: Optional[tuple], idx: int, attempt: int) -> Optional[int]:
         if self.run_seed is None:
             return None
-        from utopia.utils.generail_utils import derive_seed
+        from utopia.utils.seeding import derive_seed
         return derive_seed(self.run_seed, *(seed_ctx or ('noctx',)), idx, attempt)
         
     def _build_extra_body(self, response_format: Optional[Dict] = None) -> dict:

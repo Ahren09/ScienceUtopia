@@ -1,1 +1,0 @@
-CUDA_VISIBLE_DEVICES=4,5 python -m vllm.entrypoints.openai.api_server --model Qwen/Qwen3-8B --gpu-memory-utilization 0.95 --max-model-len 32768 --tensor-parallel-size 2 --reasoning-parser qwen3 --port 8000

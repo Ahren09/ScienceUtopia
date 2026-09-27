@@ -22,7 +22,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from utopia.utils.visual_utils import GRID, INK, MUTED, nature_style
+from utopia.visual.common import GRID, INK, MUTED, nature_style
 
 DEFAULT_FIXED = ('outputs/docs/resubmission_stats_default_Qwen3-32B_fixed30_paired/'
                  'resubmission_stats.json')

@@ -330,7 +330,7 @@ class FundingAgency(SimulationAgent):
         for program_id, apps in program_to_applications.items():
             if panel_max_apps and len(apps) > panel_max_apps:
                 import math as _math
-                from utopia.utils.generail_utils import derive_seed
+                from utopia.utils.seeding import derive_seed
                 rng = random.Random(derive_seed(panel_seed if panel_seed is not None else 0,
                                                 'funding_panels', program_id))
                 shuffled = list(apps)

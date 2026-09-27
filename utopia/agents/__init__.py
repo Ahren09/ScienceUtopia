@@ -1,21 +1,14 @@
-"""
-Multi-Agent Scientific Ecosystem Framework
+"""Agent types, loaded on demand so policy utilities stay lightweight."""
 
-This module extends the AI-Scientist-v2 infrastructure with multi-agent capabilities
-WITHOUT modifying any original files. All classes extend existing AI-Scientist components.
-"""
+from importlib import import_module
 
-from .base_agent import MultiAgentEcosystem, SimulationAgent
-from .researcher_agents import UniversityResearcher, IndustryResearcher, FreelancerAgent
-from .funding_agents import FundingAgency, FundingProgram, IndustryFundingSystem
+_EXPORTS = {'MultiAgentEcosystem': 'utopia.agents.base_agent', 'SimulationAgent': 'utopia.agents.base_agent', 'UniversityResearcher': 'utopia.agents.researcher_agents', 'IndustryResearcher': 'utopia.agents.researcher_agents', 'FreelancerAgent': 'utopia.agents.researcher_agents', 'FundingAgency': 'utopia.agents.funding_agents', 'FundingProgram': 'utopia.agents.funding_agents', 'IndustryFundingSystem': 'utopia.agents.funding_agents'}
+__all__ = list(_EXPORTS)
 
-__all__ = [
-    'MultiAgentEcosystem',
-    'SimulationAgent',
-    'UniversityResearcher',
-    'IndustryResearcher',
-    'FreelancerAgent',
-    'FundingAgency',
-    'FundingProgram',
-    'IndustryFundingSystem'
-]
+
+def __getattr__(name):
+    if name not in _EXPORTS:
+        raise AttributeError(name)
+    value = getattr(import_module(_EXPORTS[name]), name)
+    globals()[name] = value
+    return value
