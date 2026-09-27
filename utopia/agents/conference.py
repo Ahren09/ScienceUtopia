@@ -181,7 +181,7 @@ class Conference:
         if tiebreak_seed is None:
             paper_scores.sort(key=lambda x: x['score'], reverse=True)
         else:
-            from utopia.utils.generail_utils import derive_seed
+            from utopia.utils.seeding import derive_seed
             rng = random.Random(derive_seed(tiebreak_seed, self.conference_id))
             tiebreak_keys = [rng.random() for _ in paper_scores]
             order = sorted(range(len(paper_scores)),

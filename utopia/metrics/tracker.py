@@ -2,7 +2,6 @@
 
 import numpy as np
 from typing import Dict, List, Set, Any, Union
-from collections import defaultdict
 
 
 def calculate_gini_coefficient(values: Union[List[float], Dict[str, float]]) -> float:
@@ -122,3 +121,9 @@ def calculate_citation_metrics(citations: Dict[str, Set], papers_by_year: Dict[i
         'mean_citations_per_paper': float(np.mean(citation_counts)) if citation_counts else 0.0,
         'max_citations': max(citation_counts) if citation_counts else 0
     }
+
+
+def top_percentile(value, data):
+    data = np.array(data)
+    percentile = np.sum(data > value) / len(data) * 100
+    return max(percentile, 1)

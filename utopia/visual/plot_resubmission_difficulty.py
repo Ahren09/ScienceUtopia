@@ -14,7 +14,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from utopia.utils.visual_utils import nature_style
+from utopia.visual.common import nature_style
 from utopia.visual.plot_resubmission_cascades import (
     DEFAULT_DECLINING, DEFAULT_FIXED, DEFAULT_OUT_DIR, acceptance_panel)
 

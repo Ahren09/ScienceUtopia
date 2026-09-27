@@ -45,19 +45,10 @@ import json
 import os
 import re
 
-import numpy as np
 import pandas as pd
 
-from utopia.analysis.exploration_cross_seed import (
-    PRIMARY_CONTRASTS,
-    STRATEGIES,
-    benjamini_hochberg,
-    discover_runs,
-    hierarchical_bootstrap,
-    load_table,
-    researcher_level,
-    validate_runs,
-)
+from utopia.analysis.statistics import benjamini_hochberg, hierarchical_bootstrap
+from utopia.analysis.exploration_cross_seed import PRIMARY_CONTRASTS, STRATEGIES, discover_runs, load_table, researcher_level, validate_runs
 from utopia.metrics import calculate_gini_coefficient
 
 RUN_PREFIX = 'explore_confirmatory_qwen3_32b_neutral_i1000_n5000_y10'

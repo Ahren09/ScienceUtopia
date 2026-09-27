@@ -26,7 +26,7 @@ import numpy as np
 import seaborn as sns
 from matplotlib.lines import Line2D
 
-from utopia.utils.visual_utils import (
+from utopia.visual.common import (
     GRID, MUTED, VIVID_COOL, VIVID_WARM, nature_style,
 )
 from utopia.visual.plot_influx_factorial import DEFAULT_STATS, multiplier_panel

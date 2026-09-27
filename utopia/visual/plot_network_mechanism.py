@@ -46,12 +46,11 @@ import argparse
 import json
 from pathlib import Path
 
-import matplotlib as mpl
 import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
 
-from utopia.utils.visual_utils import GRID, INK, MUTED, nature_style
+from utopia.visual.common import GRID, INK, nature_style
 
 DEFAULT_GROWTH_LOG = ('outputs/checkpoints/network_review_bias_source_seed7101/'
                       'preferential_attachment/network_growth_log.jsonl')

@@ -67,6 +67,9 @@ Metric definitions
   hit               paper in the top citation decile of its cohort; labeled
                     "high-impact paper" in figure text, and aggregated per
                     researcher by the hit_rate / ever_hit data columns
+  ever_hit (c)     researcher citation total at or above the within-world
+                    90th percentile (ties included); distinct from the
+                    calibration paper-hit event plotted in panel (a)
   log1p_citations   log(1 + citations) at paper age 3 (skew-robust)
   SMD               mean difference / pooled within-seed SD
 
@@ -96,6 +99,12 @@ Args: --analysis_dir (cross-seed CSV dir), --runs_glob (per-seed run dirs
 for the trajectory panels), --out_dir (figure destination),
 --e4a_analysis_dir / --e4a_runs_glob (E4a inputs for panels c/d).
 """
+
+import os
+import numpy as np
+import pandas as pd
+from utopia.visual.common import save_figure
+from utopia.analysis.exploration_cross_seed import STRATEGIES as DIAGNOSTIC_STRATEGIES
 import argparse
 import glob
 import re
@@ -103,12 +112,9 @@ from pathlib import Path
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
 import seaborn as sns
 
-from utopia.utils.visual_utils import (
-    GRID, INK, MUTED, nature_style, STRATEGY_PALETTE, STRATEGY_NICE)
+from utopia.visual.common import GRID, INK, MUTED, nature_style, STRATEGY_PALETTE, STRATEGY_NICE
 
 DEFAULT_ANALYSIS_DIR = 'outputs/docs/explore_calibration_analysis'
 DEFAULT_RUNS_GLOB = ('outputs/docs/'
@@ -119,7 +125,7 @@ DEFAULT_E4A_ANALYSIS_DIR = 'outputs/docs/explore_e4a_analysis'
 DEFAULT_E4A_RUNS_GLOB = ('outputs/docs/'
                          'explore_confirmatory_qwen3_32b_neutral_i1000_n5000_y10_seed*')
 
-# Shared three-strategy palette (single source of truth in visual_utils):
+# Shared three-strategy palette (single source of truth in visual.common):
 # Hiroshige-family warm coral / soft amber / deep steel blue. The cautious
 # explorer wears the salient deep blue -- it is the story's protagonist.
 STRATEGIES = ['explorer', 'cautious_explorer', 'exploiter']
@@ -327,7 +333,7 @@ def trajectory_panel(ax, sy: pd.DataFrame, value: str, ylabel: str, title: str,
 # Forest rows: hypothesis-test outcome column, display label, raw-effect format.
 OUTCOMES = [
     ('acceptance_rate', 'Acceptance\nrate', lambda d: f'{d * 100:+.1f}'),
-    ('ever_hit', 'Citation-hit\nprob.', lambda d: f'{d * 100:+.1f}'),
+    ('ever_hit', 'Top-decile\ncitation prob.', lambda d: f'{d * 100:+.1f}'),
     ('log1p_citations', 'log\ncitations', lambda d: f'{d:+.3f}'),
     ('cumulative_funding_received', 'Cumulative\nfunding', lambda d: f'{d:+.1f}'),
 ]
@@ -467,7 +473,7 @@ def main():
 
     smd = mc.smd_explorer_vs_exploiter_career
     axr_a = strategy_points_panel(
-        ax_a, agg, 'career_distance', 'Mean career distance',
+        ax_a, agg, 'career_distance', 'Mean exploration distance (ED)',
         'Behavior and high-impact papers',
         note=f'explorer vs exploiter\nSMD {smd.min():.1f}–{smd.max():.1f}',
         overlay_col='hit_rate',
@@ -529,3 +535,106 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+def make_figures(researchers, agent_year, ecosystem, paper_age, out_dir):
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    fig_dir = os.path.join(out_dir, 'figures')
+    os.makedirs(fig_dir, exist_ok=True)
+    colors = {'explorer': 'tab:red', 'exploiter': 'tab:blue', 'cautious_explorer': 'tab:green'}
+    n_seeds = researchers['seed'].nunique() if len(researchers) else 0
+
+    def save(fig, name, title):
+        fig.suptitle(f"{title}\n(n={len(researchers)} researchers, {n_seeds} seeds; "
+                     f"uncertainty across seeds)", fontsize=9)
+        save_figure(fig, os.path.join(fig_dir, name), dpi=150)
+
+    def yearly_by_strategy(df, col, ax):
+        df = df.copy()
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+        for s in DIAGNOSTIC_STRATEGIES:
+            sub = df[df.strategy == s].groupby(['seed', 'year'])[col].mean().reset_index()
+            m = sub.groupby('year')[col].mean()
+            lo = sub.groupby('year')[col].min()
+            hi = sub.groupby('year')[col].max()
+            ax.plot(m.index, m.values, label=s, color=colors[s])
+            ax.fill_between(m.index, lo.values, hi.values, alpha=0.15, color=colors[s])
+        ax.legend(fontsize=7)
+        ax.set_xlabel('year')
+
+    if len(agent_year):
+        for col, fname, title in [
+                ('avg_career_distance', 'fig1_manipulation_career_distance.png',
+                 'Manipulation check: career-centroid distance by year and strategy'),
+                ('topic_switched', 'fig2_topic_switch_rate.png', 'Topic switch rate'),
+                ('acceptance_rate', 'fig3_acceptance_trajectory.png', 'Simulated acceptance rate'),
+                ('funding', 'fig4_funding_trajectory.png', 'Simulated funding')]:
+            fig, ax = plt.subplots(figsize=(6, 4))
+            yearly_by_strategy(agent_year, col, ax)
+            ax.set_ylabel(col)
+            save(fig, fname, title)
+
+    if len(paper_age):
+        age3 = paper_age[paper_age.age == 3]
+        if len(age3):
+            fig, ax = plt.subplots(figsize=(6, 4))
+            data = [np.log1p(age3[age3.strategy == s]['citations'].dropna()) for s in DIAGNOSTIC_STRATEGIES]
+            ax.violinplot([d.values for d in data], showmedians=True)
+            ax.set_xticks([1, 2, 3]); ax.set_xticklabels(DIAGNOSTIC_STRATEGIES, fontsize=8)
+            ax.set_ylabel('log1p(citations) at age 3')
+            save(fig, 'fig5_citation_age3_distribution.png', 'Simulated citations at age 3')
+
+            fig, ax = plt.subplots(figsize=(6, 4))
+            for s in DIAGNOSTIC_STRATEGIES:
+                sub = age3[age3.strategy == s]
+                ax.scatter(sub['novelty_score'], np.log1p(sub['citations']),
+                           s=8, alpha=0.4, color=colors[s], label=s)
+            ax.set_xlabel('novelty'); ax.set_ylabel('log1p(citations) age 3')
+            ax.legend(fontsize=7)
+            save(fig, 'fig6_risk_return.png', 'Risk-return: novelty vs age-3 citations')
+
+        cd3 = paper_age[(paper_age.age == 3) & paper_age.cd.notna()]
+        if len(cd3):
+            fig, ax = plt.subplots(figsize=(6, 4))
+            data = [cd3[cd3.strategy == s]['cd'].dropna().values for s in DIAGNOSTIC_STRATEGIES]
+            ax.boxplot(data, labels=DIAGNOSTIC_STRATEGIES)
+            ax.set_ylabel('CD index at age 3')
+            save(fig, 'fig9_cd_distribution.png', 'Disruption: age-3 CD index')
+
+        fig, ax = plt.subplots(figsize=(6, 4))
+        for s in DIAGNOSTIC_STRATEGIES:
+            acc = paper_age[paper_age.strategy == s].groupby('age')['citations'].mean()
+            ax.plot(acc.index, acc.values, label=s, color=colors[s], marker='o')
+        ax.set_xlabel('paper age'); ax.set_ylabel('mean cumulative citations')
+        ax.legend(fontsize=7)
+        save(fig, 'fig8_citation_accumulation.png', 'Citation accumulation by paper age')
+
+    if len(ecosystem):
+        for col, fname, title in [
+                ('topic_entropy_normalized', 'fig10_topic_entropy.png', 'Ecosystem topic entropy'),
+                ('funding_gini', 'fig11a_funding_gini.png', 'Funding Gini'),
+                ('citation_gini', 'fig11b_citation_gini.png', 'Citation Gini'),
+                ('num_active_researchers', 'fig12_active_researchers.png', 'Active researchers')]:
+            if col not in ecosystem.columns:
+                continue
+            fig, ax = plt.subplots(figsize=(6, 4))
+            for s_val, sub in ecosystem.groupby('seed'):
+                ax.plot(sub['year'], pd.to_numeric(sub[col], errors='coerce'),
+                        alpha=0.6, label=f'seed {s_val}')
+            ax.set_xlabel('year'); ax.set_ylabel(col)
+            ax.legend(fontsize=7)
+            save(fig, fname, title)
+
+    if len(researchers):
+        fig, ax = plt.subplots(figsize=(6, 4))
+        shares = []
+        hit = researchers.groupby(['seed', 'strategy'])['hit_papers'].sum().reset_index()
+        for s in DIAGNOSTIC_STRATEGIES:
+            sub = hit[hit.strategy == s]
+            shares.append(sub['hit_papers'].mean())
+        ax.bar(DIAGNOSTIC_STRATEGIES, shares, color=[colors[s] for s in DIAGNOSTIC_STRATEGIES])
+        ax.set_ylabel('mean hit papers per seed')
+        save(fig, 'fig7_hit_paper_share.png', 'Hit-paper share by strategy')

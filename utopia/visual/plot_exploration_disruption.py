@@ -11,8 +11,8 @@ Experiment
     worlds as panel (c) of fig_topic_diversity_selection_gate. Another run
     family can be selected with --run_prefix.
 
-Main figure (single subplot, fig_exploration_disruption; the same draw() also
-renders panel (d) of fig_topic_diversity_selection_gate)
+Main-text panel (d) of fig_topic_diversity_selection_gate (draw(), called from
+that module)
     x: topical departure of the paper, in the same five equal-width bins as the
        selection-gate figure (ticks at the bin edges). Topical departure = 1 - cosine(e_paper, c_author),
        the embedding distance between the paper's abstract and the author's
@@ -51,7 +51,7 @@ Data provenance (read-only inputs)
 
 Run
     python -m utopia.visual.plot_exploration_disruption
-    (writes both PDFs under outputs/visual/exploration_disruption/ and the
+    (writes the appendix PDF under outputs/visual/exploration_disruption/ and the
     per-bin tables under outputs/docs/exploration_disruption/)
 """
 import argparse
@@ -62,9 +62,9 @@ import pandas as pd
 import seaborn as sns
 
 from utopia.analysis.exploration_cross_seed import discover_runs, load_table, validate_runs
-from utopia.utils.visual_utils import GRID, INK, MUTED, STRATEGY_NICE, STRATEGY_PALETTE, nature_style
-from utopia.visual.plot_topic_diversity_selection_gate import (BIN_LABELS, BINS, EDGE_LABELS, EDGE_TICKS,
-                                                               RUN_PREFIX, wilson_ci)
+from utopia.visual.common import GRID, INK, MUTED, STRATEGY_NICE, STRATEGY_PALETTE, nature_style
+from utopia.visual.plot_topic_diversity_selection_gate import BIN_LABELS, BINS, EDGE_LABELS, EDGE_TICKS, RUN_PREFIX
+from utopia.analysis.statistics import wilson_ci
 
 DODGE = {'explorer': -0.1, 'cautious_explorer': 0.0, 'exploiter': 0.1}  # keeps whiskers apart
 XLABEL = 'Topical departure from own recent work'
@@ -122,11 +122,11 @@ def uptake_table(papers):
     return table.reset_index()
 
 
-def draw(ax, table, legend=True):
+def draw(ax, table):
     """Pooled line in the background, then one line per strategy with CIs and sized markers.
 
-    Returns the strategy legend handles. legend=False leaves them to the caller
-    (the combined figure draws one legend for its whole row).
+    Returns the strategy legend handles for the row legend of
+    fig_topic_diversity_selection_gate.
     """
     table = table.assign(x=table.shift_bin.cat.codes + table.strategy.map(DODGE).fillna(0))
     pooled = table[table.strategy == 'all']
@@ -148,18 +148,12 @@ def draw(ax, table, legend=True):
 
     size_key = [ax.scatter([], [], s=area(n), color=MUTED, edgecolor='white', linewidth=0.4,
                            label=f'{n:,}') for n in (100, 1000)]
-    size_legend = ax.legend(handles=size_key, title='Papers', loc='lower right', frameon=False,
-                            title_fontsize=6, handletextpad=0.2, labelspacing=0.3)
+    ax.legend(handles=size_key, title='Papers', loc='lower right', frameon=False,
+              title_fontsize=6, handletextpad=0.2, labelspacing=0.3)
     handles = [plt.Line2D([], [], color=STRATEGY_PALETTE[s], lw=1.1, marker='o', ms=3.5,
                           markeredgecolor='white', markeredgewidth=0.4, label=STRATEGY_NICE[s])
                for s in DODGE]
     handles.append(plt.Line2D([], [], color=MUTED, lw=3.2, alpha=0.25, label='All papers'))
-    if legend:
-        # add_artist keeps the in-axes size key once the strategy row above the axes
-        # becomes the regular legend
-        ax.add_artist(size_legend)
-        ax.legend(handles=handles, loc='lower center', bbox_to_anchor=(0.5, 1.0), ncol=4,
-                  frameon=False, handlelength=1.5, handletextpad=0.4, columnspacing=1.0)
 
     ax.set_xticks(EDGE_TICKS, EDGE_LABELS)
     ax.set_xlim(-0.5, len(BIN_LABELS) - 0.5)
@@ -212,8 +206,6 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--run_prefix', default=RUN_PREFIX)
-    ap.add_argument('--out', type=Path, default=Path(
-        'outputs/visual/exploration_disruption/fig_exploration_disruption.pdf'))
     ap.add_argument('--uptake_out', type=Path, default=Path(
         'outputs/visual/exploration_disruption/fig_disruption_uptake.pdf'))
     ap.add_argument('--summary_csv', type=Path, default=Path(
@@ -232,20 +224,16 @@ def main():
     print(f'{len(papers):,} papers with defined CD from {n_worlds} worlds')
 
     nature_style()
-    fig, ax = plt.subplots(figsize=(3.3, 2.4))
-    draw(ax, table)
-    fig.tight_layout()
     fig_uptake, axes = plt.subplots(1, 2, figsize=(5.0, 2.1))
     draw_uptake(axes, papers, uptake)
     fig_uptake.tight_layout(w_pad=2.0)
 
-    for path, figure in [(args.out, fig), (args.uptake_out, fig_uptake)]:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        figure.savefig(path, bbox_inches='tight')
+    args.uptake_out.parent.mkdir(parents=True, exist_ok=True)
+    fig_uptake.savefig(args.uptake_out, bbox_inches='tight')
     for path, frame in [(args.summary_csv, table), (args.uptake_csv, uptake)]:
         path.parent.mkdir(parents=True, exist_ok=True)
         frame.to_csv(path, index=False)
-    print(f'wrote {args.out}, {args.uptake_out}, {args.summary_csv}, and {args.uptake_csv}')
+    print(f'wrote {args.uptake_out}, {args.summary_csv}, and {args.uptake_csv}')
 
 
 if __name__ == '__main__':

@@ -59,7 +59,7 @@ panels read left-to-right as a decomposition, (a) + (b) = (c))
     Open (white) cobalt marker = CI crosses zero; filled red marker with a bold
     red value label = CI excludes zero (the resolved identity signal).
     Colors are the vivid accent pair shared with the resubmission figure
-    (VIVID_WARM / VIVID_COOL in utopia.utils.visual_utils). Rows sit at the same height in
+    (VIVID_WARM / VIVID_COOL in utopia.visual.common). Rows sit at the same height in
     every panel so the same author distance lines up across (a), (b), (c).
 
 Row meanings 每一栏含义(y 轴用大白话,括号里的 d2/d3/far 是技术标注)
@@ -94,6 +94,11 @@ Data provenance (read-only input)
 Run:
     python -m utopia.visual.plot_network_bias_forest
 """
+
+import os
+import numpy as np
+from utopia.visual.common import save_figure
+from utopia.analysis.network_review_bias_analysis import STRATA
 import argparse
 import json
 from pathlib import Path
@@ -105,7 +110,7 @@ from matplotlib.legend_handler import HandlerTuple
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 
-from utopia.utils.visual_utils import MUTED, VIVID_COOL, VIVID_WARM, nature_style
+from utopia.visual.common import MUTED, VIVID_COOL, VIVID_WARM, nature_style
 
 DEFAULT_RESULTS = 'outputs/docs/network_review_bias_final/results.json'
 DEFAULT_OUT_DIR = 'outputs/visual/network_review_bias_final'
@@ -325,3 +330,99 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+def make_figures(pairs, papers, sec, primary, stability_agreement, vis_dir):
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    os.makedirs(vis_dir, exist_ok=True)
+
+
+    # 1: delta by stratum
+    fig, ax = plt.subplots(figsize=(6, 4))
+    stats = pairs.dropna(subset=['delta']).groupby('stratum').delta.agg(['mean', 'sem', 'count'])
+    stats = stats.reindex(list(STRATA))
+    ax.bar(stats.index, stats['mean'], yerr=1.96 * stats['sem'], color='#4878d0', capsize=4)
+    ax.axhline(0, color='k', lw=0.8)
+    ax.set_ylabel('Relationship effect  C − B (score points)')
+    ax.set_title('Relationship-disclosure effect by network distance')
+    save_figure(fig, os.path.join(vis_dir, 'fig1_delta_by_stratum.png'), dpi=150)
+
+    # 2: paired d2 vs far contrast
+    fig, ax = plt.subplots(figsize=(5, 4))
+    v = papers.dropna(subset=['paper_effect']).paper_effect
+    ax.hist(v, bins=21, color='#4878d0', alpha=0.85)
+    ax.axvline(0, color='k', lw=0.8)
+    ax.axvline(v.mean(), color='#d65f5f', lw=2,
+               label=f"mean={v.mean():.3f}\n95% CI [{primary['primary_d2_minus_far']['ci_lo']:.3f}, "
+                     f"{primary['primary_d2_minus_far']['ci_hi']:.3f}]")
+    ax.legend()
+    ax.set_xlabel('paper_effect = (C−B)@d2 − (C−B)@far')
+    ax.set_title('Primary paired contrast (paper level)')
+    save_figure(fig, os.path.join(vis_dir, 'fig2_primary_paired_contrast.png'), dpi=150)
+
+    # 3: distance trend
+    fig, ax = plt.subplots(figsize=(5, 4))
+    xs = {'d2': 2, 'd3': 3, 'far': 4}
+    for s in STRATA:
+        d = pairs[(pairs.stratum == s)].dropna(subset=['delta']).delta
+        if len(d):
+            ax.errorbar(xs[s], d.mean(), yerr=1.96 * d.sem(), fmt='o', color='#4878d0',
+                        capsize=4)
+    tr = sec['S2_distance_trend']
+    xg = np.array([2, 4])
+    dm = pairs.dropna(subset=['delta'])
+    b0 = dm.delta.mean() - tr['estimate'] * 0  # slope on standardized x; draw raw means only
+    ax.plot(xg, [dm[dm.stratum == 'd2'].delta.mean(), dm[dm.stratum == 'far'].delta.mean()],
+            '--', color='#d65f5f', alpha=0.6, label=f"trend p={tr['p_boot']:.3f}")
+    ax.axhline(0, color='k', lw=0.8)
+    ax.set_xticks([2, 3, 4]); ax.set_xticklabels(['d2', 'd3', 'far/disc'])
+    ax.set_ylabel('C − B'); ax.legend()
+    ax.set_title('Distance trend of relationship effect')
+    save_figure(fig, os.path.join(vis_dir, 'fig3_distance_trend.png'), dpi=150)
+
+    # 4: effect vs author betweenness
+    fig, ax = plt.subplots(figsize=(5, 4))
+    pm = papers.merge(pairs[pairs.stratum == 'd2'][['paper_id', 'focal_betweenness']]
+                      .drop_duplicates(), on='paper_id', how='left') \
+               .dropna(subset=['paper_effect', 'focal_betweenness'])
+    ax.scatter(pm.focal_betweenness, pm.paper_effect, s=12, alpha=0.5, color='#4878d0')
+    m = sec['S5_author_betweenness_moderation']
+    ax.set_xlabel('focal-author betweenness (pre-review graph)')
+    ax.set_ylabel('paper_effect')
+    ax.set_title(f"Author-betweenness moderation (slope p={m['p_boot']:.3f})")
+    save_figure(fig, os.path.join(vis_dir, 'fig4_author_betweenness.png'), dpi=150)
+
+    # 5: similarity balance
+    fig, ax = plt.subplots(figsize=(5, 4))
+    sim = pairs[['stratum', 'similarity']].dropna()
+    sim.boxplot(column='similarity', by='stratum', ax=ax)
+    ax.set_title('Expertise-similarity balance across strata'); ax.set_ylabel('cosine sim')
+    fig.suptitle('')
+    save_figure(fig, os.path.join(vis_dir, 'fig5_similarity_balance.png'), dpi=150)
+
+    # 6: identity effect by stratum
+    fig, ax = plt.subplots(figsize=(6, 4))
+    st = pairs.dropna(subset=['identity_effect']).groupby('stratum') \
+              .identity_effect.agg(['mean', 'sem']).reindex(list(STRATA))
+    ax.bar(st.index, st['mean'], yerr=1.96 * st['sem'], color='#6acc64', capsize=4)
+    ax.axhline(0, color='k', lw=0.8)
+    ax.set_ylabel('Identity effect  B − A')
+    ax.set_title('Identity-disclosure effect by stratum')
+    save_figure(fig, os.path.join(vis_dir, 'fig6_identity_effect.png'), dpi=150)
+
+    # 7: stability agreement
+    fig, ax = plt.subplots(figsize=(5, 4))
+    if stability_agreement is not None and len(stability_agreement):
+        ax.scatter(stability_agreement.paper_effect_main,
+                   stability_agreement.paper_effect_stab, s=14, alpha=0.6, color='#4878d0')
+        lim = np.nanmax(np.abs(stability_agreement[['paper_effect_main',
+                                                    'paper_effect_stab']].values)) * 1.1
+        ax.plot([-lim, lim], [-lim, lim], 'k--', lw=0.8)
+        r = stability_agreement[['paper_effect_main', 'paper_effect_stab']].corr().iloc[0, 1]
+        ax.set_title(f'Stability replication (r={r:.2f}, n={len(stability_agreement)})')
+    else:
+        ax.set_title('Stability replication (pending)')
+    ax.set_xlabel('paper_effect (main panel)'); ax.set_ylabel('paper_effect (stability panel)')
+    save_figure(fig, os.path.join(vis_dir, 'fig7_stability_agreement.png'), dpi=150)

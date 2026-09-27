@@ -9,7 +9,7 @@ Experiment
     the citation Gini essentially unchanged (delta <= 0.0005).
 
 Panels (1x2, double-column halves; house dot-and-whisker style matching
-fig_exploration_strategies panel (c) / fig_novelty_selection_gate)
+fig_exploration_strategies panel (c))
     (a) Forest-style dot-and-whisker: self-citation rate by the citing
         author's strategy, pooled over the three seeds with Wilson 95% CIs
         and direct value labels. Exploiters self-cite at 0.57%, cautious
@@ -36,6 +36,8 @@ Run
     (writes outputs/visual/self_citation_e4a/fig_self_citation.pdf by
     default; override with --out)
 """
+
+from utopia.analysis.statistics import wilson_ci
 import argparse
 import os
 
@@ -44,27 +46,19 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 
-from utopia.utils.visual_utils import (ACCENT_COOL, INK, MUTED, STRATEGY_NICE,
-                                       STRATEGY_PALETTE, nature_style)
+from utopia.visual.common import ACCENT_COOL, INK, STRATEGY_NICE, STRATEGY_PALETTE, nature_style
 
 DEFAULT_ANALYSIS_DIR = 'outputs/docs/self_citation_e4a'
 DEFAULT_OUT = 'outputs/visual/self_citation_e4a/fig_self_citation.pdf'
 STRATEGY_ORDER = ['explorer', 'cautious_explorer', 'exploiter']
 
 
-def wilson_ci(k, n, z=1.96):
-    """Wilson score 95% interval for a binomial proportion."""
-    p = k / n
-    denom = 1 + z ** 2 / n
-    center = (p + z ** 2 / (2 * n)) / denom
-    half = z * np.sqrt(p * (1 - p) / n + z ** 2 / (4 * n ** 2)) / denom
-    return max(0.0, center - half), center + half
 
 
 def _rates_ci(ks, ns):
     """Percent-scale rates with asymmetric Wilson CI half-widths (2, n)."""
     rates = np.array([100 * k / n for k, n in zip(ks, ns)])
-    los, his = zip(*[wilson_ci(k, n) for k, n in zip(ks, ns)])
+    los, his = zip(*[wilson_ci(k, n, clip_lower=True) for k, n in zip(ks, ns)])
     err = np.array([[r - 100 * lo, 100 * hi - r]
                     for r, lo, hi in zip(rates, los, his)]).T
     return rates, err

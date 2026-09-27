@@ -2,7 +2,6 @@
 
 from typing import Dict, List, Set, Union, Any
 import logging
-from utopia.utils.generail_utils import print_colored
 from utopia.agents.researcher_agents import UniversityResearcher, IndustryResearcher
 
 logger = logging.getLogger(__name__)

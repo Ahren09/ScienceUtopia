@@ -19,12 +19,31 @@ Do not sacrifice correctness or reproducibility merely to reduce the number of c
 
 ## 2. Repository Layout
 
-All source code must live under `src/`.
+All production source code must live under `utopia/`. Tests belong in `tests/`,
+with reusable fixtures in `tests/support/`. Do not create `src/` or root-level
+Python entrypoints. Use `python -m utopia` and
+`python -m utopia.experiments.<function>` from the project root.
+
+Shared code must not depend on experiment runners. Tests must not import other
+`test_*` modules. Resolve the repository root with `utopia.utils.paths.project_root`;
+do not modify `sys.path`. New identifiers describe functionality, not people.
+Historical aliases and unchanged seed namespace strings belong in
+`utopia.runtime.historical`. Never rewrite historical artifacts or replace their
+trusted source hashes to make a new checkout pass a frozen plan.
+
+Package ownership rules:
+
+* `utopia.utils` contains generic IO, hashing, seeding, logging, and path helpers. It must not import domain packages.
+* All visualization libraries, themes, rendering, export operations, and W&B chart construction belong in `utopia.visual`.
+* Statistical estimators belong in `utopia.analysis.statistics`, keyword processing in `utopia.data`, and funding rules in `utopia.funding`.
+* Runtime setup and run provenance belong in `utopia.runtime`. Metrics loggers retain collection, history, and logging, and call visualization functions for charts.
+* Use the shared IO writers with explicit serialization, streaming, permissions, and newline policies. Keep domain authorization checks in the caller.
+* Preserve distinct prompts, sampling units, RNG order, projection algorithms, and failure policies when consolidating ownership.
 
 All generated artifacts must use the following repository-relative locations:
 
 ```text
-src/                     # All library code, training code, evaluation code, and utilities
+utopia/                     # All library code, training code, evaluation code, and utilities
 data/                    # Raw, processed, cached, and generated datasets
 outputs/
 ├── logs/                # Training, evaluation, profiling, and job logs
@@ -35,7 +54,8 @@ outputs/
 
 Required placement:
 
-* Source code: `src/`
+* Production source code: `utopia/`
+* Tests and shared fixtures: `tests/` and `tests/support/`
 * Logs: `outputs/logs/`
 * LoRA checkpoints: `outputs/checkpoints/`
 * Visualizations: `outputs/visual/`
@@ -55,7 +75,7 @@ Before implementing a feature:
 1. Search the repository for related implementations, utilities, configuration fields, and command-line arguments.
 2. Extend or generalize the existing implementation whenever practical.
 3. Update all relevant callers instead of introducing a parallel implementation.
-4. Create a new file only when the functionality is genuinely distinct and cannot be placed naturally in an existing module under `src/`.
+4. Create a new file only when the functionality is genuinely distinct and cannot be placed naturally in an existing module under `utopia/`.
 
 Never create files such as:
 
@@ -133,7 +153,7 @@ When changing an interface:
 
 Do not leave temporary debugging scripts, copied code, scratch files, or one-off experiment files in the repository.
 
-All reusable code should be placed under `src/`.
+All reusable code should be placed under `utopia/`.
 
 ---
 
@@ -280,7 +300,7 @@ Prefer Python launchers, orchestration scripts, and experiment runners over Bash
 
 Do not create Bash wrappers when the same functionality can be implemented in Python.
 
-Training, evaluation, preprocessing, and generation workflows should be reproducible through Python entry points under `src/`.
+Training, evaluation, preprocessing, and generation workflows should be reproducible through Python entry points under `utopia/`.
 
 Every training, evaluation, preprocessing, or large-scale generation job must:
 
@@ -420,7 +440,6 @@ If a model-related change was made, explicitly state:
 * Whether LoRA adapters were used
 * Whether any full model checkpoints were created
 * Where LoRA adapters were stored or loaded from
-
 
 IMPORTANT NOTES
 

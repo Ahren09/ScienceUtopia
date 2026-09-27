@@ -45,10 +45,13 @@ Run:
       --workers 8
 """
 
+from utopia.utils.data_utils import write_json as write_json_file
+
+from utopia.utils.data_utils import read_json
+
 import argparse
 import csv
 import glob
-import gzip
 import json
 import os
 import re
@@ -84,10 +87,7 @@ def list_checkpoints(world_dir):
     return by_year
 
 
-def load_checkpoint(path):
-    opener = gzip.open if path.endswith(".gz") else open
-    with opener(path, "rt") as f:
-        return json.load(f)
+
 
 
 def count_replay_dir(family, replay_dir):
@@ -118,7 +118,7 @@ def count_world(task):
         if not checkpoints:
             return {"family": family, "world_dir": world_dir, "error": "no checkpoint found"}
         final_year = max(checkpoints)
-        data = load_checkpoint(checkpoints[final_year])
+        data = read_json(checkpoints[final_year])
 
         agents = data["ecosystem_data"]["agents"]
         researchers = [a for a in agents if a.get("type") not in NON_RESEARCHER_TYPES]
@@ -151,7 +151,7 @@ def count_world(task):
             n_decisions = 0
             n_reviews = 0
             for year in sorted(checkpoints):
-                yearly = data if year == final_year else load_checkpoint(checkpoints[year])
+                yearly = data if year == final_year else read_json(checkpoints[year])
                 for c in yearly["conference_system"]["conferences"]:
                     decisions = c.get("decisions") or {}
                     n_decisions += len(decisions.get("accept") or []) + len(decisions.get("reject") or [])
@@ -268,8 +268,7 @@ def main():
         "errors": errors,
     }
     json_path = os.path.join(args.output_dir, "dataset_statistics.json")
-    with open(json_path, "w") as f:
-        json.dump(summary, f, indent=2)
+    write_json_file(summary, json_path, indent=2)
 
     md_path = os.path.join(args.output_dir, "dataset_statistics.md")
     with open(md_path, "w") as f:

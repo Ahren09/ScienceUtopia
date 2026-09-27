@@ -13,11 +13,16 @@ Outputs (under --out_dir):
   aggregate_results.csv, primary_hypothesis_tests.csv, manipulation_check.csv,
   balance_check.csv, ecosystem_trajectories.csv, analysis_report.md, figures/
 """
+
+from utopia.utils.data_utils import write_json as write_json_file
+
+from utopia.utils.data_utils import read_json
+
+from utopia.analysis.statistics import hierarchical_bootstrap
 import argparse
 import glob
 import json
 import os
-from collections import defaultdict
 from typing import Dict
 
 import numpy as np
@@ -142,14 +147,8 @@ def within_institution_contrasts(researchers: pd.DataFrame, outcome: str) -> pd.
 def load_funding_received(experiment_id: str, year: int, outputs_dir: str = 'outputs') -> Dict[str, float]:
     """Cumulative funding RECEIVED (flow) per researcher from the year-Y checkpoint's
     funding_success_history — the frozen H-CE endpoint (not year-end resources)."""
-    import gzip
     base = os.path.join(outputs_dir, 'checkpoints', experiment_id, f'checkpoint_year_{year}.json')
-    if os.path.exists(base):
-        with open(base) as f:
-            ck = json.load(f)
-    else:
-        with gzip.open(base + '.gz', 'rt') as f:
-            ck = json.load(f)
+    ck = read_json(base if os.path.exists(base) else base + '.gz')
     out = {}
     for a in ck['ecosystem_data']['agents']:
         hist = a.get('funding_success_history') or {}
@@ -167,16 +166,13 @@ def load_review_scores(experiment_id: str, outputs_dir: str = 'outputs') -> pd.D
     year (of the submission event), paper_id, event_idx (submission
     attempt, 0-based), overall_score (1-5 rubric, decimals allowed).
     """
-    import gzip
     ck_dir = os.path.join(outputs_dir, 'checkpoints', experiment_id)
     paths = glob.glob(os.path.join(ck_dir, 'checkpoint_year_*.json*'))
     if not paths:
         raise FileNotFoundError(f'No checkpoints under {ck_dir}')
     year_of = lambda p: int(os.path.basename(p).split('_')[-1].split('.')[0])
     path = max(paths, key=year_of)
-    opener = gzip.open if path.endswith('.gz') else open
-    with opener(path, 'rt') as f:
-        ck = json.load(f)
+    ck = read_json(path)
     rows = []
     for paper in ck['paper_tracker']['papers']:
         for event_idx, event in enumerate(paper.get('review_history') or []):
@@ -239,70 +235,14 @@ def review_score_trajectories(valid, out_dir: str, outputs_dir: str = 'outputs')
               + f" | mean slope {summary[stat]['mean_slope_per_year']:+.4f}/yr, "
                 f"{summary[stat]['seeds_with_negative_slope']}/{len(slopes)} seeds negative")
     json_path = os.path.join(out_dir, 'review_score_convergence.json')
-    with open(json_path, 'w') as f:
-        json.dump(summary, f, indent=2)
+    write_json_file(summary, json_path, indent=2)
     print(f'Wrote {csv_path} and {json_path}')
 
 
-def hierarchical_bootstrap(contrasts: pd.DataFrame, n_boot=10000, seed=0):
-    """Two-level bootstrap: resample seeds, then institutions within seed.
-
-    Returns rows per (outcome, contrast): mean, 95% CI, fraction of seeds with
-    the same direction, cluster counts.
-    """
-    rng = np.random.default_rng(seed)
-    out = []
-    for (outcome, contrast), df in contrasts.groupby(['outcome', 'contrast']):
-        seeds = df['seed'].unique()
-        by_seed = {s: df[df['seed'] == s]['diff'].values for s in seeds}
-        point = float(np.mean([np.mean(v) for v in by_seed.values()]))
-        seed_means = [float(np.mean(v)) for v in by_seed.values()]
-        boots = np.empty(n_boot)
-        for b in range(n_boot):
-            if len(seeds) > 1:
-                chosen = rng.choice(seeds, size=len(seeds), replace=True)
-            else:
-                chosen = seeds
-            vals = []
-            for s in chosen:
-                v = by_seed[s]
-                vals.append(np.mean(v[rng.integers(0, len(v), len(v))]))
-            boots[b] = np.mean(vals)
-        pooled_sd = float(df['diff'].std(ddof=1)) if len(df) > 1 else np.nan
-        # Two-sided bootstrap p: how often the resampled mean crosses zero,
-        # floored at 1/n_boot (cannot resolve smaller p from n_boot draws).
-        p_boot = 2.0 * min(float(np.mean(boots <= 0)), float(np.mean(boots >= 0)))
-        p_boot = float(min(1.0, max(p_boot, 1.0 / n_boot)))
-        out.append({
-            'outcome': outcome, 'contrast': contrast,
-            'mean_diff': point,
-            'ci_lo': float(np.percentile(boots, 2.5)),
-            'ci_hi': float(np.percentile(boots, 97.5)),
-            'p_boot': p_boot,
-            'smd': point / pooled_sd if pooled_sd and pooled_sd > 0 else np.nan,
-            'n_seeds': len(seeds),
-            'n_institution_blocks': len(df),
-            'seed_direction_agreement': float(np.mean(np.sign(seed_means) == np.sign(point)))
-            if point != 0 else np.nan,
-            'per_seed_means': json.dumps({str(s): round(float(np.mean(v)), 5)
-                                          for s, v in by_seed.items()}),
-        })
-    return pd.DataFrame(out)
 
 
-def benjamini_hochberg(pvals):
-    """BH-adjusted p-values (same order as input)."""
-    p = np.asarray(pvals, dtype=float)
-    n = len(p)
-    order = np.argsort(p)
-    adj = np.empty(n)
-    prev = 1.0
-    for rank_idx in range(n - 1, -1, -1):
-        i = order[rank_idx]
-        val = min(prev, p[i] * n / (rank_idx + 1))
-        adj[i] = val
-        prev = val
-    return adj
+
+
 
 
 # ----------------------------------------------------- manipulation / balance
@@ -440,114 +380,12 @@ def power_analysis(researchers: pd.DataFrame, out_dir: str,
 
 # ------------------------------------------------------------------- figures
 
-def make_figures(researchers, agent_year, ecosystem, paper_age, out_dir):
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-
-    fig_dir = os.path.join(out_dir, 'figures')
-    os.makedirs(fig_dir, exist_ok=True)
-    colors = {'explorer': 'tab:red', 'exploiter': 'tab:blue', 'cautious_explorer': 'tab:green'}
-    n_seeds = researchers['seed'].nunique() if len(researchers) else 0
-
-    def save(fig, name, title):
-        fig.suptitle(f"{title}\n(n={len(researchers)} researchers, {n_seeds} seeds; "
-                     f"uncertainty across seeds)", fontsize=9)
-        fig.tight_layout()
-        fig.savefig(os.path.join(fig_dir, name), dpi=150)
-        plt.close(fig)
-
-    def yearly_by_strategy(df, col, ax):
-        df = df.copy()
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-        for s in STRATEGIES:
-            sub = df[df.strategy == s].groupby(['seed', 'year'])[col].mean().reset_index()
-            m = sub.groupby('year')[col].mean()
-            lo = sub.groupby('year')[col].min()
-            hi = sub.groupby('year')[col].max()
-            ax.plot(m.index, m.values, label=s, color=colors[s])
-            ax.fill_between(m.index, lo.values, hi.values, alpha=0.15, color=colors[s])
-        ax.legend(fontsize=7)
-        ax.set_xlabel('year')
-
-    if len(agent_year):
-        for col, fname, title in [
-                ('avg_career_distance', 'fig1_manipulation_career_distance.png',
-                 'Manipulation check: career-centroid distance by year and strategy'),
-                ('topic_switched', 'fig2_topic_switch_rate.png', 'Topic switch rate'),
-                ('acceptance_rate', 'fig3_acceptance_trajectory.png', 'Simulated acceptance rate'),
-                ('funding', 'fig4_funding_trajectory.png', 'Simulated funding')]:
-            fig, ax = plt.subplots(figsize=(6, 4))
-            yearly_by_strategy(agent_year, col, ax)
-            ax.set_ylabel(col)
-            save(fig, fname, title)
-
-    if len(paper_age):
-        age3 = paper_age[paper_age.age == 3]
-        if len(age3):
-            fig, ax = plt.subplots(figsize=(6, 4))
-            data = [np.log1p(age3[age3.strategy == s]['citations'].dropna()) for s in STRATEGIES]
-            ax.violinplot([d.values for d in data], showmedians=True)
-            ax.set_xticks([1, 2, 3]); ax.set_xticklabels(STRATEGIES, fontsize=8)
-            ax.set_ylabel('log1p(citations) at age 3')
-            save(fig, 'fig5_citation_age3_distribution.png', 'Simulated citations at age 3')
-
-            fig, ax = plt.subplots(figsize=(6, 4))
-            for s in STRATEGIES:
-                sub = age3[age3.strategy == s]
-                ax.scatter(sub['novelty_score'], np.log1p(sub['citations']),
-                           s=8, alpha=0.4, color=colors[s], label=s)
-            ax.set_xlabel('novelty'); ax.set_ylabel('log1p(citations) age 3')
-            ax.legend(fontsize=7)
-            save(fig, 'fig6_risk_return.png', 'Risk-return: novelty vs age-3 citations')
-
-        cd3 = paper_age[(paper_age.age == 3) & paper_age.cd.notna()]
-        if len(cd3):
-            fig, ax = plt.subplots(figsize=(6, 4))
-            data = [cd3[cd3.strategy == s]['cd'].dropna().values for s in STRATEGIES]
-            ax.boxplot(data, labels=STRATEGIES)
-            ax.set_ylabel('CD index at age 3')
-            save(fig, 'fig9_cd_distribution.png', 'Disruption: age-3 CD index')
-
-        fig, ax = plt.subplots(figsize=(6, 4))
-        for s in STRATEGIES:
-            acc = paper_age[paper_age.strategy == s].groupby('age')['citations'].mean()
-            ax.plot(acc.index, acc.values, label=s, color=colors[s], marker='o')
-        ax.set_xlabel('paper age'); ax.set_ylabel('mean cumulative citations')
-        ax.legend(fontsize=7)
-        save(fig, 'fig8_citation_accumulation.png', 'Citation accumulation by paper age')
-
-    if len(ecosystem):
-        for col, fname, title in [
-                ('topic_entropy_normalized', 'fig10_topic_entropy.png', 'Ecosystem topic entropy'),
-                ('funding_gini', 'fig11a_funding_gini.png', 'Funding Gini'),
-                ('citation_gini', 'fig11b_citation_gini.png', 'Citation Gini'),
-                ('num_active_researchers', 'fig12_active_researchers.png', 'Active researchers')]:
-            if col not in ecosystem.columns:
-                continue
-            fig, ax = plt.subplots(figsize=(6, 4))
-            for s_val, sub in ecosystem.groupby('seed'):
-                ax.plot(sub['year'], pd.to_numeric(sub[col], errors='coerce'),
-                        alpha=0.6, label=f'seed {s_val}')
-            ax.set_xlabel('year'); ax.set_ylabel(col)
-            ax.legend(fontsize=7)
-            save(fig, fname, title)
-
-    if len(researchers):
-        fig, ax = plt.subplots(figsize=(6, 4))
-        shares = []
-        hit = researchers.groupby(['seed', 'strategy'])['hit_papers'].sum().reset_index()
-        for s in STRATEGIES:
-            sub = hit[hit.strategy == s]
-            shares.append(sub['hit_papers'].mean())
-        ax.bar(STRATEGIES, shares, color=[colors[s] for s in STRATEGIES])
-        ax.set_ylabel('mean hit papers per seed')
-        save(fig, 'fig7_hit_paper_share.png', 'Hit-paper share by strategy')
 
 
 # ---------------------------------------------------------------------- main
 
 def main():
+    from utopia.visual.plot_exploration_strategies import make_figures
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--multi_run_prefix', type=str, required=True)
     parser.add_argument('--out_dir', type=str, required=True)

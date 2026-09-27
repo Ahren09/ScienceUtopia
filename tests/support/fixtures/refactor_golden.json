@@ -1,0 +1,76 @@
+{
+  "bootstrap_mean_ci": [
+    4.666666666666667,
+    1.0,
+    7.375000000000009
+  ],
+  "bootstrap_ci": [
+    1.0,
+    7.375000000000009
+  ],
+  "hierarchical_bootstrap": [
+    {
+      "outcome": "x",
+      "contrast": "A-B",
+      "mean_diff": 1.5,
+      "ci_lo": 0.0,
+      "ci_hi": 3.0,
+      "p_boot": 0.09,
+      "smd": 0.7205766921228921,
+      "n_seeds": 2,
+      "n_institution_blocks": 4,
+      "seed_direction_agreement": 1.0,
+      "per_seed_means": "{\"1\": 1.5, \"2\": 1.5}"
+    }
+  ],
+  "standard_server": [
+    "vllm",
+    "serve",
+    "Qwen/Qwen3-32B",
+    "--tensor-parallel-size",
+    "2",
+    "--max-model-len",
+    "32768",
+    "--gpu-memory-utilization",
+    "0.90",
+    "--port",
+    "8000",
+    "--seed",
+    "42",
+    "--reasoning-parser",
+    "qwen3",
+    "--api-key",
+    "fixture-key"
+  ],
+  "resource_size_server": [
+    "vllm",
+    "serve",
+    "Qwen/Qwen3-32B",
+    "--revision",
+    "9216db5781bf21249d130ec9da846c4624c16137",
+    "--tensor-parallel-size",
+    "4",
+    "--max-model-len",
+    "32768",
+    "--gpu-memory-utilization",
+    "0.90",
+    "--port",
+    "8000",
+    "--seed",
+    "8301",
+    "--reasoning-parser",
+    "qwen3",
+    "--api-key",
+    "fixture-key"
+  ],
+  "historical_sources": {
+    "src/james_funding_sequential.py": "2a21371ef43def84511df7836ff350834aae463dea5384e4cf770048993e2264",
+    "src/james_funding_compact.py": "0dfd3b97821c4cd1c96ccb1a6e9433cacaf19f495e287a9fe691b5ee9bb7bd04",
+    "src/james_funding_validation.py": "f523f567aa7a51211cccbea9ccb3000508e4123427d851944cdb826c4a062150",
+    "utopia/models/models.py": "49efcd892f3fa427c6aa4391662885832a960e03a07bfc6a37bbb6ee558942c3",
+    "utopia/models/request_audit.py": "8397ce06f7255c9d85c71e1ccb3199d7189c7f9e75a7f8778aa9d6f1707b1831",
+    "utopia/agents/funding_agents.py": "c79588853a238ea02d01bc20a7ff9e19e1cdd0c6ee5c1e6fe449e109e4a94be6",
+    "const.py": "7c78fb71ee3181a531a9fbf82315fdcef0232ab0b62b39b9ddde52190904c4ee",
+    "docs/james_sequential_funding_protocol.md": "193efb0708997b8ca921ee25ac5189bce3532517e3114f05fb08beab73627551"
+  }
+}

@@ -1,1 +1,0 @@
-CUDA_VISIBLE_DEVICES=0,1,4,5 python -m vllm.entrypoints.openai.api_server --model google/gemma-3-27b-it --gpu-memory-utilization 0.95 --max-model-len 16384 --tensor-parallel-size 2 --port 8027

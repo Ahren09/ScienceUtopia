@@ -46,20 +46,26 @@ Run:
   python -m utopia.analysis.scale_expansion --num_years 8
   python -m utopia.analysis.scale_expansion --glob "outputs/checkpoints/scale_*" --horizon 3
 """
+
+from utopia.utils.data_utils import write_json as write_json_file
+
+from utopia.analysis.statistics import bootstrap_mean_ci
+
+from utopia.utils.data_utils import read_json
 import argparse
 import glob
 import gzip
 import json
 import os
 import re
-from collections import Counter, defaultdict
+from collections import Counter
 from itertools import combinations
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
-from utopia.analysis.exploration_cross_seed import benjamini_hochberg
+from utopia.analysis.statistics import benjamini_hochberg
 from utopia.metrics.tracker import calculate_gini_coefficient
 
 PRIMARY = ['P1_survival_h', 'P2_resub_review_share', 'P3_award_gini', 'P4_followup_share']
@@ -112,8 +118,7 @@ def load_checkpoint(run_dir: str, num_years: int) -> Tuple[dict, int]:
         base = os.path.join(run_dir, f'checkpoint_year_{year}.json')
         for path, opener in ((base, open), (base + '.gz', gzip.open)):
             if os.path.exists(path):
-                with opener(path, 'rt') as f:
-                    return json.load(f), year
+                return read_json(path), year
     raise FileNotFoundError(f'no checkpoint in {run_dir}')
 
 
@@ -380,15 +385,6 @@ def compute_run_endpoints(run_dir: str, num_years: int, horizon: int = 3) -> dic
 
 # ---------------------------------------------------------------- aggregation
 
-def bootstrap_mean_ci(values, n_boot=2000, seed=0):
-    v = np.asarray([x for x in values if x is not None], dtype=float)
-    if len(v) == 0:
-        return (None, None, None)
-    if len(v) == 1:
-        return (float(v[0]), None, None)
-    rng = np.random.default_rng(seed)
-    means = rng.choice(v, size=(n_boot, len(v)), replace=True).mean(axis=1)
-    return float(v.mean()), float(np.percentile(means, 2.5)), float(np.percentile(means, 97.5))
 
 
 def permutation_pvalue(a, b, n_perm=5000, seed=0) -> Optional[float]:
@@ -516,9 +512,7 @@ def write_report(out_dir: str, per_run, yearly, cell_summary, contrasts, horizon
               '(manipulation checks), not findings.']
     with open(os.path.join(out_dir, 'report.md'), 'w') as f:
         f.write('\n'.join(lines) + '\n')
-    with open(os.path.join(out_dir, 'analysis.json'), 'w') as f:
-        json.dump({'cell_summary': cell_summary.to_dict(orient='records'),
-                   'contrasts': contrasts.to_dict(orient='records')}, f, indent=2, default=str)
+    write_json_file({'cell_summary': cell_summary.to_dict(orient='records'), 'contrasts': contrasts.to_dict(orient='records')}, os.path.join(out_dir, 'analysis.json'), indent=2, default=str)
 
 
 def main(argv=None):

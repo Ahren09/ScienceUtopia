@@ -5,24 +5,21 @@ IMPORTANT: This creates NEW classes that extend existing AI-Scientist infrastruc
 WITHOUT modifying any original files.
 """
 
-import hashlib
 import logging
-import subprocess
 import time
 from typing import List, Dict, Optional, Set, Union, Tuple
 from pydantic import BaseModel
 import networkx as nx
 from langchain_core.documents import Document
 from enum import Enum
-from const import REVIEW_CRITERIA, IMPORTANT_NOTES, STANDARDIZED_REVIEW_POLICY
+from utopia.constants import REVIEW_CRITERIA, IMPORTANT_NOTES, STANDARDIZED_REVIEW_POLICY
 from utopia.agents.conference import Conference
 from utopia.agents.research_direction import ResearchDirection
-from utopia.agents.conference import ARXIV_CATEGORY_NAMES
 from utopia.config import SIMULATION_CONFIG
 from utopia.data.paper_tracker import PaperTracker
 from utopia.models.models import BaseLLM
-from utopia.utils.data_utils import top_percentile
-from const import COI_NOTE
+from utopia.metrics.tracker import top_percentile
+from utopia.constants import COI_NOTE
 logger = logging.getLogger(__name__)
 
 
@@ -731,7 +728,7 @@ If you choose not to resubmit, respond with a json file that contains an empty l
         """Only opt-in projects change prompts. Balance is already net of the fee."""
         if getattr(self, 'production_cost_mode', 'per_paper') != 'per_project':
             return ''
-        from src.project_cost_accounting import project_id
+        from utopia.funding.accounting import project_id
         entry = getattr(self, 'production_cost_entries', {}).get(project_id(self))
         if not entry or not entry['admitted'] or entry['year'] != year:
             raise ValueError(f"Production prompt without a paid project: {self.id}/{year}")

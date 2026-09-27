@@ -26,10 +26,8 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 
-from utopia.utils.visual_utils import GRID, MUTED, nature_style
-from utopia.visual.plot_exploration_strategies import (
-    DEFAULT_OUT_DIR, DEFAULT_RUNS_GLOB, LABELS, PALETTE, STRATEGIES,
-    load_run_tables)
+from utopia.visual.common import GRID, MUTED, nature_style
+from utopia.visual.plot_exploration_strategies import DEFAULT_OUT_DIR, DEFAULT_RUNS_GLOB, LABELS, PALETTE, STRATEGIES, load_run_tables
 
 ANNOT_FS = 8  # in-axes annotation type (n-count, trend-line note)
 

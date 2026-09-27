@@ -11,7 +11,6 @@ References:
 """
 
 import asyncio
-import json
 import numpy as np
 import os
 import re
@@ -23,17 +22,15 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 # LangChain imports
 from langchain_core.documents import Document
-from pathlib import Path
 # Scientific computing
 from time import time
 from tqdm import trange, tqdm
-from typing import List, Dict, Tuple, Optional, TYPE_CHECKING
+from typing import List, Dict, Optional
 
 from datasets import load_dataset
 
 from langchain_community.vectorstores import FAISS
 
-from utopia.utils.data_utils import read_json
 from utopia.agents.conference import ALL_CS_TOPICS, ARXIV_CATEGORY_NAMES
 
 import pandas as pd
@@ -461,126 +458,6 @@ class RAG:
 
         return results
 
-    def visualize_embeddings(
-            self,
-            queries: List[str] = None,
-            save_path: str = None,
-            show_plot: bool = True
-    ):
-        """
-        Visualize document embeddings using PaCMAP dimensionality reduction
-
-        Args:
-            queries: Optional list of queries to visualize alongside documents
-            save_path: Path to save the plot
-            show_plot: Whether to display the plot
-        """
-        try:
-            import pacmap
-            import matplotlib.pyplot as plt
-            from sklearn.preprocessing import normalize
-        except ImportError:
-            print("PaCMAP/matplotlib not available. Skipping visualization.")
-            return
-
-        if self.document_embeddings is None:
-            raise ValueError("Document embeddings not available. Build knowledge index first.")
-
-        print("\nGenerating embedding visualization...")
-
-        # Convert PyTorch tensors to numpy for visualization
-        embeddings_to_plot = self.document_embeddings.cpu().numpy()
-        labels = ['document'] * len(self.documents)
-        titles = [doc.metadata.get('title', '')[:50] for doc in self.documents]
-
-        # Add query embeddings if provided
-        if queries:
-            query_embeddings = np.array([
-                self.embeddings.embed_query(q) for q in queries
-            ])
-            if self.config.normalize_embeddings:
-                query_embeddings = normalize(query_embeddings)
-
-            embeddings_to_plot = np.vstack([embeddings_to_plot, query_embeddings])
-            labels.extend(['query'] * len(queries))
-            titles.extend(queries)
-
-        # Apply PaCMAP for dimensionality reduction
-        print("Applying PaCMAP dimensionality reduction...")
-        reducer = pacmap.PaCMAP(
-            n_components=2,
-            n_neighbors=10,
-            MN_ratio=0.5,
-            FP_ratio=2.0,
-            random_state=42
-        )
-        embeddings_2d = reducer.fit_transform(embeddings_to_plot)
-
-        # Create visualization
-        fig, ax = plt.subplots(figsize=(14, 10))
-
-        # Plot documents
-        doc_mask = np.array(labels) == 'document'
-        scatter_docs = ax.scatter(
-            embeddings_2d[doc_mask, 0],
-            embeddings_2d[doc_mask, 1],
-            c='lightblue',
-            alpha=0.6,
-            s=50,
-            label='Documents',
-            edgecolors='navy',
-            linewidth=0.5
-        )
-
-        # Plot queries if available
-        if queries:
-            query_mask = np.array(labels) == 'query'
-            scatter_queries = ax.scatter(
-                embeddings_2d[query_mask, 0],
-                embeddings_2d[query_mask, 1],
-                c='red',
-                alpha=0.8,
-                s=200,
-                marker='*',
-                label='Queries',
-                edgecolors='darkred',
-                linewidth=1.5
-            )
-
-            # Annotate queries
-            for i, (x, y) in enumerate(embeddings_2d[query_mask]):
-                ax.annotate(
-                    f"Q{i + 1}: {queries[i][:30]}...",
-                    (x, y),
-                    xytext=(10, 10),
-                    textcoords='offset points',
-                    fontsize=9,
-                    bbox=dict(boxstyle='round,pad=0.5', fc='yellow', alpha=0.7),
-                    arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=0')
-                )
-
-        ax.set_xlabel('PaCMAP Dimension 1', fontsize=12)
-        ax.set_ylabel('PaCMAP Dimension 2', fontsize=12)
-        ax.set_title(
-            'Document Embeddings Visualization (PaCMAP 2D Projection)',
-            fontsize=14,
-            fontweight='bold'
-        )
-        ax.legend(fontsize=10)
-        ax.grid(True, alpha=0.3)
-
-        plt.tight_layout()
-
-        # Save if requested
-        if save_path:
-            plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            print(f"Visualization saved to {save_path}")
-
-        # Show if requested
-        if show_plot:
-            plt.show()
-        else:
-            plt.close()
 
     def print_results(
             self,

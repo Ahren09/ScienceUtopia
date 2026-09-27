@@ -2,16 +2,17 @@
 
 Run from the project root: python -m utopia.visual.plot_scale_replication
 """
+
+from utopia.utils.paths import project_root
 import json
-from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from utopia.utils.visual_utils import nature_style
+from utopia.visual.common import nature_style
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = project_root(__file__)
 DATA = ROOT / 'outputs/docs'
 OUTPUT = ROOT / 'outputs/visual/scale_expansion_analysis_uni300/fig_scale_combined.pdf'
 
@@ -46,8 +47,9 @@ def plot_survival(ax, yearly, cells, sectors):
             share = rows[column] / rows[column].max()
             ax.plot(rows['year'], share, linestyle=linestyle,
                     solid_capstyle='round', **curve_style(cell))
+            label_dy = {'S1R0': 1, 'S1R1': -1}.get(cell, 0) if len(cells) == 4 else 0
             ax.annotate(f'{share.iloc[-1]:.2f}',
-                        xy=(rows['year'].iloc[-1], share.iloc[-1]), xytext=(4, 0),
+                        xy=(rows['year'].iloc[-1], share.iloc[-1]), xytext=(3, label_dy),
                         textcoords='offset points', va='center',
                         fontsize=7.1, color=CONDITIONS[cell][2])
     last_year = int(yearly['year'].max())
@@ -119,7 +121,7 @@ def main():
                    handlelength=1, handleheight=1, labelspacing=0.35,
                    borderaxespad=0, labelcolor=INK)
 
-    fig.subplots_adjust(left=0.055, right=0.944, bottom=0.29, top=0.79, wspace=0.29)
+    fig.subplots_adjust(left=0.055, right=0.944, bottom=0.29, top=0.79, wspace=0.35)
     for start, title in [(0, 'University Researchers Only'), (2, 'Mixed Population')]:
         x0, x1 = axes[start].get_position().x0, axes[start + 1].get_position().x1
         fig.text((x0 + x1) / 2, 0.925, title, ha='center', va='center',
