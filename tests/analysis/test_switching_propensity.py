@@ -101,6 +101,7 @@ def native_year_writer(cell):
     exec(compile(ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[])), str(path), "exec"), scope)
     writer = scope["Writer"]()
     writer.docs, writer.propensity_cell = Path(cell), cell
+    writer.propensity_horizon = driver.YEARS
     writer.propensity_years, writer.funding_feedback_years, writer.direction_events = {}, {}, []
     writer.paper_tracker = SimpleNamespace(papers_by_id={})
     writer.counts = {}

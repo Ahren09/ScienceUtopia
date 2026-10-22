@@ -214,11 +214,14 @@ def write_run_manifest(docs_dir: str, status: str, args=None, resolved_config: d
         manifest["resolved_config"] = resolved_config
         manifest["scientific_config_hash"] = config_hash(resolved_config)
     if extra:
-        # Resume-safe: llm_call_stats accumulate across restarts instead of
-        # being overwritten by a short resume run's counters.
+        # Portable checkpoints restore cumulative counters, so a later final
+        # write replaces them (including a resume with no new inference).
+        # Legacy callers still supply session counters that must be added.
+        saved_args = manifest.get("args")
+        portable = isinstance(saved_args, dict) and saved_args.get("portable_checkpoint") is True
         new_stats = extra.get("llm_call_stats")
         old_stats = manifest.get("llm_call_stats")
-        if isinstance(new_stats, dict) and isinstance(old_stats, dict):
+        if not portable and isinstance(new_stats, dict) and isinstance(old_stats, dict):
             extra = dict(extra)
             extra["llm_call_stats"] = {
                 k: (old_stats.get(k, 0) or 0) + (new_stats.get(k, 0) or 0)

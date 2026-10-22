@@ -234,7 +234,8 @@ class PropensityMixin(feedback.FundingFeedbackMixin):
     """Only direction candidates and neutral observations differ from native P1F1."""
 
     def __init__(self, *args, cell, initial_cache, embedding_snapshot,
-                 simulator_module, direction_lookup, initialize_only=False, **kwargs):
+                 simulator_module, direction_lookup, initialize_only=False,
+                 founder_count=None, horizon=None, **kwargs):
         require(cell in CELLS or (cell is None and initialize_only), "invalid_driver_cell")
         self.propensity_cell = cell
         self.initial_cache = initial_cache
@@ -242,6 +243,8 @@ class PropensityMixin(feedback.FundingFeedbackMixin):
         self.simulator_module = simulator_module
         self.direction_lookup = direction_lookup
         self.initialize_only = initialize_only
+        self._propensity_founder_count = FOUNDERS if founder_count is None else founder_count
+        self._propensity_horizon = YEARS if horizon is None else horizon
         self.propensity_years, self.direction_events = {}, []
         self.initial_records = []
         super().__init__(*args, mechanisms=feedback.Mechanisms(), **kwargs)
@@ -249,6 +252,14 @@ class PropensityMixin(feedback.FundingFeedbackMixin):
     @property
     def docs(self):
         return Path(self.args.docs_dir)
+
+    @property
+    def propensity_founder_count(self):
+        return getattr(self, "_propensity_founder_count", FOUNDERS)
+
+    @property
+    def propensity_horizon(self):
+        return getattr(self, "_propensity_horizon", YEARS)
 
     def world_state_hash(self):
         return provenance.digest(canonical_state({
@@ -259,24 +270,27 @@ class PropensityMixin(feedback.FundingFeedbackMixin):
     def initialize_agents(self):
         result = super().initialize_agents()
         founders = [a for a in self.ecosystem.agent_population.values() if a.get_type() == "university"]
-        require(len(founders) == FOUNDERS and self.initial_industry_count == 0,
+        require(len(founders) == self.propensity_founder_count and self.initial_industry_count == 0,
                 "population_must_be_1200_university_founders")
         require(not self.is_exploration_experiment
                 and all(a.exploration_strategy == "balanced" and a.resources == 100 for a in founders),
                 "common_population_configuration_mismatch")
+        self.initialize_neutral_history(founders)
+        return result
+
+    def initialize_neutral_history(self, founders):
         import utopia.metrics.embedding_tracker as embedding_module
         constructor = embedding_module.SentenceTransformer
         with preserved_cpu_rng(), module_attribute(
             embedding_module, "SentenceTransformer",
-            lambda _name, **_kwargs: constructor(str(self.embedding_snapshot), device="cpu", local_files_only=True)
+            lambda _name, **kwargs: constructor(str(self.embedding_snapshot), device="cpu", local_files_only=True)
         ):
             self.embedding_tracker = embedding_module.EmbeddingTracker(
                 model_name=EMBEDDING_MODEL, cache_dir=str(Path(self.args.data_cache_dir) / "embeddings"))
-            self.neutral_history = NeutralHistory(
+            self.neutral_history = getattr(self, "history_class", NeutralHistory)(
                 self.embedding_tracker, founders, list(self.direction_lookup.values()))
             self.embedding_tracker.flush_cache()
         provenance.write_json(self.docs / "direction_embedding_norms.json", self.neutral_history.direction_norms)
-        return result
 
     def _resource_rows(self):
         return [{"agent_id": aid, "active": bool(self.ecosystem.agent_population[aid].is_active),
@@ -285,9 +299,9 @@ class PropensityMixin(feedback.FundingFeedbackMixin):
 
     def _setup_year(self, year):
         result = super()._setup_year(year)
-        require(len(self.founder_ids) == FOUNDERS, "founder_count_changed")
+        require(len(self.founder_ids) == self.propensity_founder_count, "founder_count_changed")
         self.propensity_years[year] = {
-            "year": year, "cell": self.propensity_cell, "founder_count": FOUNDERS,
+            "year": year, "cell": self.propensity_cell, "founder_count": self.propensity_founder_count,
             "year_start_resources": self._resource_rows(), "annual_charges": [],
         }
         self.propensity_years[year]["year_start_active_ids"] = [
@@ -331,7 +345,7 @@ class PropensityMixin(feedback.FundingFeedbackMixin):
         record["phase0_lost_active_ids"] = sorted(
             set(record["year_start_active_ids"]) - {a.id for a in authors})
         if year == 1:
-            require(len(due) == FOUNDERS and all(a.newest_direction is None for a in due),
+            require(len(due) == self.propensity_founder_count and all(a.newest_direction is None for a in due),
                     "initial_choice_risk_set_mismatch")
             self.pre_choice_state_hash = self.world_state_hash()
             if self.initial_cache is not None:
@@ -443,6 +457,7 @@ class PropensityMixin(feedback.FundingFeedbackMixin):
             event.update(cell=self.propensity_cell, detailed_focus=response["detailed_focus"],
                          reason=response["reason"], input_hash=captured["input_hash"],
                          project_start_year=agent.project_start_year, project_end_year=agent.project_end_year)
+            event = self.direction_observation(event)
             append_record(self.docs / "direction_events.jsonl", event)
             self.direction_events.append(event)
         if year == 1:
@@ -453,6 +468,9 @@ class PropensityMixin(feedback.FundingFeedbackMixin):
             if self.initialize_only:
                 raise InitialChoicesComplete()
         return result
+
+    def direction_observation(self, event):
+        return event
 
     def _record_paper_metadata_batch(self, year):
         # Do not turn on the exploration experiment: no keywords, novelty scores,
@@ -501,7 +519,7 @@ class PropensityMixin(feedback.FundingFeedbackMixin):
             if submitted["first_submission_year"] == year:
                 require(paper.status in ("accept", "reject"), "first_attempt_decision_missing", paper_id=pid)
                 submitted["first_attempt_accepted"] = paper.status == "accept"
-            if submitted["first_submission_year"] <= YEARS - 3 and year == submitted["first_submission_year"] + 3:
+            if submitted["first_submission_year"] <= self.propensity_horizon - 3 and year == submitted["first_submission_year"] + 3:
                 submitted["three_year_observation"] = observed
         provenance.write_json(self.docs / "years" / f"year_{year:02d}.json", record)
         provenance.write_json(self.docs / "submission_registry.json", {
@@ -519,10 +537,467 @@ def simulation_class(base=None):
     return type("SwitchingPropensitySimulation", (PropensityMixin, base), {})
 
 
-def main(argv=None):
-    from utopia.experiments.common import main_for
-    return main_for("switching_propensity", argv)
 
+PROSPECTIVE_PROTOCOL = "switching-frequency-fulltext-portable-v1"
+PROSPECTIVE_CELLS = ("LN", "HN")
+
+
+def prospective_spec(options):
+    """A new six-year question, separate from all historical ten-year runs."""
+    initial = bool(getattr(options, "initialize_only", False))
+    pilot = bool(getattr(options, "pilot", False))
+    require(options.seed == 42 and options.cell in (("INIT",) if initial else PROSPECTIVE_CELLS),
+            "invalid_prospective_switching_cell")
+    require(type(options.founders) is int and options.founders > 0 and options.founders % 5 == 0,
+            "prospective_founders_must_be_positive_multiple_of_five")
+    require((options.founders == 5000 and options.years == 6) if not pilot else
+            (options.founders <= 5000 and 1 <= options.years <= 6),
+            "formal_switching_requires_5000_founders_and_six_years")
+    return {
+        "protocol": PROSPECTIVE_PROTOCOL, "cell": options.cell,
+        "purpose": "engineering_pilot" if pilot else "prospective_scientific_world",
+        "initialize_only": initial, "founders": options.founders, "years": options.years,
+        "start_year": 2016, "seed": 42, "annual_influx_rate": 0.0,
+        "switch_probability": None if initial else policy.CELLS[options.cell][0],
+        "distance_policy": "near-history", "direction_menu_size": policy.MENU_SIZE,
+        "project_years": 1, "papers_per_project": 1, "resubmissions": "native_enabled",
+        "funding_cell": "P1F1", "funding_selection": "one_complete_permutation_v1",
+        "embedding_model": EMBEDDING_MODEL, "embedding_revision": EMBEDDING_REVISION,
+        "embedding_weights_sha256": EMBEDDING_WEIGHTS_SHA256,
+        "adjacent_distance": "cosine_previous_selected_direction_to_current_selected_direction",
+        "history_distance": "native_direction_to_prior_paper_centroid_cosine",
+    }
+
+
+
+def prospective_initial_identity(options, binding, *, driver_sha256=None, policy_sha256=None):
+    identity = {
+        "protocol": PROSPECTIVE_PROTOCOL, "seed": options.seed,
+        "founders": options.founders, "years": options.years,
+        "pilot": bool(getattr(options, "pilot", False)), "start_year": 2016,
+        "model": binding["model"], "model_revision": binding["model_revision"],
+        "corpus_sha256": binding["corpus_sha256"],
+        "context_tokens": options.context_tokens, "max_tokens": options.max_tokens,
+        "config": deepcopy(binding["science_config"]["config"]),
+        "embedding_revision": EMBEDDING_REVISION,
+        "embedding_weights_sha256": EMBEDDING_WEIGHTS_SHA256,
+        "driver_sha256": driver_sha256 or file_sha256(Path(__file__)),
+        "policy_sha256": policy_sha256 or file_sha256(Path(policy.__file__)),
+    }
+    return json.loads(json.dumps(identity))
+
+
+
+def load_prospective_initial_choices(options):
+    payload = Path(options.initial_choices).read_bytes()
+    record = json.loads(payload)
+    require(record.get("protocol") == PROSPECTIVE_PROTOCOL
+            and record.get("status") in ("initial_choices_ready", "initialization_only_complete")
+            and record.get("scientific_years_completed") == 0,
+            "initial_choices_require_new_prospective_initializer")
+    founders, rows = record.get("founder_ids", []), record.get("records", [])
+    require(len(rows) == len(founders) == options.founders
+            and all(type(aid) is str for aid in founders)
+            and len(set(founders)) == options.founders,
+            "initial_choices_founder_coverage_mismatch")
+    require(record.get("records_sha256") == provenance.digest(rows),
+            "initial_choices_record_hash_mismatch")
+    for index, (aid, row) in enumerate(zip(founders, rows)):
+        require(row.get("agent_id") == aid and row.get("item_index") == index
+                and row.get("year") == 1 and row.get("fallback_kind") is None
+                and isinstance(row.get("raw_response"), dict)
+                and all(row["raw_response"].get(key) == row.get("response", {}).get(key)
+                        for key in ("topic", "detailed_focus", "reason"))
+                and row.get("response", {}).get("topic") in row.get("candidate_topics", [])
+                and all(type(row.get("response", {}).get(key)) is str
+                        for key in ("topic", "detailed_focus", "reason")),
+                "invalid_completed_initial_choice", index=index)
+    for key in ("pre_choice_state_hash", "initial_state_hash"):
+        value = record.get(key)
+        require(type(value) is str and len(value) == 64
+                and all(c in "0123456789abcdef" for c in value), "initial_choices_state_hash_missing")
+    return payload, record
+
+
+
+def publish_prospective_initial_choices(options):
+    """Publish committed local choices; safe to resume without constructing a model."""
+    import base64
+    import subprocess
+    from urllib.parse import urlsplit
+    from utopia.runtime.checkpointing import PortableStop
+
+    spec = prospective_spec(options)
+    require(spec["initialize_only"], "publication_requires_initializer")
+    require(options.run_id and all(c in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+                                   for c in options.run_id), "invalid_prospective_run_id")
+    payload, record = load_prospective_initial_choices(options)
+    digest = hashlib.sha256(payload).hexdigest()
+    docs = ROOT / "outputs/docs" / f"{options.run_id}_{options.cell}"
+    manifest_path = docs / "experiment.json"
+    manifest = json.loads(manifest_path.read_text())
+    binding = manifest["binding"]
+    extra = binding["science_config"]["extra"]
+    require(all(binding.get(key) == value for key, value in {
+        "protocol": PROSPECTIVE_PROTOCOL, "cell": "INIT", "seed": options.seed,
+        "model": options.model, "model_revision": options.model_revision}.items())
+        and extra.get("switching") == spec
+        and record["common_identity"] == prospective_initial_identity(
+            options, binding, driver_sha256=extra["switching_driver_sha256"],
+            policy_sha256=extra["switching_policy_sha256"]),
+        "initial_choices_publication_binding_mismatch")
+    require(manifest.get("years_completed", 0) == 0
+            and manifest.get("status") in ("starting", "running", "paused", "initialization_only_complete")
+            and manifest.get("initial_choices_sha256", digest) == digest,
+            "initial_choices_publication_receipt_mismatch")
+    manifest.update(status="paused", reason="initial_choices_publication_pending",
+                    years_completed=0, scientific_years_completed=0, initial_choices_sha256=digest)
+    provenance.write_json(manifest_path, manifest)
+    try:
+        location = urlsplit(options.s3_prefix)
+        if location.scheme != "s3" or not location.netloc or location.query or location.fragment:
+            raise ValueError("A study s3://bucket/prefix is required")
+        prefix = location.path.strip("/")
+        key = "/".join(part for part in (prefix, "shared", f"initial_choices_{digest}.json") if part)
+        pointer_key = "/".join(part for part in (prefix, "shared", "initial_choices.json") if part)
+        uri = f"s3://{location.netloc}/{key}"
+        pointer_uri = f"s3://{location.netloc}/{pointer_key}"
+        metadata = {
+            "schema_version": 1, "status": "published", "protocol": PROSPECTIVE_PROTOCOL,
+            "run_id": options.run_id, "seed": options.seed, "founders": options.founders,
+            "years": options.years, "scientific_years_completed": 0,
+            "initial_choices_uri": uri, "initial_choices_sha256": digest, "bytes": len(payload),
+            "records_sha256": record["records_sha256"],
+            "common_identity_sha256": provenance.digest(record["common_identity"]),
+        }
+        environment = {**os.environ, "AWS_MAX_ATTEMPTS": "1", "AWS_PAGER": ""}
+        with tempfile.TemporaryDirectory(prefix="switching-publication-") as temporary:
+            def put(object_key, body, *, immutable):
+                # Upload the validated bytes, even if the source path is subsequently moved.
+                path = Path(temporary) / "body.json"
+                path.write_bytes(body)
+                checksum = base64.b64encode(hashlib.sha256(body).digest()).decode()
+                command = ["aws", "s3api", "put-object", "--bucket", location.netloc,
+                           "--key", object_key, "--body", str(path), "--content-type", "application/json",
+                           "--checksum-sha256", checksum, "--output", "json", "--no-cli-pager"]
+                if immutable:
+                    command += ["--if-none-match", "*"]
+                try:
+                    result = subprocess.run(command, check=True, capture_output=True, text=True,
+                                            timeout=600, env=environment)
+                    response = json.loads(result.stdout)
+                except subprocess.CalledProcessError as error:
+                    if not immutable or "PreconditionFailed" not in (error.stderr or ""):
+                        raise
+                    result = subprocess.run(
+                        ["aws", "s3api", "head-object", "--bucket", location.netloc,
+                         "--key", object_key, "--checksum-mode", "ENABLED", "--output", "json",
+                         "--no-cli-pager"], check=True, capture_output=True, text=True,
+                        timeout=600, env=environment)
+                    response = json.loads(result.stdout)
+                    if response.get("ContentLength") != len(body):
+                        raise ValueError("Existing immutable S3 object has different bytes")
+                if response.get("ChecksumSHA256") != checksum:
+                    raise ValueError("S3 did not confirm the expected object SHA256")
+            put(key, payload, immutable=True)
+            put(pointer_key, (json.dumps(metadata, sort_keys=True, indent=2) + "\n").encode(), immutable=False)
+        provenance.write_json(docs / "initial_choices_publication.json", metadata)
+        manifest.update(status="initialization_only_complete", initial_choices_publication={
+            **metadata, "pointer_uri": pointer_uri})
+        manifest.pop("reason", None)
+        provenance.write_json(manifest_path, manifest)
+    except Exception as error:
+        reason = f"initial_choices_publication_failed: {type(error).__name__}: {error}"
+        manifest.update(status="paused", reason=reason)
+        provenance.write_json(manifest_path, manifest)
+        raise PortableStop(reason) from error
+    return {"status": "initialization_only_complete", "scientific_years_completed": 0,
+            "initial_choices_sha256": digest, "initial_choices_uri": uri,
+            "pointer_uri": pointer_uri, "founder_count": len(record["founder_ids"])}
+
+
+
+class ProspectiveNeutralHistory(NeutralHistory):
+    """Index one read-only history snapshot per phase, retaining native centroids."""
+
+    def prepare_year(self, year):
+        self.reconcile()
+        self._reference_year = year
+        self._papers_by_author = {aid: {} for aid in self.founders}
+        for pid, metadata in self.tracker.paper_metadata.items():
+            self._papers_by_author[metadata["author_id"]][pid] = metadata
+
+    def reference(self, agent_id, year, papers):
+        require(getattr(self, "_reference_year", None) == year and agent_id in self.founders,
+                "history_snapshot_not_prepared")
+        metadata = self._papers_by_author[agent_id]
+        eligible = sorted(pid for pid, item in metadata.items() if year - 4 <= item["year"] <= year - 1)
+        with module_attribute(self.tracker, "paper_metadata", metadata):
+            vector = self.tracker.compute_career_centroid(agent_id, max_years=3, current_year=year - 1)
+        norm = self.vector_norm(vector, "reference", agent_id)
+        return vector, {"reference_source": "paper_history" if eligible else "initial_expertise",
+                        "history_ids": eligible, "expected_history_count": len(eligible),
+                        "history_window_start": year - 4, "history_window_end": year - 1,
+                        "reference_norm": norm}
+
+
+
+class ProspectivePropensityMixin(PropensityMixin):
+    """Native policy and phases with complete, data-only portable subclass state."""
+
+    history_class = ProspectiveNeutralHistory
+
+    def __init__(self, *args, propensity_options, **kwargs):
+        self.prospective_options = propensity_options
+        self.prospective_specification = prospective_spec(propensity_options)
+        self.initial_choices_path = Path(propensity_options.initial_choices)
+        self._direction_request_index = None
+        mechanisms = kwargs.pop("mechanisms", feedback.Mechanisms())
+        require(mechanisms == feedback.Mechanisms(), "switching_requires_common_P1F1")
+        import utopia.simulation as simulator
+        lookup = {d.topic: d for d in simulator.AVAILABLE_DIRECTIONS}
+        require(all(d.years == 1 for d in lookup.values()), "prospective_requires_one_year_context")
+        snapshot, _ = resolve_embedding_snapshot()
+        initial = self.prospective_specification["initialize_only"]
+        initial_cache = None if initial else self.read_initial_choices()
+        super().__init__(
+            *args, cell=None if initial else propensity_options.cell,
+            initial_cache=initial_cache, embedding_snapshot=snapshot,
+            simulator_module=simulator, direction_lookup=lookup, initialize_only=initial,
+            founder_count=propensity_options.founders, horizon=propensity_options.years, **kwargs)
+        if initial_cache is not None:
+            require(initial_cache["common_identity"] == self.common_initial_identity(),
+                    "initial_choices_scientific_binding_mismatch")
+
+    def common_initial_identity(self):
+        return prospective_initial_identity(self.prospective_options, self.args.checkpoint_binding)
+
+    def read_initial_choices(self):
+        return load_prospective_initial_choices(self.prospective_options)[1]
+
+    def write_initial_choices(self):
+        require(not self.yearly_results and not self.paper_tracker.papers_by_id
+                and not self.funding_feedback_years,
+                "initializer_must_stop_before_scientific_outcomes")
+        record = {
+            "protocol": PROSPECTIVE_PROTOCOL, "status": "initial_choices_ready",
+            "scientific_years_completed": 0, "common_identity": self.common_initial_identity(),
+            "founder_ids": list(self.founder_ids), "records": deepcopy(self.initial_records),
+            "records_sha256": provenance.digest(self.initial_records),
+            "pre_choice_state_hash": self.pre_choice_state_hash,
+            "initial_state_hash": self.initial_state_hash,
+        }
+        if self.initial_choices_path.exists():
+            previous = self.read_initial_choices()
+            def science(value):
+                value = deepcopy(value)
+                value.pop("records_sha256")
+                value.pop("status")
+                for item in value["records"]:
+                    item.pop("request_attempts")
+                return value
+            require(science(previous) == science(record), "refuse_to_replace_different_initial_choices")
+            return previous
+        else:
+            from utopia.utils.data_utils import write_json_atomic
+            self.initial_choices_path.parent.mkdir(parents=True, exist_ok=True)
+            write_json_atomic(self.initial_choices_path, record)
+        return record
+
+    def _run_phase_1_research_directions(self, year, year_results):
+        self._direction_request_index = None
+        if year > 1:
+            self.neutral_history.prepare_year(year)
+        try:
+            return super()._run_phase_1_research_directions(year, year_results)
+        except InitialChoicesComplete:
+            require(self.initialize_only and year == 1, "unexpected_prospective_initialization_boundary")
+            self.write_initial_choices()
+            from utopia.runtime.checkpointing import PortableStop
+            raise PortableStop("prospective_initial_choices_complete") from None
+
+    def _request_records(self, offset, year, index):
+        audit = getattr(self.llm, "request_audit", None)
+        require(audit is not None and offset is not None, "formal_direction_calls_require_request_audit")
+        if self._direction_request_index is None:
+            grouped = {}
+            with Path(audit.path).open() as stream:
+                stream.seek(offset)
+                for line in stream:
+                    if not line.strip():
+                        continue
+                    item = json.loads(line)
+                    if (item.get("event") == "request_started"
+                            and item.get("seed_ctx") == ["phase1_directions", year]):
+                        grouped.setdefault(item["item_index"], []).append(item)
+            self._direction_request_index = grouped
+        attempts = sorted(self._direction_request_index.get(index, []), key=lambda r: r["attempt"])
+        require(bool(attempts), "direction_request_audit_missing", year=year, index=index)
+        for item in attempts:
+            require(item["request_seed"] == self.simulator_module.derive_seed(
+                42, "phase1_directions", year, index, item["attempt"]),
+                "direction_request_seed_policy_changed")
+        return attempts
+
+    def direction_observation(self, event):
+        from utopia.runtime.checkpointing import PortableCheckpointError
+        if event["fallback"]:
+            raise PortableCheckpointError("Prospective switching cannot replace an invalid direction response")
+        event["distance_to_history"] = event["conditional_switch_distance"]
+        event["adjacent_direction_distance"] = None
+        if not event["is_initial_choice"]:
+            previous, chosen = event["previous_topic"], event["chosen_topic"]
+            if previous == chosen:
+                event["adjacent_direction_distance"] = 0.0
+            else:
+                import numpy as np
+                texts = [self.direction_lookup[t].topic + " " + " ".join(
+                    self.direction_lookup[t].keywords or []) for t in (previous, chosen)]
+                with preserved_cpu_rng():
+                    vectors = self.embedding_tracker._encode_cached(texts)
+                a, b = (np.asarray(v, dtype=np.float64) for v in vectors)
+                norms = (self.neutral_history.vector_norm(a, "direction", previous),
+                         self.neutral_history.vector_norm(b, "direction", chosen))
+                event["adjacent_direction_distance"] = float(1.0 - np.dot(a / norms[0], b / norms[1]))
+        return event
+
+    def extra_checkpoint_state(self):
+        state = super().extra_checkpoint_state()
+        tracker = self.embedding_tracker
+        def vectors(values):
+            return {key: {"dtype": value.dtype.str, "values": value.tolist()}
+                    for key, value in values.items()}
+        state["prospective_switching"] = {
+            "specification": deepcopy(self.prospective_specification),
+            "propensity_years": deepcopy(self.propensity_years),
+            "direction_events": deepcopy(self.direction_events),
+            "initial_records": deepcopy(self.initial_records), "initial_cache": deepcopy(self.initial_cache),
+            "pre_choice_state_hash": getattr(self, "pre_choice_state_hash", None),
+            "initial_state_hash": getattr(self, "initial_state_hash", None),
+            "registry": deepcopy(self.neutral_history.registry),
+            "direction_norms": deepcopy(self.neutral_history.direction_norms),
+            "embeddings": vectors(tracker.embeddings),
+            "paper_metadata": deepcopy(tracker.paper_metadata),
+            "expertise_centroids": vectors(tracker.expertise_centroids),
+            "disk_cache": vectors(tracker._disk_cache),
+            "near_threshold": tracker.near_threshold, "far_threshold": tracker.far_threshold,
+        }
+        return state
+
+    def restore_extra_checkpoint_state(self, state):
+        import numpy as np
+        from utopia.runtime.checkpointing import PortableCheckpointError
+        state = deepcopy(state)
+        saved = state.pop("prospective_switching", None)
+        if not isinstance(saved, dict) or saved.get("specification") != self.prospective_specification:
+            raise PortableCheckpointError("Prospective switching checkpoint policy differs")
+        super().restore_extra_checkpoint_state(state)
+        founders = [a for a in self.ecosystem.agent_population.values() if a.get_type() == "university"]
+        require(len(founders) == self.propensity_founder_count, "checkpoint_founder_coverage_mismatch")
+        self.initialize_neutral_history(founders)
+        for field in ("propensity_years", "direction_events", "initial_records", "initial_cache",
+                      "pre_choice_state_hash", "initial_state_hash"):
+            setattr(self, field, saved[field])
+        self.neutral_history.registry = saved["registry"]
+        self.neutral_history.direction_norms = saved["direction_norms"]
+        tracker = self.embedding_tracker
+        for target, key in (("embeddings", "embeddings"), ("expertise_centroids", "expertise_centroids"),
+                            ("_disk_cache", "disk_cache")):
+            setattr(tracker, target, {k: np.asarray(v["values"], dtype=np.dtype(v["dtype"]))
+                                     for k, v in saved[key].items()})
+        tracker.paper_metadata = saved["paper_metadata"]
+        tracker.near_threshold, tracker.far_threshold = saved["near_threshold"], saved["far_threshold"]
+        tracker._disk_cache_dirty = True
+        tracker.flush_cache()
+        self.neutral_history.reconcile(self.paper_tracker.papers_by_id)
+        self._direction_request_index = None
+
+
+
+def prospective_simulation_class(base=None):
+    if base is None:
+        from utopia.simulation import Simulation
+        base = Simulation
+    return type("ProspectiveSwitchingSimulation", (ProspectivePropensityMixin, base), {})
+
+
+
+def configure_prospective_switching(args, options):
+    """Bind the design and declare only switching-owned replayable outputs."""
+    spec = prospective_spec(options)
+    for name, expected in {"num_years": options.years, "start_year": 2016,
+                           "papers_per_project": 1, "annual_influx_rate": 0.0,
+                           "disable_resubmission": False, "initial_funding": 100}.items():
+        require(getattr(args, name) == expected, "prospective_shared_setting_mismatch", field=name)
+    paths = dict(getattr(args, "checkpoint_replay_paths", {}))
+    docs = Path(args.docs_dir)
+    # Compatibility with the first shared runner: the live manifest is not replayable.
+    if paths.get("metrics") == str(docs):
+        paths.pop("metrics")
+    for name in ("direction_embedding_norms.json", "direction_requests.jsonl",
+                 "direction_events.jsonl", "submission_registry.json"):
+        paths["switching/" + name] = str(docs / name)
+    for year in range(1, options.years + 1):
+        name = f"years/year_{year:02d}.json"
+        paths["switching/" + name] = str(docs / name)
+    args.checkpoint_replay_paths = paths
+    return {"switching": spec,
+            "initial_choices_sha256": None if spec["initialize_only"] else file_sha256(Path(options.initial_choices)),
+            "switching_driver_sha256": file_sha256(Path(__file__)),
+            "switching_policy_sha256": file_sha256(Path(policy.__file__))}
+
+
+
+def run_prospective(options):
+    """Fresh initialization and both cells use the shared new portable runtime."""
+    from utopia.runtime.checkpointing import PortableStop
+    spec = prospective_spec(options)
+    options.protocol, options.funding_cell = PROSPECTIVE_PROTOCOL, "P1F1"
+    initial = spec["initialize_only"]
+    choices_exist = Path(options.initial_choices).is_file()
+    if initial and choices_exist:
+        if not options.resume:
+            raise FileExistsError("Existing initial choices require explicit --resume")
+        return publish_prospective_initial_choices(options)
+    if not initial and not choices_exist:
+        raise FileNotFoundError("Run prospective-initialize before either LN or HN")
+    from functools import partial
+    import utopia.experiments.funding_feedback as runner
+    import utopia.simulation as simulator
+    import utopia.agents.research_direction as directions
+    def configure(args):
+        return configure_prospective_switching(args, options)
+    def factory(base):
+        return partial(prospective_simulation_class(base), propensity_options=options)
+    try:
+        return runner.run_prospective(
+            options, simulation_factory=factory, configure=configure,
+            run_context=lambda: one_year_context(simulator, directions))
+    except PortableStop as error:
+        if not initial or str(error) != "prospective_initial_choices_complete":
+            raise
+        return publish_prospective_initial_choices(options)
+
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] in (['prospective-initialize'], ['prospective']):
+        from utopia.experiments.funding_feedback import prospective_arguments
+        parser = argparse.ArgumentParser(description=__doc__)
+        prospective_arguments(parser)
+        initial = argv[0] == 'prospective-initialize'
+        parser.set_defaults(founders=5000, initialize_only=initial)
+        for action in parser._actions:
+            if action.dest == 'cell':
+                action.choices = ('INIT',) if initial else PROSPECTIVE_CELLS
+                if initial:
+                    action.default, action.required = 'INIT', False
+        parser.add_argument('--initial-choices', type=Path, required=True)
+        parser.add_argument('--pilot', action='store_true')
+        return run_prospective(parser.parse_args(argv[1:]))
+    from utopia.experiments.common import main_for
+    return main_for('switching_propensity', argv)
 
 if __name__ == "__main__":
     main()

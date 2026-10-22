@@ -20,7 +20,7 @@
 
 ScienceUtopia models researchers choosing projects, submitting papers, reviewing one another's work, receiving citations, and competing for funding. Language models make structured decisions within an explicit yearly simulation. Researchers retrieve candidate papers from the public [SciEvo dataset](https://huggingface.co/datasets/Ahren09/SciEvo).
 
-This release supports **new experiments**. It contains the simulator, scientific prompts, experiment definitions, numerical estimators, and regression tests. Historical campaign artifacts and their original results are not distributed. Simulation outputs are checkpoints, request audits, manifests, and numerical tables; experiment plotting and rendering code are excluded.
+This release supports **new experiments**. It contains the simulator, scientific prompts, experiment definitions, numerical estimators, and regression tests. Historical campaign artifacts and their original results are not distributed. Simulation outputs are checkpoints, request audits, manifests, and numerical tables. Optional manuscript renderers live separately in `scripts/figures/`.
 
 The [project website](https://ahren09.github.io/ScienceUtopia/) is a static page in `index.html`, with styles in `assets/css/style.css` and the copy-button script in `assets/js/main.js`. Open `index.html` directly in a browser, or view the GitHub Pages site. No backend, package installation, or frontend build is required. GitHub Pages publishes the root of `main`; `.nojekyll` keeps the files static.
 
@@ -89,6 +89,7 @@ conda activate "$SCIENCEUTOPIA_STORAGE/env"
 | `requirements-vllm.txt` | Core plus the local vLLM server |
 | `requirements-optional.txt` | Optional providers and scalar W&B logging |
 | `requirements-test.txt` | Core plus pytest |
+| `requirements-figures.txt` | Core plus optional manuscript plotting |
 
 `constraints-linux-py311.txt` pins the resolved transitive versions for these groups. An existing compatible model endpoint needs only the core requirements. Optional providers require their own credentials; the quick start uses local inference and makes no paid API calls. W&B is disabled by default. If installed and explicitly enabled with `--wandb`, it logs scalars.
 
@@ -217,12 +218,12 @@ python -m utopia.experiments.project_cost --cell S1R1_costcontrol --dry-run
 
 # Launch a fresh exploration world against the running local server.
 python -m utopia.experiments.exploration \
-    --cell neutral --model Qwen/Qwen3-8B --seed 43 \
+    --cell neutral --model Qwen/Qwen3-8B --seed 42 \
     --vllm-url "http://127.0.0.1:$SCIENCEUTOPIA_PORT/v1" \
-    --rag-device cuda:0 --output-root outputs/exploration-seed43
+    --rag-device cuda:0 --output-root outputs/exploration-seed42
 ```
 
-Increase population, years, and independent seeds for larger studies. Keep the same model, source, configuration, data revision, and initial state across paired conditions. Funding feedback and influx use audited, panelized sequential selection; this differs scientifically from a single global funding ranking.
+Use one configured seed and an explicit population and time horizon. Keep the same model, source, configuration, data revision, and initial state across paired conditions. Funding feedback and influx use audited, panelized sequential selection; this differs scientifically from a single global funding ranking.
 
 Switching first runs `--initialize` to record treatment-independent first choices. Pass the resulting `initial_choices.json` via `--initial-choices <path>` to every LN/LF/HN/HF condition with the same config and seed. Resource-size populations require a multiple of three institutions. Influx requires a multiple of six institutions and five researchers per institution.
 
@@ -238,6 +239,20 @@ python -m utopia.experiments.review_replay --run-name study1 analyze --stage smo
 ```
 
 Replay needs enough eligible papers per source to satisfy its quotas. Defaults target larger source worlds, not the ten-researcher quick start. `extract --help` exposes quotas and network-study inputs; use `--study network_proximity` for the alternative study.
+
+## Full-text experiments and portable resume
+
+[Full-text usage](docs/fulltext.md) describes the `run-fulltext` interface,
+frozen corpus preparation, response caching, and year-boundary recovery. This
+interface supports the four funding feedback treatments, the RANDOM/TOPIC
+reviewer comparison, and prospective switching experiments.
+
+Annual, failure, and final snapshots are preserved on the server before an
+optional S3 upload. Upload success and independent readback verification are
+recorded separately. Replayed cached responses do not count as new inference.
+Large corpora, response databases, and outputs stay on the compute server or
+in private object storage; Git excludes them. Existing frozen worlds must
+continue with their matching execution source and original budget.
 
 ## Numerical analysis
 
@@ -283,6 +298,18 @@ CUDA_VISIBLE_DEVICES="" python -B -m pytest tests -q -m integration
 ```
 
 The quick-start simulation and `--require-activity` report provide the separate real-model end-to-end check.
+
+## Manuscript figures
+
+Optional renderers consume supplied aggregate statistics and do not launch
+simulations:
+
+```bash
+pip install -r requirements-figures.txt
+python -m scripts.figures.plot_influx_factorial --help
+python -m scripts.figures.plot_resubmission_cascades --help
+python -m scripts.figures.plot_resubmission_difficulty --help
+```
 
 ## Acknowledgements
 

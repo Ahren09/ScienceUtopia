@@ -46,6 +46,7 @@ import sys
 import threading
 
 import time
+from tqdm import tqdm
 
 from types import ModuleType
 
@@ -115,7 +116,7 @@ def client_definitions():
         "logger": logging.getLogger("schema-transport-test"),
         "ThreadPoolExecutor": ThreadPoolExecutor,
         "as_completed": as_completed,
-        "tqdm": lambda iterable, **kwargs: iterable,
+        "tqdm": lambda *args, **kwargs: tqdm(*args, disable=True, **kwargs),
     }
     compile_nodes(nodes, ns, path)
     return ns
@@ -264,7 +265,7 @@ class TransportFixture(unittest.TestCase):
         replacement.start()
         self.addCleanup(replacement.stop)
 
-    def make_client(self, recorder=None, *, thinking=True, seed=42):
+    def make_client(self, recorder=None, *, thinking=True, seed=42, thinking_override=None):
         recorder = recorder or WireRecorder()
         http = httpx.Client(transport=httpx.MockTransport(recorder.handle))
         self.addCleanup(http.close)
@@ -281,6 +282,7 @@ class TransportFixture(unittest.TestCase):
                     "http://schema-fixture.invalid/v1",
                     max_concurrent_requests=2,
                     run_seed=seed,
+                    thinking_override=thinking_override,
                 )
-        client.enable_thinking = thinking
+        client.enable_thinking = thinking if thinking_override is None else thinking_override
         return client, recorder

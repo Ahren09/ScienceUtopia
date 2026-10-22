@@ -60,6 +60,16 @@ class TestRequestAudit(unittest.TestCase):
     def scope(self):
         return request_audit_scope(self.path, _tokenizer=FakeTokenizer())
 
+    def test_empty_resume_audit_requires_explicit_opt_in(self):
+        with request_audit_scope(self.path, _tokenizer=FakeTokenizer(), allow_empty=True) as audit:
+            active_audit_for(MODEL)
+        self.assertEqual(audit.summary()["status"], "complete")
+        self.assertEqual(audit.summary()["n_requests"], 0)
+        other = self.path.with_name("fresh_empty.jsonl")
+        with self.assertRaises(RequestAuditFailure):
+            with request_audit_scope(other, _tokenizer=FakeTokenizer()):
+                active_audit_for(MODEL)
+
     def test_default_no_active_guard(self):
         self.assertIsNone(active_audit_for("any historical model"))
 

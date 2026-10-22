@@ -33,6 +33,7 @@ import tempfile
 from threading import Event, Lock
 
 import time
+from tqdm import tqdm
 
 from types import ModuleType, SimpleNamespace
 
@@ -213,12 +214,12 @@ def model_class():
         "parse_json_response": json.loads,
         "ThreadPoolExecutor": ThreadPoolExecutor,
         "as_completed": as_completed,
-        "tqdm": lambda values, **kwargs: values,
+        "tqdm": lambda *args, **kwargs: tqdm(*args, disable=True, **kwargs),
         "time": time,
     }
     return definitions(
         ROOT / "utopia/models/models.py",
         "VLLMServerModel",
-        {"_request_seed", "_build_extra_body", "_create_completion", "generate_batch"},
+        {"_request_seed", "_build_extra_body", "_create_completion", "batch_completions", "generate_batch"},
         ns,
     )

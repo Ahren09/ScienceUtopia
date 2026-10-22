@@ -538,11 +538,41 @@ class VLLMServerModel(BaseLLM):
         base_url: str = "http://localhost:8000/v1",
         max_concurrent_requests: int = 32,
         run_seed: Optional[int] = None,
+        response_cache_dir=None,
+        checkpoint_binding=None,
+        model_revision=None,
+        max_tokens_override=None,
+        sdk_max_retries: int = 5,
+        request_timeout: float = 600.0,
+        thinking_override: Optional[bool] = None,
     ):
+        if thinking_override is not None and type(thinking_override) is not bool:
+            raise ValueError("thinking_override must be None or a bool")
         super().__init__(model_name)
+        self.thinking_override = thinking_override
+        self.model_revision = model_revision
+        self.max_tokens_override = max_tokens_override
+        if max_tokens_override is not None and (type(max_tokens_override) is not int or max_tokens_override <= 0):
+            raise ValueError("max_tokens_override must be a positive integer")
+        self.response_cache = None
+        if response_cache_dir is not None:
+            from pathlib import Path
+            from utopia.models.response_cache import CompletedResponseCache
+            from utopia.runtime.checkpointing import PortableCheckpointError, validate_binding
+            binding = validate_binding(checkpoint_binding)
+            if (binding['model'] != model_name or binding['model_revision'] != model_revision
+                    or binding['seed'] != run_seed):
+                raise PortableCheckpointError("Model client differs from portable cache binding")
+            if binding["science_config"].get("thinking_override") is not thinking_override:
+                raise PortableCheckpointError("Thinking override differs from portable cache binding")
+            if sdk_max_retries != 0:
+                raise PortableCheckpointError("Portable calls require sdk_max_retries=0")
+            self.response_cache = CompletedResponseCache(
+                Path(response_cache_dir) / "responses.sqlite", binding=binding)
         self.base_url = base_url
         self.max_concurrent_requests = max_concurrent_requests
-        self.enable_thinking = SIMULATION_CONFIG['llm']['enable_thinking']
+        self.enable_thinking = (thinking_override if thinking_override is not None
+                                else SIMULATION_CONFIG['llm']['enable_thinking'])
         # Run seed: when set, every request gets a deterministic per-request seed
         # derived from (run_seed, seed_ctx..., item_index, attempt).
         self.run_seed = run_seed
@@ -564,8 +594,8 @@ class VLLMServerModel(BaseLLM):
         self.client = OpenAI(
             base_url=base_url,
             api_key=os.environ.get("VLLM_API_KEY", "EMPTY"),
-            timeout=600.0,
-            max_retries=5,
+            timeout=request_timeout,
+            max_retries=sdk_max_retries,
         )
 
         # Test connection (warning only, not fatal)
@@ -584,15 +614,29 @@ class VLLMServerModel(BaseLLM):
         if response_format and response_format.get('type') == 'json_schema':
             json_object = response_format.get('json_object', {})
             schema = json_object.get('schema')
-        return build_vllm_extra_body(schema, enable_thinking=self.enable_thinking)
+        extra = build_vllm_extra_body(schema, enable_thinking=self.enable_thinking)
+        override = getattr(self, "thinking_override", None)
+        if override is not None:
+            extra["chat_template_kwargs"] = {"enable_thinking": override}
+        return extra
 
     def _create_completion(self, *, seed_ctx=None, item_index=0, attempt=0, **payload):
         audit = self.request_audit
+        cache = getattr(self, 'response_cache', None)
+        callback = self.client.chat.completions.create
+        if cache is not None:
+            raw_callback = callback
+            def callback(**request):
+                return cache.create(raw_callback, seed_ctx=seed_ctx,
+                                    item_index=item_index, attempt=attempt, **request)
         if audit is None:
-            return self.client.chat.completions.create(**payload)
-        return audit.create(
-            self.client.chat.completions.create, seed_ctx=seed_ctx,
-            item_index=item_index, attempt=attempt, **payload)
+            response = callback(**payload)
+        else:
+            response = audit.create(callback, seed_ctx=seed_ctx,
+                                    item_index=item_index, attempt=attempt, **payload)
+        if cache is not None and cache.stop is not None:
+            cache.stop.check()
+        return response
 
     def generate(
         self,
@@ -623,6 +667,8 @@ class VLLMServerModel(BaseLLM):
                 messages.append({"role": "system", "content": system_prompt})
             messages.append({"role": "user", "content": prompt})
 
+        if getattr(self, 'max_tokens_override', None) is not None:
+            max_tokens = self.max_tokens_override
         extra_body = self._build_extra_body(response_format)
         request_seed = self._request_seed(seed_ctx, 0, 0)
         if request_seed is not None:
@@ -637,9 +683,19 @@ class VLLMServerModel(BaseLLM):
             extra_body=extra_body if extra_body else None,
         )
 
-        response_text = response.choices[0].message.content.strip()
-
-        response_json = parse_json_response(response_text)
+        try:
+            response_text = response.choices[0].message.content.strip()
+            response_json = parse_json_response(response_text)
+            if response_json is None and getattr(self, 'response_cache', None) is not None:
+                raise ValueError("Portable response parsed as None")
+        except Exception as error:
+            if getattr(self, 'response_cache', None) is not None:
+                from utopia.runtime.checkpointing import PortableCheckpointError
+                failure = PortableCheckpointError(f"Invalid portable response for {seed_ctx!r}: {error}")
+                if self.response_cache.stop is not None:
+                    self.response_cache.stop.fail(failure)
+                raise failure from error
+            raise
 
         messages.append({
             "role": "assistant",
@@ -647,6 +703,71 @@ class VLLMServerModel(BaseLLM):
         })
 
         return response_json, messages
+
+    def batch_completions(self, executor, requests, *, seed_ctx, attempt):
+        """Only HTTP runs in workers; the caller owns all cache and audit writes."""
+        from utopia.runtime.checkpointing import PortableStop
+        cache, audit = getattr(self, 'response_cache', None), self.request_audit
+        pending, replies = {}, {}
+        failure = None
+        try:
+            for idx, payload in requests:
+                ticket = audit.before(payload, seed_ctx=seed_ctx, item_index=idx,
+                                      attempt=attempt) if audit else None
+                try:
+                    key, payload_sha, saved = (cache.lookup(
+                        seed_ctx=seed_ctx, item_index=idx, attempt=attempt, **payload)
+                        if cache else (None, None, None))
+                    if saved is None:
+                        future = executor.submit(self.client.chat.completions.create, **payload)
+                        pending[future] = (idx, ticket, key, payload_sha)
+                except BaseException as error:
+                    if audit:
+                        audit.transport_error(ticket, error)
+                    raise
+                if saved is not None:
+                    if audit:
+                        audit.response(ticket, saved)
+                    replies[idx] = saved
+        except BaseException as error:
+            failure = error
+        # Drain every submitted request even after a failure, saving each reply.
+        for future in as_completed(pending):
+            idx, ticket, key, payload_sha = pending[future]
+            try:
+                try:
+                    response = future.result()
+                except Exception as error:
+                    if cache:
+                        if cache.stop is not None:
+                            cache.stop.request_stop()
+                        raise PortableStop(
+                            f"LLM transport interrupted: {type(error).__name__}: {error}") from error
+                    raise
+                if cache:
+                    response = cache.store(key, payload_sha, response)
+            except BaseException as error:
+                if isinstance(error, Exception) and cache is None:
+                    replies[idx] = error
+                else:
+                    failure = failure or error
+                try:
+                    if audit:
+                        audit.transport_error(ticket, error)
+                except BaseException as audit_error:
+                    failure = failure or audit_error
+                continue
+            try:
+                if audit:
+                    audit.response(ticket, response)
+                replies[idx] = response
+            except BaseException as error:
+                failure = failure or error
+        if failure is not None:
+            raise failure
+        if cache is not None and cache.stop is not None:
+            cache.stop.check()
+        return replies
 
     def generate_batch(
         self,
@@ -658,94 +779,73 @@ class VLLMServerModel(BaseLLM):
         desc: Optional[str] = None,
         seed_ctx: Optional[tuple] = None,
     ) -> List[Tuple[Dict, List[Dict]]]:
-        """Process prompts concurrently via the external vLLM server.
-
-        Uses ThreadPoolExecutor — the vLLM server handles continuous batching internally.
-        When run_seed is set, each request carries a deterministic seed derived from
-        (run_seed, *seed_ctx, item_index, attempt).
-
-        Returns:
-            List of (parsed_json_dict, message_history) tuples, one per prompt.
-        """
-
+        """Small HTTP batches with ordered results and single-thread persistence."""
         if not prompts:
             return []
-
+        if getattr(self, 'max_tokens_override', None) is not None:
+            max_tokens = self.max_tokens_override
         base_extra_body = self._build_extra_body(response_format)
-
-        max_retries = 3
-
-        def _call_single(idx_prompt):
-            idx, prompt = idx_prompt
-
-            msgs = []
-            if system_prompt:
-                msgs.append({"role": "system", "content": system_prompt})
-            msgs.append({"role": "user", "content": f"{IMPORTANT_NOTES}\n\n{prompt}"})
-
-            success = False
-            response_text = ""
-            response_json = None
-            n_retries = 0
-            tokens = (0, 0)  # (prompt, completion) — accumulated by the main thread
-            for attempt in range(max_retries):
-                try:
-                    extra_body = dict(base_extra_body)
-                    request_seed = self._request_seed(seed_ctx, idx, attempt)
-                    if request_seed is not None:
-                        extra_body['seed'] = request_seed
-                    resp = self._create_completion(
-                        seed_ctx=seed_ctx, item_index=idx, attempt=attempt,
-                        model=self.model_name,
-                        messages=msgs,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        extra_body=extra_body if extra_body else None,
-                    )
-                    response_text = resp.choices[0].message.content.strip()
-                    if getattr(resp, 'usage', None):
-                        tokens = (resp.usage.prompt_tokens or 0, resp.usage.completion_tokens or 0)
-                    response_json = parse_json_response(response_text)
-                    if response_json is None and response_format is not None:
-                        raise ValueError("Parsed JSON is None but structured output was expected")
-                    success = True
-                    break
-                except Exception as e:
-                    n_retries += 1
-                    if attempt < max_retries - 1:
-                        logger.warning(f"Prompt {idx} attempt {attempt + 1}/{max_retries} failed: {e}. Retrying...")
-                    else:
-                        logger.error(f"Prompt {idx} failed after {max_retries} attempts: {e}")
-
-            if not success:
-                return idx, (None, msgs), n_retries, False, tokens
-
-            msgs.append({
-                "role": "assistant",
-                "content": [{"type": "text", "text": response_text}]
-            })
-            return idx, (response_json, msgs), n_retries, True, tokens
-
-        label = desc or f"batch of {len(prompts)} prompts"
-        logger.info(f"[vLLM Server] Generating {label} ...")
-
-        start_time = time.time()
         results = [None] * len(prompts)
-        with ThreadPoolExecutor(max_workers=self.max_concurrent_requests) as executor:
-            futures = {executor.submit(_call_single, (i, p)): i for i, p in enumerate(prompts)}
-            for future in tqdm(as_completed(futures), total=len(prompts), desc=label):
-                idx, result, n_retries, success, tokens = future.result()
-                results[idx] = result
-                self.call_stats['n_prompts'] += 1
-                self.call_stats['n_retries'] += n_retries
-                self.call_stats['prompt_tokens'] += tokens[0]
-                self.call_stats['completion_tokens'] += tokens[1]
-                if success and n_retries == 0:
-                    self.call_stats['n_first_attempt_success'] += 1
-                if not success:
-                    self.call_stats['n_failures'] += 1
+        label = desc or f"batch of {len(prompts)} prompts"
+        start_time = time.time()
+        with ThreadPoolExecutor(max_workers=self.max_concurrent_requests) as executor, \
+                tqdm(total=len(prompts), desc=label) as progress:
+            for start in range(0, len(prompts), self.max_concurrent_requests):
+                remaining = list(range(start, min(len(prompts), start + self.max_concurrent_requests)))
+                for attempt in range(3):
+                    requests, messages = [], {}
+                    for idx in remaining:
+                        msgs = ([{"role": "system", "content": system_prompt}] if system_prompt else [])
+                        msgs.append({"role": "user", "content": f"{IMPORTANT_NOTES}\n\n{prompts[idx]}"})
+                        messages[idx] = msgs
+                        extra = dict(base_extra_body)
+                        seed = self._request_seed(seed_ctx, idx, attempt)
+                        if seed is not None:
+                            extra['seed'] = seed
+                        requests.append((idx, dict(model=self.model_name, messages=msgs,
+                            temperature=temperature, max_tokens=max_tokens,
+                            extra_body=extra if extra else None)))
+                    replies = self.batch_completions(
+                        executor, requests, seed_ctx=seed_ctx, attempt=attempt)
+                    retry = []
+                    for idx in remaining:
+                        try:
+                            response = replies[idx]
+                            if isinstance(response, Exception):
+                                raise response
+                            text = response.choices[0].message.content.strip()
+                            parsed = parse_json_response(text)
+                            if parsed is None and (response_format is not None or getattr(self, 'response_cache', None) is not None):
+                                raise ValueError("Parsed JSON is None but structured output was expected")
+                        except Exception as error:
+                            self.call_stats['n_retries'] += 1
+                            if attempt < 2:
+                                logger.warning(f"Prompt {idx} attempt {attempt + 1}/3 failed: {error}. Retrying...")
+                                retry.append(idx)
+                                continue
+                            if getattr(self, 'response_cache', None) is not None:
+                                from utopia.runtime.checkpointing import PortableCheckpointError
+                                failure = PortableCheckpointError(
+                                    f"Portable request {seed_ctx!r}/{idx} exhausted 3 response attempts")
+                                if self.response_cache.stop is not None:
+                                    self.response_cache.stop.fail(failure)
+                                raise failure from error
+                            results[idx] = (None, messages[idx])
+                            self.call_stats['n_failures'] += 1
+                        else:
+                            messages[idx].append({"role": "assistant", "content": [
+                                {"type": "text", "text": text}]})
+                            results[idx] = (parsed, messages[idx])
+                            if getattr(response, 'usage', None):
+                                self.call_stats['prompt_tokens'] += response.usage.prompt_tokens or 0
+                                self.call_stats['completion_tokens'] += response.usage.completion_tokens or 0
+                            self.call_stats['n_first_attempt_success'] += int(attempt == 0)
+                        self.call_stats['n_prompts'] += 1
+                        progress.update(1)
+                    remaining = retry
+                    if not remaining:
+                        break
         self.call_stats['elapsed_seconds'] += time.time() - start_time
-
         logger.info(f"Batch generation complete: {len(results)} responses")
         return results
 

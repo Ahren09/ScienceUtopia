@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
+
 from utopia.runtime.historical import source_binding_value, trusted_audit_sources
 
 from utopia.utils.data_utils import file_sha256
@@ -170,14 +172,14 @@ class AwardResourceGate:
         self.enabled = enabled
         self.award_calls = []
 
-    def __call__(self, delta):
+    def __call__(self, delta, **accounting):
         if not isinstance(delta, (int, float)) or not math.isfinite(delta):
             raise ValueError("Resource update must be finite and numeric")
         if delta < 0:
-            return self.original(delta)
+            return self.original(delta, **accounting)
         self.award_calls.append(float(delta))
         if self.enabled:
-            return self.original(delta)
+            return self.original(delta, **accounting)
         return None
 
 
@@ -512,17 +514,44 @@ class FundingFeedbackMixin:
         super().__init__(*args, **kwargs)
 
     def load_checkpoint(self, year):
+        if getattr(getattr(self, "args", None), "portable_checkpoint", False):
+            return super().load_checkpoint(year)
         raise RuntimeError(
             "Funding feedback mechanism runs require fresh worlds, no checkpoint resume"
         )
 
+    def extra_checkpoint_state(self):
+        state = super().extra_checkpoint_state()
+        state["funding_feedback"] = {
+            "mechanisms": asdict(self.mechanisms),
+            "years": self.funding_feedback_years,
+            "initial_world": self.initial_world,
+            "initial_world_hash": getattr(self, "initial_world_hash", None),
+            "founder_ids": list(getattr(self, "founder_ids", ())),
+            "corpus_hash": self.corpus_hash,
+        }
+        return state
+
+    def restore_extra_checkpoint_state(self, state):
+        from utopia.runtime.checkpointing import PortableCheckpointError
+        state = dict(state)
+        saved = state.pop("funding_feedback")
+        if saved["mechanisms"] != asdict(self.mechanisms):
+            raise PortableCheckpointError("Funding treatment differs from checkpoint")
+        self.funding_feedback_years = {int(k): v for k, v in saved["years"].items()}
+        self.initial_world = saved["initial_world"]
+        self.initial_world_hash = saved["initial_world_hash"]
+        self.founder_ids = tuple(saved["founder_ids"])
+        self.corpus_hash = saved["corpus_hash"]
+        super().restore_extra_checkpoint_state(state)
+
     def _setup_year(self, year):
         if year == 1:
             # to_dict is the simulator's existing state serializer, without LLMs.
-            self.initial_world = {
+            self.initial_world = deepcopy({
                 "ecosystem": self.ecosystem.to_dict(),
                 "conferences": self.conference_system.to_dict(),
-            }
+            })
             founders = [
                 a
                 for a in self.ecosystem.agent_population.values()
@@ -530,7 +559,9 @@ class FundingFeedbackMixin:
             ]
             if (
                 hasattr(self.args, "funding_feedback")
-                and len(founders) != self.args.num_institutions * self.args.researchers_per_institution
+                and len(founders) != (self.args.expected_founders
+                                     if getattr(self.args, "portable_checkpoint", False)
+                                     else self.args.num_institutions * self.args.researchers_per_institution)
             ):
                 raise RuntimeError(
                     "Founder population differs from the configured university population"

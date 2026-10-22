@@ -24,6 +24,7 @@ from datasets import load_dataset
 
 
 from utopia.agents.conference import ALL_CS_TOPICS, ARXIV_CATEGORY_NAMES
+from utopia.data.fulltext import corpus_from_env
 
 import pandas as pd
 
@@ -34,7 +35,7 @@ class RAGConfig:
     batch_size: int = 64
     chunk_size: int = 512
     embedding_model: str = "thenlper/gte-small" # "Qwen/Qwen3-Embedding-0.6B" 
-    embedding_revision: str = "17e1f347d17fe144873b1201da91788898c639cd"
+    embedding_revision: Optional[str] = None
     dataset_revision: str = "f80fb38a034b2f763dfcbdd2cd187f5b42ddcce6"
     cache_dir: str = "data/cache/rag"
     num_retrieved_docs: int = 1000
@@ -53,7 +54,18 @@ class RAG:
         self.embeddings = None
         self.knowledge_index = None
         self.debug = debug
+        self.fulltext_corpus = corpus_from_env()
+        self.embedding_revision = config.embedding_revision
         self.device = config.device
+        if self.fulltext_corpus is not None:
+            # The shared serving model owns the GPUs in full-text experiments.
+            self.device = self.config.device = 'cpu'
+            env_revision = os.environ.get('UTOPIA_EMBEDDING_REVISION', '').strip() or None
+            if config.embedding_revision and env_revision and config.embedding_revision != env_revision:
+                raise ValueError('Conflicting full-text embedding revisions in config and environment')
+            self.embedding_revision = config.embedding_revision or env_revision
+            self.config.embedding_revision = self.embedding_revision
+        self.embedding_revision = self.config.embedding_revision = self.embedding_revision or '17e1f347d17fe144873b1201da91788898c639cd'
         self.use_langchain: bool = use_langchain
 
         # Year-based data partitioning
@@ -119,7 +131,20 @@ class RAG:
             raise ValueError('Checkpoint dataset identity differs from the requested dataset/year selection')
         cache_path = cache_root / f"documents-{json_sha256(self.dataset_identity, sort_keys=True)}.pkl"
         cache_valid = False
-        if os.path.exists(cache_path):
+        if self.fulltext_corpus is not None:
+            records = self.fulltext_corpus.abstract_records(self.start_year, num_years)
+            self.documents = [Document(page_content=r['page_content'], metadata={
+                **r['metadata'], 'published': pd.to_datetime(r['metadata']['published'])
+            }) for r in records]
+            self.id2year_pos = {}
+            counts = Counter()
+            for doc in self.documents:
+                year = doc.metadata['publication_year']
+                self.id2year_pos[doc.metadata['id']] = (year, counts[year])
+                counts[year] += 1
+            cache_valid = True
+            print(f'[Full text] Frozen corpus {self.fulltext_corpus.sha256}: {len(records)} abstracts')
+        elif os.path.exists(cache_path):
             print(f"[Cache HIT] Loading documents from {cache_path}")
             with open(cache_path, 'rb') as f:
                 cache_data = pickle.load(f)
@@ -297,7 +322,7 @@ class RAG:
         # Lazy-load model on first use (fp16 only on CUDA; CPU runs fp32)
         if getattr(self, 'sentence_transformer_model', None) is None:
             from sentence_transformers import SentenceTransformer
-            model_kwargs = {"torch_dtype": torch.float16} if 'cuda' in str(self.device) else {}
+            model_kwargs = {"torch_dtype": torch.float16} if 'cuda' in str(self.device) else {"dtype": torch.float32}
             self.sentence_transformer_model = SentenceTransformer(
                 self.config.embedding_model, revision=self.config.embedding_revision,
                 device=self.device, model_kwargs=model_kwargs
@@ -311,6 +336,7 @@ class RAG:
 
         # The ordered metadata/text binding rejects equal-length but different corpora.
         identity = {
+            "corpus_sha256": self.fulltext_corpus.sha256 if self.fulltext_corpus else None,
             "documents": json_sha256(
                 [(doc.metadata, doc.page_content) for doc in self.documents],
                 sort_keys=True, default=str),
@@ -319,7 +345,7 @@ class RAG:
             "normalized": self.config.normalize_embeddings,
             "dtype": "float16" if "cuda" in str(self.device) else "float32",
         }
-        cache_root = Path(self.config.cache_dir)
+        cache_root = self.fulltext_corpus.root / 'embeddings' if self.fulltext_corpus else Path(self.config.cache_dir)
         cache_root.mkdir(parents=True, exist_ok=True)
         cache_file = cache_root / f"embeddings-{json_sha256(identity, sort_keys=True)}.pt"
 
@@ -346,10 +372,17 @@ class RAG:
                 show_progress_bar=True,
                 device=self.device,
             )
-            with tempfile.NamedTemporaryFile(dir=cache_root, delete=False) as stream:
-                temporary = stream.name
-                torch.save(self.document_embeddings, stream)
-            os.replace(temporary, cache_file)
+            temporary = tempfile.NamedTemporaryFile(
+                dir=cache_root, prefix=".embeddings-", suffix=".tmp", delete=False)
+            try:
+                with temporary as stream:
+                    torch.save(self.document_embeddings, stream)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary.name, cache_file)
+            finally:
+                if os.path.exists(temporary.name):
+                    os.unlink(temporary.name)
             print(f"[Cache SAVE] Saved {self.document_embeddings.shape[0]} embeddings to {cache_file}")
 
         print(f"[SentenceTransformer] Encode documents: {time() - t0:.2f} seconds")
@@ -429,7 +462,9 @@ class RAG:
             if getattr(self, 'sentence_transformer_model', None) is None:
                 from sentence_transformers import SentenceTransformer
                 self.sentence_transformer_model = SentenceTransformer(
-                    self.config.embedding_model, device=self.device
+                    self.config.embedding_model, device=self.device,
+                    model_kwargs={} if 'cuda' in str(self.device) else {"dtype": torch.float32},
+                    **({'revision': self.embedding_revision} if self.embedding_revision else {}),
                 )
 
             # Encode queries: shape (Q, embedding_dim)
@@ -526,6 +561,13 @@ class RAG:
         self.document_status.loc[self.document_status['id'].isin(rejected_paper_ids), 'status'] = 'reject'
         assert len(self.document_status.loc[self.document_status['status'] == 'submitted']) == 0, "Some papers still require a decision!"
 
+    def embedding_config(self) -> Dict:
+        return {
+            'embedding_model': self.config.embedding_model,
+            'embedding_revision': self.embedding_revision,
+            'normalize_embeddings': self.config.normalize_embeddings,
+        }
+
     def to_dict(self) -> Dict:
         """Serialize RAG state (document status only, embeddings rebuilt on load)"""
         return {
@@ -536,13 +578,30 @@ class RAG:
             'ordered_documents_sha256': getattr(self, 'document_identity', None),
             'embedding_model': self.config.embedding_model,
             'embedding_revision': self.config.embedding_revision,
+            **({'fulltext': self.fulltext_corpus.reference(),
+                'embedding_config': self.embedding_config(),
+                'num_years': getattr(self, 'num_years', len(self.fulltext_corpus.index['years']))}
+               if self.fulltext_corpus is not None else {}),
         }
 
     @classmethod
     def from_dict(cls, data: Dict, config: RAGConfig, model=None, debug: bool = False, **kwargs) -> 'RAG':
         """Reconstruct RAG from saved state"""
         start_year = data.get('start_year', kwargs.get('start_year', 2016))
+        saved_embedding = data.get('embedding_config')
+        if data.get('fulltext') and saved_embedding:
+            if not config.embedding_revision and not os.environ.get('UTOPIA_EMBEDDING_REVISION', '').strip():
+                config.embedding_revision = saved_embedding['embedding_revision']
         rag = cls(config=config, model=model, debug=debug, start_year=start_year)
+        saved_fulltext = data.get('fulltext')
+        if bool(saved_fulltext) != bool(rag.fulltext_corpus):
+            raise ValueError('Checkpoint full-text mode differs from the current corpus setting')
+        if saved_fulltext and saved_fulltext != rag.fulltext_corpus.reference():
+            raise ValueError('Checkpoint full-text corpus differs from the frozen index')
+        if saved_fulltext and saved_embedding and saved_embedding != rag.embedding_config():
+            raise ValueError('Checkpoint full-text embedding configuration differs')
+        if saved_fulltext:
+            rag.num_years = data['num_years']
         rag.document_status = pd.DataFrame(data['document_status'])
         # Backward compatibility: add publication_year column if missing
         if 'publication_year' not in rag.document_status.columns:

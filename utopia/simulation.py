@@ -440,6 +440,124 @@ class Simulation:
         self.collaboration_tracker = None
         self.network_metrics = None
         self._collaboration_pairs = {}  # {year: {lead_id: co_author_id}}
+        if getattr(self.args, 'portable_checkpoint', False):
+            from utopia.runtime.checkpointing import RunStop
+            stop = RunStop()
+            deadline = getattr(self.args, 'deadline_epoch', None)
+            if deadline is not None:
+                stop.deadline = time.monotonic() + float(deadline) - time.time()
+            self.enable_portable_checkpoints(
+                self.args.checkpoint_binding, stop=stop,
+                replay_paths=getattr(self.args, 'checkpoint_replay_paths', None))
+
+    def enable_portable_checkpoints(self, binding, *, stop=None, replay_paths=None):
+        """Opt a NEW cell into portable snapshots and replay of completed replies.
+
+        Native and funding-mixin outputs are included automatically. replay_paths
+        adds stable names for custom cell-owned metric files; do not pass the whole
+        docs directory (it may contain live manifests/audits). Response caches,
+        checkpoints and audit streams must survive replay. Subclasses restore
+        their scientific and logical audit counters through the hooks.
+        """
+        from pathlib import Path
+        from utopia.runtime.checkpointing import PortableCheckpointError, RunStop, validate_binding
+        binding = validate_binding(binding)
+        cache = getattr(self.llm, 'response_cache', None)
+        if cache is None or cache.binding != binding:
+            raise PortableCheckpointError("Portable simulator requires its own bound response cache")
+        if (binding['seed'] != getattr(self.args, 'seed', None)
+                or binding['seed'] != getattr(self.llm, 'run_seed', None)
+                or binding['model'] != getattr(self.llm, 'model_name', None)
+                or binding['model_revision'] != getattr(self.llm, 'model_revision', None)):
+            raise PortableCheckpointError("Simulator/model differs from checkpoint binding")
+        if getattr(self, 'always_rerun', False):
+            raise PortableCheckpointError("Portable cells must not ignore existing checkpoints")
+        if getattr(self.wandb_logger, 'enabled', False):
+            raise PortableCheckpointError("Portable replay requires wandb disabled")
+        hash_seed = os.environ.get('PYTHONHASHSEED', '')
+        if not hash_seed.isdecimal() or not 0 <= int(hash_seed) < 2**32:
+            raise PortableCheckpointError("Start portable runs with a fixed numeric PYTHONHASHSEED")
+        if any(Path(self.output_dir).glob('checkpoint_year_*.json*')):
+            raise PortableCheckpointError("Legacy checkpoints cannot seed a new portable cell")
+        self._portable_binding = binding
+        self.checkpoint_callback = getattr(self.args, 'checkpoint_callback',
+                                           getattr(self, 'checkpoint_callback', None))
+        self.portable_stop = stop or RunStop()
+        cache.stop = self.portable_stop
+        from utopia.runtime.checkpointing import simulation_replay_paths
+        from utopia.metrics.exploration_metrics import TABLE_NAMES
+        self._portable_replay_paths = simulation_replay_paths(
+            self.output_dir, getattr(self.args, 'docs_dir', self.output_dir), self.num_years,
+            table_names=TABLE_NAMES if self.is_exploration_experiment else ())
+        self._portable_replay_paths.update(replay_paths or {})
+        checkpoint_root = Path(self.output_dir).resolve()
+        manifest_path = (Path(getattr(self.args, 'docs_dir', self.output_dir)) / 'run_manifest.json').resolve()
+        for path in self._portable_replay_paths.values():
+            path = Path(path).resolve()
+            if path == checkpoint_root or path in checkpoint_root.parents:
+                raise PortableCheckpointError("Replay outputs must not contain checkpoints")
+            if path == cache.path.resolve() or path in cache.path.resolve().parents:
+                raise PortableCheckpointError("Response cache must not be rolled back with metrics")
+            if path == manifest_path or path in manifest_path.parents:
+                raise PortableCheckpointError("Declare metric files, not the directory containing the live run manifest")
+        self._portable_last_year = 0
+
+    def notify_portable_checkpoint(self, checkpoint_path):
+        """Run an optional synchronous upload callback AFTER a local commit.
+
+        Supply args.checkpoint_callback = callable(Path) before construction;
+        sim.checkpoint_callback can also be replaced before run(). This runtime
+        callable is never serialized or bound to science. On resume, run() also
+        invokes it for the last validated checkpoint before starting another year;
+        callers therefore use idempotent per-year destinations. No retries here.
+        """
+        callback = getattr(self, 'checkpoint_callback', None)
+        if callback is None:
+            return
+        from pathlib import Path
+        from utopia.runtime.checkpointing import PortableStop
+        try:
+            callback(Path(checkpoint_path))
+        except Exception as error:
+            raise PortableStop(
+                f"Checkpoint retained locally; upload callback failed ({type(error).__name__}): "
+                f"{checkpoint_path}") from error
+
+    def extra_checkpoint_state(self):
+        """Subclass hook: data only, including funding and logical audit counters."""
+        return {}
+
+    def restore_extra_checkpoint_state(self, state):
+        if state:
+            from utopia.runtime.checkpointing import PortableCheckpointError
+            raise PortableCheckpointError("Checkpoint contains unhandled subclass state")
+
+    def portable_contract(self):
+        from utopia.runtime.checkpointing import canonical_json
+        # Runtime endpoints, output locations, batch concurrency and deadlines
+        # are intentionally absent. Callers bind all extra scientific options.
+        fields = ('num_years', 'debug', 'industry_funding_mode', 'use_langchain',
+                  'max_retries', 'weighted_funding_assignment', 'funding_allocation_mode',
+                  'experiment_name', 'collaboration_mode', 'collaboration_network_growth_mode',
+                  'papers_per_project', 'cost_policy', 'funding_budget_mode',
+                  'funding_budget_slots_frac', 'reviewer_capacity', 'reviews_per_paper',
+                  'reviewer_matching', 'review_policy', 'review_score_mode',
+                  'acceptance_tiebreak', 'acceptance_mode', 'start_year')
+        return json.loads(canonical_json({
+            'binding': self._portable_binding,
+            'simulation': {name: getattr(self, name, None) for name in fields},
+            'config': SIMULATION_CONFIG,
+            'model': getattr(self.llm, 'model_name', None),
+            'model_revision': getattr(self.llm, 'model_revision', None),
+            'max_tokens_override': getattr(self.llm, 'max_tokens_override', None),
+            'enable_thinking': getattr(self.llm, 'enable_thinking', None),
+            'python_hash_seed': os.environ.get('PYTHONHASHSEED'),
+        }))
+
+    def portable_safe_point(self):
+        stop = getattr(self, 'portable_stop', None)
+        if stop is not None:
+            stop.check()
 
     @property
     def is_exploration_experiment(self) -> bool:
@@ -3074,7 +3192,8 @@ class Simulation:
                 for tag in paper.get('tags', []):
                     paper_cats |= tag_to_categories.get(str(tag).lower(), set())
                 matched = [a for a in eligible if reviewer_categories.get(a.id, set()) & paper_cats]
-                unmatched = [a for a in eligible if a not in matched]
+                matched_ids = {a.id for a in matched}
+                unmatched = [a for a in eligible if a.id not in matched_ids]
                 chosen = rng.sample(matched, min(r, len(matched)))
                 if len(chosen) < r and unmatched:
                     chosen += rng.sample(unmatched, min(r - len(chosen), len(unmatched)))
@@ -3762,20 +3881,25 @@ class Simulation:
         Returns:
             Dictionary with year results
         """
+        self.portable_safe_point()
         # Year setup
         year_results = self._setup_year(year)
 
+        self.portable_safe_point()
         # Phase 0: Resubmissions (year 2+)
         resubmissions_list = self._run_phase_0_resubmissions(year, year_results)
         self.wandb_logger.log_phase(year, 0, year_results, self, num_resubmissions=len(resubmissions_list))
 
+        self.portable_safe_point()
         # Phase 1: Assign research directions
         directions, active_authors, avg_funding = self._run_phase_1_research_directions(year, year_results)
         self.wandb_logger.log_phase(year, 1, year_results, self, num_active_authors=len(active_authors), avg_funding=avg_funding)
 
+        self.portable_safe_point()
         # Phase 1.5: Collaboration formation (preferential_attachment experiment only)
         self._run_phase_1_5_collaboration_formation(year, directions, active_authors, year_results)
 
+        self.portable_safe_point()
         # Phase 2: Generate and submit papers
         submissions_list = self._run_phase_2_submit_papers(
             year, directions, active_authors, resubmissions_list, year_results
@@ -3784,9 +3908,11 @@ class Simulation:
         self._record_paper_metadata_batch(year)
         self.wandb_logger.log_phase(year, 2, year_results, self)
 
+        self.portable_safe_point()
         # Charge annual costs
         self._charge_annual_costs(year)
 
+        self.portable_safe_point()
         # Phase 3: Peer review
         average_scores = self._run_phase_3_peer_review(year, year_results)
         self.wandb_logger.log_phase(year, 3, year_results, self)
@@ -3794,6 +3920,7 @@ class Simulation:
         # Apply strategy-dependent quality adjustment (between review and acceptance)
         self._apply_strategy_quality_adjustment(year)
 
+        self.portable_safe_point()
         # Phase 4: Make acceptance decisions
         self._run_phase_4_acceptance_decisions(year, year_results)
         self.wandb_logger.log_phase(year, 4, year_results, self)
@@ -3801,6 +3928,7 @@ class Simulation:
         # Assign latent citation-potential metadata to newly accepted papers
         self._assign_citation_potential(year)
 
+        self.portable_safe_point()
         # Phase 5: Update funding
         self._run_phase_5_update_funding(year, submissions_list, year_results)
 
@@ -3839,8 +3967,13 @@ class Simulation:
         resolved_config = deepcopy(SIMULATION_CONFIG)
         resolved_config['project_cost_accounting'] = self.cost_policy
         resolved_config['conference']['resubmission_cost'] = self.cost_policy['resubmission_cost']
+        manifest_args = self.args
+        if hasattr(self, '_portable_binding'):
+            from argparse import Namespace
+            manifest_args = Namespace(**{key: value for key, value in vars(self.args).items()
+                                         if key != 'checkpoint_callback'})
         write_run_manifest(
-            docs_dir, status='running', args=self.args,
+            docs_dir, status='running', args=manifest_args,
             resolved_config=resolved_config,
             extra={'experiment_id': getattr(self.args, 'experiment_id', self.experiment_name),
                    'model_id': getattr(self.llm, 'model_name', 'unknown'),
@@ -3850,11 +3983,13 @@ class Simulation:
         checkpoint_loaded = False
         loaded_year = None
 
+        portable = hasattr(self, '_portable_binding')
         # Try to load from checkpoint unless always_rerun is specified
         if not self.always_rerun:
             # Try to find the most recent checkpoint
-            for year in range(self.num_years, 0, -1):
-                checkpoint_path = os.path.join(self.output_dir, f"checkpoint_year_{year}.json")
+            for year in range(self.num_years, -1 if portable else 0, -1):
+                name = f"portable_checkpoint_year_{year}.json.gz" if portable else f"checkpoint_year_{year}.json"
+                checkpoint_path = os.path.join(self.output_dir, name)
                 if os.path.exists(checkpoint_path) or os.path.exists(checkpoint_path + '.gz'):
                     logger.info(f"Found checkpoint at year {year}, attempting to load...")
                     if self.load_checkpoint(year):
@@ -3890,6 +4025,11 @@ class Simulation:
                 num_conferences=num_conferences
             )
 
+            # The registry contains mutable Conference instances. New portable
+            # cells must not modify it or inherit another cell's review history.
+            if portable:
+                from copy import deepcopy
+                selected_conferences = deepcopy(selected_conferences)
             # Create conference system with selected conferences
             self.conference_system = ConferenceSystem(conferences=selected_conferences)
 
@@ -3913,16 +4053,42 @@ class Simulation:
             logger.info(f"RAG will filter out {len(self.submitted_paper_ids)} already submitted papers")
 
         assert start_year >= 1, "Start year must be >= 1"
-        if start_year == 1:
+        if start_year == 1 and not checkpoint_loaded:
             for agent_id, agent in self.ecosystem.agent_population.items():
                 if getattr(agent, 'resources', None) is not None:
                     self.agent_tracker.record_agent_resources(agent_id, agent.resources, 0)
 
-        # Run simulation for each year
-        for year in range(start_year, self.num_years + 1):
-            year_results = self.run_one_round(year)
-            self.yearly_results.append(year_results)
-            self._save_checkpoint(year, phase=5)
+        if portable and not checkpoint_loaded:
+            from pathlib import Path
+            from utopia.runtime.checkpointing import PortableCheckpointError
+            if any(Path(self.output_dir).glob('checkpoint_year_*.json*')):
+                raise PortableCheckpointError("Legacy checkpoints cannot seed a new portable cell")
+
+        # A stopped year is replayed from its preceding snapshot. Replied-to
+        # requests remain in the independent durable cache, never rolled back.
+        from contextlib import nullcontext
+        from utopia.runtime.checkpointing import PortableStop
+        stop = getattr(self, 'portable_stop', None)
+        try:
+            with stop.signals() if stop is not None else nullcontext():
+                if portable:
+                    if checkpoint_loaded:
+                        self.notify_portable_checkpoint(os.path.join(
+                            self.output_dir, f"portable_checkpoint_year_{start_year - 1}.json.gz"))
+                    else:
+                        self._save_checkpoint(0, phase=0)
+                for year in range(start_year, self.num_years + 1):
+                    self.portable_safe_point()
+                    if portable:
+                        self.current_year = year
+                    year_results = self.run_one_round(year)
+                    self.yearly_results.append(year_results)
+                    self._save_checkpoint(year, phase=5)
+        except PortableStop:
+            write_run_manifest(docs_dir, status='paused',
+                               extra={'years_completed': self._portable_last_year,
+                                      'resume_year': self._portable_last_year + 1})
+            raise
         # Generate final report
         self._generate_final_report()
         self.wandb_logger.finish()
@@ -3948,8 +4114,12 @@ class Simulation:
         Args:
             year: Year number
         """
+        portable = hasattr(self, '_portable_binding')
         checkpoint_path = os.path.join(self.output_dir, f"checkpoint_year_{year}.json")
-        if getattr(self, 'resource_ledger', None) is not None:
+        if portable and phase != (0 if year == 0 else 5):
+            from utopia.runtime.checkpointing import PortableCheckpointError
+            raise PortableCheckpointError("Portable snapshots require initialized year 0 or a complete year")
+        if getattr(self, 'resource_ledger', None) is not None and year > 0:
             self.resource_ledger.reconcile(year, self.ecosystem.agent_population, require_closed=True)
 
         # Serialize everything to JSON-compatible format
@@ -3977,7 +4147,8 @@ class Simulation:
             # or a neighboring manifest. Transport endpoints may change on resume.
             from utopia.runtime.provenance import _git
             checkpoint_data['cost_experiment_binding'] = {
-                'args': dict(vars(self.args)),
+                'args': {key: value for key, value in vars(self.args).items()
+                         if not portable or key != 'checkpoint_callback'},
                 'git_commit': _git(['git', 'rev-parse', 'HEAD']),
             }
 
@@ -4004,6 +4175,39 @@ class Simulation:
                 'collaboration_pairs': {str(k): v for k, v in self._collaboration_pairs.items()},
             }
 
+        if portable:
+            from utopia.runtime.checkpointing import capture_outputs, capture_rng, write_portable_checkpoint
+            if getattr(self, 'resource_ledger', None) is not None:
+                self.resource_ledger.write(self.output_dir)
+            graph = self.ecosystem.citation_graph
+            checkpoint_data['portable'] = {
+                'contract': self.portable_contract(),
+                'agent_states': {aid: {'type': agent.get_type(),
+                                      'state': {key: value for key, value in vars(agent).items()
+                                                if key not in ('llm', 'resource_ledger')}}
+                                 for aid, agent in self.ecosystem.agent_population.items()},
+                'citation_graph': {'nodes': list(graph.nodes(data=True)),
+                                   'edges': list(graph.edges(data=True)), 'graph': graph.graph},
+                'extra': self.extra_checkpoint_state(),
+                'llm_call_stats': getattr(self.llm, 'call_stats', {}),
+                'response_cache_count': self.llm.response_cache.committed_count(),
+                'direction_records': self._direction_records,
+                'direction_fallback_stats': self._direction_fallback_stats,
+                'pending_paper_metadata': self._pending_paper_metadata,
+                'rag_columns': list(self.rag.document_status.columns),
+                'outputs': capture_outputs(self._portable_replay_paths),
+                'rng': capture_rng(),
+            }
+            for saved, conf in zip(checkpoint_data['conference_system']['conferences'],
+                                   self.conference_system.conferences):
+                saved['submitted_papers'] = conf.submitted_papers
+            checkpoint_path = os.path.join(self.output_dir, f"portable_checkpoint_year_{year}.json.gz")
+            write_portable_checkpoint(checkpoint_path, checkpoint_data)
+            self._portable_last_year = year
+            logger.info(f"Portable checkpoint saved for year {year}: {checkpoint_path}")
+            self.notify_portable_checkpoint(checkpoint_path)
+            return
+
         # Large-stage runs write gzipped checkpoints (~10x smaller; plan scale rule)
         if getattr(self.args, 'experiment_stage', None) in ('calibration', 'confirmatory', 'manyworld', 'mechanism', 'funding_cutoff', 'funding_cutoff_cost'):
             checkpoint_path += '.gz'
@@ -4027,13 +4231,33 @@ class Simulation:
         """
         checkpoint_path = os.path.join(self.output_dir, f"checkpoint_year_{year}.json")
 
+        portable = hasattr(self, '_portable_binding')
         from utopia.utils.data_utils import read_json
-        if not os.path.exists(checkpoint_path):
+        if portable:
+            from utopia.runtime.checkpointing import PortableCheckpointError, read_portable_checkpoint
+            portable_path = os.path.join(self.output_dir, f"portable_checkpoint_year_{year}.json.gz")
+            if not os.path.exists(portable_path):
+                raise PortableCheckpointError("Missing portable snapshot; legacy checkpoints are not resumable here")
+            checkpoint_data = read_portable_checkpoint(portable_path)
+            saved = checkpoint_data.get('portable', {})
+            if saved.get('contract') != self.portable_contract():
+                raise PortableCheckpointError("Checkpoint science/model/corpus/config binding changed")
+            if self.llm.response_cache.committed_count() < saved['response_cache_count']:
+                raise PortableCheckpointError("Response cache is older than the checkpoint")
+            saved_fulltext = checkpoint_data.get('rag', {}).get('fulltext')
+            current_fulltext = getattr(self.rag, 'fulltext_corpus', None)
+            if (bool(saved_fulltext) != bool(current_fulltext)
+                    or (saved_fulltext and saved_fulltext != current_fulltext.reference())):
+                raise PortableCheckpointError("Checkpoint full-text corpus differs from configured corpus")
+            if checkpoint_data.get('year') != year or checkpoint_data.get('phase') != (0 if year == 0 else 5):
+                raise PortableCheckpointError("Checkpoint is not a committed year boundary")
+        elif not os.path.exists(checkpoint_path):
             if not os.path.exists(checkpoint_path + '.gz'):
                 logger.warning(f"Checkpoint not found: {checkpoint_path}(.gz)")
                 return False
             checkpoint_path += '.gz'
-        checkpoint_data = read_json(checkpoint_path)
+        if not portable:
+            checkpoint_data = read_json(checkpoint_path)
 
         from utopia.funding.accounting import resolve_cost_policy, cost_policy_enabled, ResourceLedger
         current_policy = getattr(self, 'cost_policy', resolve_cost_policy(self.args, SIMULATION_CONFIG))
@@ -4042,11 +4266,11 @@ class Simulation:
             raise ValueError("Checkpoint cost policy differs from requested policy")
         if saved_policy is None and cost_policy_enabled(current_policy):
             raise ValueError("Cannot resume a legacy checkpoint under a new cost/audit policy")
-        if cost_policy_enabled(current_policy) and checkpoint_data.get('phase', 5) != 5:
+        if cost_policy_enabled(current_policy) and checkpoint_data.get('phase', 5) != 5 and not (portable and year == 0):
             raise ValueError("Cost accounting supports the native end-of-year checkpoints only")
         if current_policy['log_resource_ledger'] and 'resource_ledger' not in checkpoint_data:
             raise ValueError("Audit checkpoint is missing its resource ledger")
-        if current_policy['log_resource_ledger']:
+        if current_policy['log_resource_ledger'] and not portable:
             binding = checkpoint_data.get('cost_experiment_binding')
             if not binding:
                 raise ValueError("Audit checkpoint is missing its experiment binding")
@@ -4060,13 +4284,34 @@ class Simulation:
         self.current_year = checkpoint_data['year']
 
         # Reconstruct ecosystem with LLM from serialized data
-        self.ecosystem = MultiAgentEcosystem.from_dict(
-            checkpoint_data['ecosystem_data'],
-            llm=self.llm
-        )
+        if portable:
+            # Native from_dict assumes every researcher already has a direction
+            # and drops some agent fields. Portable data reconstructs complete
+            # known agent classes, then reattaches the NEW machine's live client.
+            self.ecosystem = MultiAgentEcosystem(checkpoint_data['ecosystem_data']['config'])
+            self.ecosystem.simulation_metrics = checkpoint_data['ecosystem_data']['simulation_metrics']
+            classes = {'university': UniversityResearcher, 'industry': IndustryResearcher,
+                       'funding_agency': FundingAgency}
+            for aid, record in saved['agent_states'].items():
+                if record['type'] not in classes:
+                    raise PortableCheckpointError(f"Unsupported agent type: {record['type']}")
+                agent = classes[record['type']].__new__(classes[record['type']])
+                agent.__dict__.update(record['state'])
+                if agent.id != aid:
+                    raise PortableCheckpointError("Agent identity changed inside checkpoint")
+                agent.llm = self.llm
+                self.ecosystem.add_agent(agent)
+            graph = saved['citation_graph']
+            self.ecosystem.citation_graph.add_nodes_from(graph['nodes'])
+            self.ecosystem.citation_graph.add_edges_from(graph['edges'])
+            self.ecosystem.citation_graph.graph.update(graph['graph'])
+        else:
+            self.ecosystem = MultiAgentEcosystem.from_dict(
+                checkpoint_data['ecosystem_data'], llm=self.llm)
         if self.resource_ledger is not None:
             self.resource_ledger.attach(self.ecosystem.agent_population)
-            self.resource_ledger.reconcile(year, self.ecosystem.agent_population, require_closed=True)
+            if year > 0:
+                self.resource_ledger.reconcile(year, self.ecosystem.agent_population, require_closed=True)
             # A crash may leave newer exports than the last committed checkpoint.
             self.resource_ledger.write(self.output_dir)
 
@@ -4074,7 +4319,8 @@ class Simulation:
         self.conference_system = ConferenceSystem.from_dict(checkpoint_data['conference_system'])
 
         # Reset conferences for the next year (checkpoint was saved before reset)
-        self.conference_system.reset_all_for_new_year(year)
+        if not portable:
+            self.conference_system.reset_all_for_new_year(year)
 
         # Reconstruct citation tracker
         self.citation_tracker = CitationTracker.from_dict(checkpoint_data.get('citation_tracker', {'citations': {}}))
@@ -4082,8 +4328,10 @@ class Simulation:
         self.funding_tracker = FundingTracker.from_dict(checkpoint_data.get('funding_tracker', {}))
         self.funding_tracker.funding_allocation_mode = self.funding_allocation_mode
         # Reconstruct paper tracker
-        self.paper_tracker = PaperTracker.from_dict(
-            checkpoint_data.get('paper_tracker', checkpoint_data.get('paper_tracker', {})))
+        paper_data = checkpoint_data.get('paper_tracker', {})
+        if portable:
+            paper_data = {**paper_data, 'output_dir': self.output_dir}
+        self.paper_tracker = PaperTracker.from_dict(paper_data)
 
         self.yearly_results = checkpoint_data['yearly_results']
 
@@ -4107,8 +4355,17 @@ class Simulation:
                 cache_dir=os.path.join(getattr(self.args, 'data_cache_dir', 'data/cache'), 'rag'),
                 **({'dataset_revision': self.args.dataset_revision} if getattr(self.args, 'dataset_revision', None) else {}),
                 **({'device': rag_device} if rag_device else {}))
-            self.rag = RAG.from_dict(checkpoint_data['rag'], config=rag_config, model=None,
-                                     debug=self.debug, start_year=self.start_year)
+            if portable:
+                # Preserve configured corpus/index/fulltext providers on this host.
+                self.rag.document_status = pd.DataFrame(checkpoint_data['rag']['document_status'],
+                                                       columns=saved['rag_columns'])
+                self.rag.start_year = checkpoint_data['rag']['start_year']
+                self.rag.current_sim_year = checkpoint_data['rag']['current_sim_year']
+                if 'num_years' in checkpoint_data['rag']:
+                    self.rag.num_years = checkpoint_data['rag']['num_years']
+            else:
+                self.rag = RAG.from_dict(checkpoint_data['rag'], config=rag_config, model=None,
+                                         debug=self.debug, start_year=self.start_year)
             logger.info(f"  Loaded RAG with {len(self.rag.document_status)} document statuses")
 
         # Reconstruct exploration experiment trackers if enabled
@@ -4166,6 +4423,18 @@ class Simulation:
             if pa_data.get('collaboration_pairs'):
                 self._collaboration_pairs = {int(k): v for k, v in pa_data['collaboration_pairs'].items()}
                 logger.info(f"  Loaded {len(self._collaboration_pairs)} collaboration pair records")
+
+        if portable:
+            from utopia.runtime.checkpointing import restore_outputs, restore_rng
+            self.llm.call_stats = saved['llm_call_stats']
+            self._direction_records = saved['direction_records']
+            self._direction_fallback_stats = saved['direction_fallback_stats']
+            self._pending_paper_metadata = saved['pending_paper_metadata']
+            restore_outputs(self._portable_replay_paths, saved['outputs'])
+            self.restore_extra_checkpoint_state(saved['extra'])
+            self._portable_last_year = year
+            # Restore LAST: rebuilding objects and subclass hooks may consume RNG.
+            restore_rng(saved['rng'])
 
         logger.info(f"Checkpoint loaded successfully from year {checkpoint_data['year']}")
         logger.info(f"  Loaded {len(self.ecosystem.agent_population)} agents")
