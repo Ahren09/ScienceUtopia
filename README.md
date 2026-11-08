@@ -2,7 +2,7 @@
 
 ScienceUtopia simulates researchers, institutions, funding agencies, peer review,
 publication, and citation networks. Experiment drivers reuse the same simulator
-and record the configuration, request audits, source fingerprints, and results.
+and record the configuration, request usage, checkpoints, and results.
 
 ## Code layout
 
@@ -15,9 +15,9 @@ All production Python lives in `utopia/`. Tests and their fixtures live in
 | `utopia.experiments` | Experiment configuration, launch plans, and orchestration |
 | `utopia.analysis` | Data admission, estimates, and statistics |
 | `utopia.funding` | Accounting, ranking validation, sequential selection, feedback |
-| `utopia.runtime` | Queue control, server profiles, launchers, and provenance |
+| `utopia.runtime` | Server commands, application setup, and run provenance |
 | `utopia.visual` | Figure construction |
-| `utopia.utils` | Generic IO, hashing, seeding, console logging, and project-root discovery |
+| `utopia.utils` | File IO, seeding, console logging, and project-root discovery |
 | `tests/support` | Shared simulation, funding, and transport fixtures |
 
 Import shared operations from their owning package. Library code does not import
@@ -55,7 +55,6 @@ python -m utopia.experiments.resource_size --help
 python -m utopia.experiments.funding_cutoff --help
 python -m utopia.experiments.review_replay --help
 python -m utopia.experiments.project_cost --help
-python -m utopia.runtime.experiment_queue --help
 python -m utopia.data.keyword_extractor --help
 ```
 
@@ -74,6 +73,28 @@ Generated data stays in `data/` and `outputs/`, with logs, checkpoints, figures,
 and reports in `outputs/logs`, `outputs/checkpoints`, `outputs/visual`, and
 `outputs/docs` respectively. Importing a utility or analysis module must not
 instantiate a model or launch a process.
+
+The historical machine-specific queue and checkpoint-capacity probe have been
+retired. Start servers explicitly and use the existing experiment entrypoints.
+The cost-control planner preserves its four pilot cells and original full-scale
+design, but no longer allocates GPUs or manages servers. Print native commands,
+run them in the shell, and validate their checkpoints:
+
+```bash
+python -m utopia.experiments.project_cost plan \
+  --directory outputs/docs/project_cost_control --vllm-url http://localhost:8032/v1
+python -m utopia.experiments.project_cost commands \
+  --plan outputs/docs/project_cost_control/plan.json --stage costpilot
+python -m utopia.experiments.project_cost validate \
+  --plan outputs/docs/project_cost_control/plan.json --stage costpilot
+python -m utopia.experiments.project_cost commands \
+  --plan outputs/docs/project_cost_control/plan.json --stage costcontrol
+python -m utopia.analysis.project_cost \
+  --plan outputs/docs/project_cost_control/plan.json --out outputs/docs/project_cost_control/results
+```
+
+`commands --stage costcontrol` validates all pilot results before printing the
+full-scale commands. Native simulation resumes saved worlds and missing requests.
 
 ## Validation
 

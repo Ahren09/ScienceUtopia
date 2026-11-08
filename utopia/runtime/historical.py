@@ -13,13 +13,11 @@ SOURCE_PATHS = {
     "utopia/analysis/research_strategy.py": "src/analyze_james_strategy.py",
     "utopia/analysis/project_cost.py": "src/analyze_project_cost.py",
     "utopia/analysis/switching_propensity.py": "src/james_propensity_analysis.py",
-    "utopia/runtime/checkpoint_capacity.py": "src/check_james_checkpoint_capacity_resource.py",
     "utopia/funding/compact.py": "src/james_funding_compact.py",
     "utopia/funding/sequential.py": "src/james_funding_sequential.py",
     "utopia/funding/validation.py": "src/james_funding_validation.py",
     "utopia/funding/accounting.py": "src/project_cost_accounting.py",
     "utopia/runtime/server_profiles.py": "src/james_server_profiles.py",
-    "utopia/runtime/experiment_queue.py": "src/run_james_ec2_queue.py",
     "utopia/runtime/modal_vllm.py": "src/modal_vllm_server.py",
     "utopia/runtime/modal_resource_size.py": "src/modal_vllm_server_tp4.py",
     "utopia/runtime/fp8_server.py": "scripts/run_qwen3_32b_fp8_server.py",
@@ -36,11 +34,8 @@ SOURCE_PATHS = {
     "utopia/analysis/funding_cutoff.py": "utopia/analysis/matthew_rd_analysis.py",
     "utopia/analysis/resource_size.py": "utopia/analysis/factorial_resource_size_analysis.py",
     "utopia/visual/plot_funding_cutoff.py": "utopia/visual/plot_matthew_rd.py",
-    "docs/frozen_continuation.md": "docs/james_pending_continuation.md",
     "docs/switching_propensity_protocol.md": "docs/james_propensity_protocol.md",
     "docs/sequential_funding_protocol.md": "docs/james_sequential_funding_protocol.md",
-    "tests/runtime/test_experiment_queue.py": "src/test_james_ec2_queue.py",
-    "tests/runtime/test_frozen_continuation.py": "src/test_james_pending_continuation.py",
     "tests/funding/test_compact.py": "src/test_james_funding_compact.py",
     "tests/funding/test_sequential.py": "src/test_james_funding_sequential.py",
     "tests/funding/test_validation.py": "src/test_james_funding_validation.py",
@@ -69,49 +64,6 @@ SWITCH_GATE_SEED_NAMESPACE = "james_propensity_distance_v1_switch"
 def historical_source_path(current_path):
     """Locate the corresponding file in historical Git trees."""
     return SOURCE_PATHS.get(current_path, current_path)
-
-
-PENDING_KIND = "v6_pending_six_v1"
-
-
-PENDING_QUEUE_ID = "james_pending_seed42_n1200_20260921_r1"
-
-
-PENDING_JOB_IDS = (
-    "influx_james1202_v6_C_seed42",
-    "influx_james1202_v6_D_seed42",
-    "james_mechanisms_v6_n1200_y6_P1F1_seed42",
-    "james_mechanisms_v6_n1200_y6_P0F1_seed42",
-    "james_mechanisms_v6_n1200_y6_P1F0_seed42",
-    "james_mechanisms_v6_n1200_y6_P0F0_seed42",
-)
-
-
-PENDING_PARENT_SHA256 = {
-    "parent_plan": "382dbb5168196c2b6adb15f2ed3ef9bb273389d7c816b65e6057ee524ed9e3e0",
-    "parent_status": "5cb068350039d8dd3d2a1a581d5e5a591721c45992faefe314dc10c96ce9f4cf",
-    "parent_source_freeze": "e692b66b13347faa1b6024fdd01fbed531bd00043675a602121b12a0a20bdd4b",
-    "authorization": "bc82df78b9eb570b694b413d9fabafc124427634185761a157b73c767cbe762c",
-}
-
-
-PENDING_RECORD_PATHS = {
-    "parent_plan": "outputs/logs/ec2_preparation/james_ec2_queue_plan_v6.json",
-    "parent_status": "outputs/logs/james_ec2_queue/james_seed42_n1200_20260919_v6/status.json",
-    "parent_source_freeze": "outputs/logs/ec2_preparation/v6_source_freeze.json",
-    "authorization": "outputs/logs/ec2_preparation/pending6_execution_authorization_20260921.json",
-}
-
-
-PENDING_PROPOSAL_SHA256 = (
-    "cf888fa2a056257dae27916c86498de3af8227a9fb4f6444c8ef5274a78fe4ce"
-)
-
-
-PENDING_SCOPE = (
-    "Only six previously unstarted V6 jobs. A/B remain excluded and unresolved. "
-    "Completion means this pending subset only, never FIRST8 or all twelve conditions."
-)
 
 
 IDENTIFIER_ALIASES = {
@@ -198,5 +150,3 @@ INFLUX_POPULATION_SEED_NAMESPACE = "james1202_v2"
 HISTORICAL_PROFILE_SHA256 = (
     "8011e0aac664dcec036fc19820fd5c732beb74dfcbf7b21220a1c3dbf1c0091e"
 )
-
-PENDING_BRANCH = "codex/llm-james-pending6"

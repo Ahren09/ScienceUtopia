@@ -1,6 +1,5 @@
-import json
 import gzip
-import stat
+import json
 from unittest.mock import patch
 
 import pandas as pd
@@ -10,9 +9,9 @@ from utopia.utils.data_utils import (
     write_bytes_atomic,
     write_json,
     write_json_atomic,
+    write_json_gzip_atomic,
     write_jsonl_atomic,
     write_parquet_atomic,
-    write_json_gzip_atomic,
 )
 
 
@@ -69,19 +68,16 @@ def test_jsonl_atomic_writer_consumes_rows_lazily_and_keeps_failed_export(tmp_pa
     )
 
 
-def test_exclusive_and_private_publication_keep_permissions_and_contents(tmp_path):
-    path = tmp_path / "private.json"
-    write_bytes_atomic(path, b"first", private=True, exclusive=True, readonly=True)
-    assert stat.S_IMODE(path.stat().st_mode) == 0o444
-    with pytest.raises(FileExistsError):
-        write_bytes_atomic(path, b"second", private=True, exclusive=True)
+def test_atomic_publication_failure_keeps_original_and_removes_failed_bytes(tmp_path):
+    path = tmp_path / "record.json"
+    write_bytes_atomic(path, b"first")
+    with patch("utopia.utils.data_utils.os.replace", side_effect=OSError("disk error")):
+        with pytest.raises(OSError, match="disk error"):
+            write_bytes_atomic(path, b"second")
     assert path.read_bytes() == b"first"
-    assert not list(tmp_path.glob(".atomic-*"))
-    link = tmp_path / "link"
-    link.symlink_to(path)
-    with pytest.raises(ValueError, match="symlink"):
-        write_bytes_atomic(link, b"second", private=True)
-    assert path.read_bytes() == b"first"
+    assert not path.with_suffix(".json.tmp").exists()
+    write_bytes_atomic(path, b"second")
+    assert path.read_bytes() == b"second"
     with pytest.raises(FileExistsError):
         write_json({"new": True}, path, mode="x")
 

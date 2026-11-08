@@ -21,7 +21,6 @@ import hashlib
 import json
 import os
 import random
-import sys
 import tempfile
 from collections import Counter
 from types import SimpleNamespace
@@ -555,9 +554,11 @@ def test_driver_builds_default_population_command():
                            reviewer_capacity=None, reviewer_matching='random', legacy_scoring=False,
                            always_rerun=False, funding_panel_max_apps=0)
     cmd = drv.build_command('S1R1', 42, args)
+    assert drv.experiment_id_for(cmd) == parse_arguments(cmd[3:]).experiment_id
     assert '--population_mode' in cmd and cmd[cmd.index('--population_mode') + 1] == 'default'
     assert '--strategy_mix' not in cmd and '--num_institutions' not in cmd
     assert cmd[cmd.index('--num_years') + 1] == '10' and cmd[cmd.index('--funding_budget_mode') + 1] == 'fixed'
     args.population = 'university_only'; args.num_institutions = 60; args.num_years = 8; args.funding_panel_max_apps = 25
     cmd = drv.build_command('S0R0', 1, args)
+    assert drv.experiment_id_for(cmd) == parse_arguments(cmd[3:]).experiment_id
     assert cmd[cmd.index('--num_institutions') + 1] == '60' and cmd[cmd.index('--funding_panel_max_apps') + 1] == '25'

@@ -3,7 +3,6 @@ import hashlib
 import io
 import json
 import os
-import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -81,78 +80,28 @@ def atomic_open(
     path,
     mode="w",
     *,
-    exclusive=False,
-    readonly=False,
-    private=False,
-    symlink_error=ValueError,
-    temp_prefix=".atomic-",
     cleanup_on_error=False,
     create_parent=True,
 ):
-    """Publish a completed stream with the caller's durability and failure policy.
-
-    Ordinary writers retain partial temporary files on failure, as the original
-    streaming exporters did. Private queue records opt into cleanup and fsync.
-    """
+    """Replace a file after writing succeeds; retain failed streams for recovery."""
     path = Path(path)
     if create_parent:
-        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700 if private else 0o777)
-    if private:
-        fd, temporary = tempfile.mkstemp(prefix=temp_prefix, dir=path.parent)
-    else:
-        temporary = str(path.with_suffix(path.suffix + ".tmp"))
-        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
+        path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
     published = False
     try:
-        with os.fdopen(fd, mode) as stream:
+        with temporary.open(mode) as stream:
             yield stream
-            stream.flush()
-            if readonly:
-                os.fchmod(stream.fileno(), 0o444)
-            if private:
-                os.fsync(stream.fileno())
-        if exclusive:
-            os.link(temporary, path)
-            os.unlink(temporary)
-        else:
-            if private and path.is_symlink():
-                raise symlink_error(f"Refusing symlink status file: {path}")
-            os.replace(temporary, path)
+        os.replace(temporary, path)
         published = True
-        if private:
-            directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
     finally:
-        if (published or cleanup_on_error) and os.path.exists(temporary):
-            os.unlink(temporary)
+        if (published or cleanup_on_error) and temporary.exists():
+            temporary.unlink()
 
 
-def write_bytes_atomic(
-    path,
-    value,
-    *,
-    exclusive=False,
-    readonly=False,
-    private=False,
-    symlink_error=ValueError,
-    temp_prefix=".atomic-",
-    create_parent=True,
-):
+def write_bytes_atomic(path, value, *, create_parent=True):
     """Atomically publish complete bytes, cleaning up failed publications."""
-    with atomic_open(
-        path,
-        "wb",
-        exclusive=exclusive,
-        readonly=readonly,
-        private=private,
-        symlink_error=symlink_error,
-        temp_prefix=temp_prefix,
-        cleanup_on_error=True,
-        create_parent=create_parent,
-    ) as stream:
+    with atomic_open(path, "wb", cleanup_on_error=True, create_parent=create_parent) as stream:
         stream.write(value)
 
 

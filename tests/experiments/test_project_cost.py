@@ -1,11 +1,11 @@
 """CPU-only falsification tests for the campaign and independent analysis."""
-from copy import deepcopy
-import hashlib
 import json
-from pathlib import Path
+import shlex
 import sys
+from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -73,31 +73,32 @@ def test_wrong_cell_seed_budget_year_and_config_are_rejected():
     args = dict(papers_per_project=2, seed=3, funding_budget_mode="fixed", disable_resubmission=False)
     config = {"annual_cost": 10}
     manifest = {"git_commit": "sha", "git_dirty_files": "", "experiment_id": "planned",
-                "args": args, "resolved_config": config,
-                "scientific_config_hash": hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()}
+                "args": args, "resolved_config": config}
     checkpoint = {"year": 8, "phase": 5, "project_cost_policy": {"papers_per_project": 2},
                   "cost_experiment_binding": {"args": deepcopy(args), "git_commit": "sha"}}
     job = {"experiment_id": "planned", "years": 8, "resolved_config": config,
            "scientific_args": deepcopy(args),
            "command": ["python", "utopia/simulation.py", "--papers_per_project", "2",
                        "--seed", "3", "--funding_budget_mode", "fixed"]}
-    analysis.validate_job_binding(manifest, checkpoint, job, "sha")
+    analysis.validate_job_binding(manifest, checkpoint, job)
+    manifest.update(git_commit="newer", git_dirty_files="local edits")
+    analysis.validate_job_binding(manifest, checkpoint, job)
     for field, wrong in (("papers_per_project", 1), ("seed", 4), ("funding_budget_mode", "track"),
                          ("disable_resubmission", True)):
         altered_manifest, altered_ck = deepcopy(manifest), deepcopy(checkpoint)
         altered_manifest["args"][field] = wrong
         altered_ck["cost_experiment_binding"]["args"][field] = wrong
         with pytest.raises(ValueError):
-            analysis.validate_job_binding(altered_manifest, altered_ck, job, "sha")
+            analysis.validate_job_binding(altered_manifest, altered_ck, job)
     for field, wrong in (("year", 7), ("phase", 2)):
         altered_ck = deepcopy(checkpoint)
         altered_ck[field] = wrong
         with pytest.raises(ValueError):
-            analysis.validate_job_binding(manifest, altered_ck, job, "sha")
+            analysis.validate_job_binding(manifest, altered_ck, job)
     altered_manifest = deepcopy(manifest)
     altered_manifest["resolved_config"]["annual_cost"] = 11
     with pytest.raises(ValueError):
-        analysis.validate_job_binding(altered_manifest, checkpoint, job, "sha")
+        analysis.validate_job_binding(altered_manifest, checkpoint, job)
 
 
 def test_five_seed_exact_test_and_paired_direction():
@@ -125,71 +126,75 @@ def test_cost_control_flags_do_not_disable_resubmission_or_add_production_debit(
     assert "--production_cost_mode" not in legacy and "--resubmission_cost" not in legacy
 
 
-def test_failed_pilot_never_launches_full_world(tmp_path):
-    plan_path = tmp_path / "plan.json"
-    plan_path.write_text("{}")
-    pilot = {"stage": "costpilot", "experiment_id": "pilot"}
-    full = {"stage": "costcontrol", "experiment_id": "full"}
-    plan = {"directory": str(tmp_path), "git_commit": "sha", "jobs": [pilot, full]}
-    runner = campaign.Campaign(plan, plan_path)
-    runner.lock_root = tmp_path / "locks"
-    runner.lock_root.mkdir()
-    gpu = SimpleNamespace(index=1)
-    runner.servers = [{"gpu": gpu, "record": {"status": "ready", "identity": {}},
-                       "process": SimpleNamespace(poll=lambda: None), "client": None}]
-    launched = []
-    def start(server, job):
-        launched.append(job["experiment_id"])
-        runner.state["jobs"][job["experiment_id"]] = {"started": 0}
-        server["client"] = (SimpleNamespace(poll=lambda: 2), job)
-    with (patch.object(campaign, "runtime_check"), patch.object(runner, "recover"),
-          patch.object(runner, "cleanup"), patch.object(runner, "save"),
-          patch.object(campaign, "load_shared_probe_builder", return_value=(None, {})),
-          patch.object(campaign, "git", side_effect=lambda *args: "sha" if args[0] == "rev-parse" else ""),
-          patch.object(runner, "start_job", side_effect=start),
-          patch.object(campaign.time, "sleep"), patch.object(campaign.time, "time", return_value=1)):
-        with pytest.raises(RuntimeError, match="World exited 2"):
-            runner.run()
-    assert launched == ["pilot"]
+@pytest.fixture
+def cost_plan(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(campaign, "ROOT", tmp_path)
+    args = SimpleNamespace(
+        directory=tmp_path / "plan",
+        python=Path(sys.executable),
+        vllm_url=["http://localhost:8032/v1", "http://localhost:8033/v1"],
+    )
+    campaign.make_plan(args)
+    return json.loads((args.directory / "plan.json").read_text())
 
 
-@pytest.mark.parametrize("first_failure", ([11], RuntimeError("cannot stop")))
-def test_cleanup_visits_every_owned_server_and_retains_unresolved_reservation(tmp_path, first_failure):
-    plan_path = tmp_path / "plan.json"
-    plan_path.write_text("{}")
-    runner = campaign.Campaign({"directory": str(tmp_path)}, plan_path)
-    locks = [Mock(), Mock()]
-    runner.servers = [
-        {"record": {"identity": {"pid": pid}}, "locks": [lock]}
-        for pid, lock in zip((11, 22), locks)
-    ]
-    with (patch.object(campaign, "stop_owned", side_effect=[first_failure, []]) as stop,
-          patch.object(runner, "reservation") as release, patch.object(runner, "save")):
-        with pytest.raises(RuntimeError, match="Cleanup incomplete"):
-            runner.cleanup()
-        assert stop.call_count == 2
-        release.assert_called_once_with(runner.servers[1], "released")
-        assert runner.servers[0]["record"].get("status") != "released"
-        assert all(lock.close.call_count == 1 for lock in locks)
+def test_plan_commands_keep_native_ids_settings_and_isolated_caches(cost_plan):
+    from utopia.arguments import parse_arguments
+
+    assert len(cost_plan["jobs"]) == 24
+    assert len({job["experiment_id"] for job in cost_plan["jobs"]}) == 24
+    assert json.loads((Path(cost_plan["directory"]) / "plan.json").read_text()) == cost_plan
+    for index, job in enumerate(cost_plan["jobs"]):
+        assert job["command"][1:3] == ["-m", "utopia"]
+        args = parse_arguments(job["command"][3:])
+        assert args.experiment_id == job["experiment_id"]
+        assert analysis.scientific_arguments(vars(args)) == job["scientific_args"]
+        assert args.num_institutions * 5 == job["population"]
+        assert args.num_years == job["years"]
+        assert args.vllm_url == f"http://localhost:{8032 + index % 2}/v1"
+        assert args.funding_panel_max_apps == 25
+        assert args.log_resource_ledger and not args.disable_resubmission
+        assert job["resolved_config"]["conference"]["resubmission_cost"] == 0
+    commands = campaign.shell_commands(cost_plan, "costpilot")
+    assert len(commands) == 4
+    for command, job in zip(commands, campaign.stage_jobs(cost_plan, "costpilot")):
+        tokens = shlex.split(command)
+        assert tokens[:3] == ["env", "CUDA_VISIBLE_DEVICES=", f"PYTHONHASHSEED={job['seed']}"]
+        assert tokens[3].endswith("/data/cache/" + job["experiment_id"])
+        assert tokens[4:] == job["command"]
 
 
-def test_wrong_child_python_rejected_before_source_or_gpu_inspection():
-    with patch.object(campaign, "source_identity") as source:
-        with pytest.raises(RuntimeError, match="interpreter"):
-            campaign.runtime_check({"python": "/different/environment/python"})
-        source.assert_not_called()
+def test_full_commands_require_all_pilot_checkpoints_to_validate(cost_plan):
+    with patch.object(campaign, "validate_run", side_effect=ValueError("Incomplete world")) as validate:
+        with pytest.raises(ValueError, match="Incomplete world"):
+            campaign.shell_commands(cost_plan, "costcontrol")
+        assert validate.call_count == 1
+    with patch.object(campaign, "validate_run") as validate:
+        commands = campaign.shell_commands(cost_plan, "costcontrol")
+        assert len(commands) == 20
+        assert [call.args[1] for call in validate.call_args_list] == campaign.stage_jobs(cost_plan, "costpilot")
 
 
-def test_cpu_training_controller_still_reserves_its_gpu(tmp_path):
-    for pid, args in ((11, ["python", "-m", "src.unified.run_plan", "--gpu", "3"]),
-                      (12, ["python", "ordinary_cpu_script.py"])):
-        directory = tmp_path / str(pid)
-        directory.mkdir()
-        (directory / "cmdline").write_bytes(b"\0".join(arg.encode() for arg in args))
-    assert campaign.pending_training_gpus(tmp_path) == {3}
-    with (patch.object(campaign, "pending_training_gpus", return_value={3}),
-          patch.object(campaign, "query_gpus",
-                       return_value=[SimpleNamespace(index=3), SimpleNamespace(index=4)])):
-        assert [gpu.index for gpu in campaign.available_gpus()] == [4]
-    (tmp_path / "11/cmdline").write_bytes(b"python\0-m\0src.unified.run_plan\0--gpu\0unknown")
-    assert campaign.pending_training_gpus(tmp_path) == set(range(8))
+@pytest.mark.parametrize("mutation", ("missing", "duplicate", "wrong_cell", "duplicate_id"))
+def test_stage_rejects_incomplete_or_duplicate_worlds(cost_plan, mutation):
+    jobs = cost_plan["jobs"]
+    if mutation == "missing":
+        jobs.pop(0)
+    elif mutation == "duplicate":
+        jobs.append(jobs[0])
+    elif mutation == "wrong_cell":
+        jobs[0]["cell"] = "unexpected"
+    else:
+        jobs[0]["experiment_id"] = jobs[1]["experiment_id"]
+    with pytest.raises(ValueError, match="planned cells|world IDs"):
+        campaign.shell_commands(cost_plan, "costpilot")
+
+
+def test_shell_commands_quote_python_and_output_paths(cost_plan):
+    job = cost_plan["jobs"][0]
+    job["command"][0] = "/environment with spaces/python"
+    job["experiment_id"] = "world with spaces"
+    tokens = shlex.split(campaign.shell_commands(cost_plan, "costpilot")[0])
+    assert tokens[3].endswith("/data/cache/world with spaces")
+    assert tokens[4] == "/environment with spaces/python"

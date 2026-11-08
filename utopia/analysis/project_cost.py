@@ -31,42 +31,15 @@ def scientific_arguments(args):
     return {key: value for key, value in args.items() if key not in transport}
 
 
-def expected_flags(command):
-    result = {}
-    i = 2
-    while i < len(command):
-        flag = command[i]
-        require(flag.startswith("--"), "Malformed planned command")
-        key = flag[2:].replace("-", "_")
-        if i + 1 < len(command) and not command[i + 1].startswith("--"):
-            result[key], i = command[i + 1], i + 2
-        else:
-            result[key], i = True, i + 1
-    return result
-
-
-def validate_job_binding(manifest, checkpoint, job, commit):
-    require(manifest.get("git_commit") == commit, "Code revision mismatch")
-    require(not manifest.get("git_dirty_files"), "Run started from modified source")
+def validate_job_binding(manifest, checkpoint, job):
     require(manifest.get("experiment_id") == job["experiment_id"], "Manifest belongs to another world")
     binding = checkpoint["cost_experiment_binding"]
-    require(binding["git_commit"] == commit, "Checkpoint code revision mismatch")
     require(scientific_arguments(binding["args"]) == scientific_arguments(manifest["args"]),
             "Checkpoint and manifest identify different experiments")
     require(scientific_arguments(manifest["args"]) == job["scientific_args"],
             "Parsed scientific arguments differ from the frozen plan")
     require(checkpoint["year"] == job["years"] and checkpoint["phase"] == 5,
             "Wrong checkpoint year or phase")
-    for key, expected in expected_flags(job["command"]).items():
-        if key == "vllm_url":
-            continue
-        actual = manifest["args"].get(key)
-        if isinstance(actual, bool):
-            require(actual is expected, f"Planned flag mismatch: {key}")
-        elif isinstance(actual, (int, float)):
-            require(actual == float(expected), f"Planned numeric argument mismatch: {key}")
-        else:
-            require(actual == expected, f"Planned argument mismatch: {key}")
     require(checkpoint["project_cost_policy"]["papers_per_project"] ==
             manifest["args"]["papers_per_project"], "Checkpoint has the wrong output treatment")
     require(manifest["resolved_config"] == job["resolved_config"], "Resolved configuration changed")
@@ -145,13 +118,13 @@ def validate_ledger(checkpoint, years, founders):
     return rows
 
 
-def validate_run(root, job, commit):
+def validate_run(root, job):
     exp = job["experiment_id"]
     manifest = json.loads((root / "outputs/docs" / exp / "run_manifest.json").read_text())
     require(manifest["status"] == "complete", f"Incomplete world: {exp}")
     path = root / "outputs/checkpoints" / exp / f"checkpoint_year_{job['years']}.json"
     checkpoint = read_json(path if path.exists() else str(path) + ".gz")
-    validate_job_binding(manifest, checkpoint, job, commit)
+    validate_job_binding(manifest, checkpoint, job)
     policy = checkpoint["project_cost_policy"]
     require(policy["production_cost_mode"] == "per_paper"
             and policy["legacy_effective_per_paper_cost"] == 0
@@ -192,7 +165,7 @@ def analyze(root, plan, out):
     jobs = [job for job in plan["jobs"] if job["stage"] == "costcontrol"]
     require(len(jobs) == 4 * len(plan["seeds"]), "Incomplete planned factorial")
     for job in jobs:
-        checkpoint, rows = validate_run(root, job, plan["git_commit"])
+        checkpoint, rows = validate_run(root, job)
         blueprint = {
             a["id"]: {k: a.get(k) for k in ("type", "name", "university_name", "expertise",
                                             "exploration_strategy")}

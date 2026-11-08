@@ -41,11 +41,6 @@ Examples:
     python -m utopia.experiments.scale_expansion analyze --num_years 8
 """
 
-from utopia.utils.data_utils import write_json as write_json_file
-
-from utopia.runtime.commands import module_command
-
-from utopia.utils.paths import project_root
 import argparse
 import glob
 import json
@@ -53,6 +48,10 @@ import os
 import subprocess
 import sys
 import time
+
+from utopia.runtime.commands import module_command
+from utopia.utils.data_utils import write_json as write_json_file
+from utopia.utils.paths import project_root
 
 REPO_ROOT = str(project_root(__file__))
 MODEL = "Qwen/Qwen3-32B"
@@ -150,7 +149,7 @@ def experiment_id_for(cmd: list) -> str:
     canonical output dirs as a side effect; remove them again if they are still empty so a
     dry run leaves no trace (the real run recreates them)."""
     from utopia.arguments import parse_arguments
-    a = parse_arguments(cmd[2:])
+    a = parse_arguments(cmd[3:])
     for d in (a.log_dir, a.checkpoint_dir, a.visual_dir, a.docs_dir):
         try:
             os.rmdir(d)  # only succeeds when empty

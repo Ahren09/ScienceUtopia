@@ -63,15 +63,11 @@ def test_audit_hashes_preserve_different_unicode_encodings():
 def test_strict_decoding_preserves_caller_error_semantics(tmp_path):
     from utopia.analysis.switching_propensity import AnalysisError, read_json
     from utopia.funding.sequential import decode_selection
-    from utopia.runtime.experiment_queue import QueueError
-    from utopia.runtime.experiment_queue import read_json as read_queue_json
     from utopia.runtime.switching_evidence import ProtocolFailure, strict_evidence_json
 
     duplicate = '{"next_application_id": 0, "next_application_id": 1}'
     with pytest.raises(DuplicateJSONKey):
         decode_json(duplicate, strict=True)
-    with pytest.raises(QueueError, match="Duplicate JSON key"):
-        read_queue_json(duplicate.encode())
     with pytest.raises(ValueError, match="^Duplicate JSON key$"):
         decode_selection(duplicate, [0, 1])
     path = tmp_path / "ambiguous.json"
@@ -84,7 +80,7 @@ def test_strict_decoding_preserves_caller_error_semantics(tmp_path):
         decode_json('{"x": NaN}', strict=True)
     with pytest.raises(ProtocolFailure, match="^nonfinite_evidence_json"):
         strict_evidence_json('{"x": 1e999}', path)
-    # Existing queue/analysis decoding only rejected nonstandard constants.
+    # Strict JSON decoding rejects nonstandard constants.
     assert np.isinf(decode_json('{"x": 1e999}', strict=True)["x"])
 
 
@@ -192,7 +188,7 @@ assert not {"torch", "vllm", "transformers", "openai", "langchain_core"} & set(s
 
 def test_readonly_historical_audit_reuses_records_without_source_pins(tmp_path):
     from tests.support.simulation import zero_sequential_fixture
-    from utopia.funding.sequential import SequentialFundingError, validate_audit
+    from utopia.funding.sequential import validate_audit
 
     summary = zero_sequential_fixture(tmp_path, years=1)
     expected = GOLDEN["historical_sources"]

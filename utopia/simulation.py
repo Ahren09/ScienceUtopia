@@ -3862,7 +3862,7 @@ class Simulation:
         self.charge_annual_costs(year)
 
         # Phase 3: Peer review
-        average_scores = self.run_phase_3_peer_review(year, year_results)
+        self.run_phase_3_peer_review(year, year_results)
         self.wandb_logger.log_phase(year, 3, year_results, self)
 
         # Apply strategy-dependent quality adjustment (between review and acceptance)
@@ -3922,7 +3922,6 @@ class Simulation:
 
         start_year = 1
         checkpoint_loaded = False
-        loaded_year = None
 
         # Try to load from checkpoint unless always_rerun is specified
         if not self.always_rerun:
@@ -4164,7 +4163,7 @@ class Simulation:
         self.funding_tracker.funding_allocation_mode = self.funding_allocation_mode
         # Reconstruct paper tracker
         self.paper_tracker = PaperTracker.from_dict(
-            checkpoint_data.get('paper_tracker', checkpoint_data.get('paper_tracker', {})))
+            checkpoint_data.get('paper_tracker', {}))
 
         self.yearly_results = checkpoint_data['yearly_results']
 
