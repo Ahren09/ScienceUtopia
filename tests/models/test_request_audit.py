@@ -1,22 +1,30 @@
 """CPU coverage of deterministic request rejection and unchanged wire behavior."""
 
-from utopia.utils.paths import project_root
-
-from concurrent.futures import ThreadPoolExecutor
-from copy import deepcopy
 import json
 import os
-from pathlib import Path
 import random
 import sys
 import tempfile
-from types import SimpleNamespace
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
+
+from utopia.utils.paths import project_root
 
 ROOT = project_root(__file__)
 from utopia.models import request_audit as module
-from utopia.models.request_audit import CONTEXT_TOKENS, MODEL, REVISION, RequestAudit, RequestAuditFailure, active_audit_for, request_audit_scope
+from utopia.models.request_audit import (
+    CONTEXT_TOKENS,
+    MODEL,
+    REVISION,
+    RequestAudit,
+    RequestAuditFailure,
+    active_audit_for,
+    request_audit_scope,
+)
 
 
 class FakeTokenizer:
@@ -195,7 +203,7 @@ class TestRequestAudit(unittest.TestCase):
     def test_tokenizer_setup_restores_loaded_rngs(self):
         import numpy as np
         python_before, numpy_before = random.getstate(), np.random.get_state()
-        with module._preserve_rng():
+        with module.preserve_rng():
             random.random()
             np.random.random()
         self.assertEqual(random.getstate(), python_before)
@@ -218,7 +226,7 @@ class TestRequestAudit(unittest.TestCase):
             "huggingface_hub": SimpleNamespace(snapshot_download=download),
             "transformers": SimpleNamespace(AutoTokenizer=SimpleNamespace(from_pretrained=pretrained)),
         }):
-            self.assertIs(module._load_tokenizer(), tokenizer)
+            self.assertIs(module.load_tokenizer(), tokenizer)
         download.assert_called_once_with(repo_id=MODEL, revision=REVISION, local_files_only=True)
         pretrained.assert_called_once_with(
             str(snapshot.resolve()), local_files_only=True, trust_remote_code=False)
@@ -367,8 +375,9 @@ class TestActualClientAudit(unittest.TestCase):
         # Run in the actual private runtime with HF_HUB_OFFLINE=1 and the
         # production HF_HOME. A metadata call is forbidden even if Hub offline
         # mode would stop it before a network connection.
-        import huggingface_hub
         import socket
+
+        import huggingface_hub
         with patch.object(huggingface_hub, "model_info",
                           side_effect=AssertionError("offline loader must not query model_info")), \
                 patch.object(socket, "create_connection",
@@ -380,7 +389,7 @@ class TestActualClientAudit(unittest.TestCase):
             import torch
             python_before, numpy_before = random.getstate(), np.random.get_state()
             torch_before = torch.get_rng_state().clone()
-            tokenizer = module._load_tokenizer()
+            tokenizer = module.load_tokenizer()
             self.assertTrue(Path(tokenizer.name_or_path).is_absolute())
             self.assertEqual(Path(tokenizer.name_or_path).name, REVISION)
             with request_audit_scope(Path(directory) / "actual.jsonl") as audit:

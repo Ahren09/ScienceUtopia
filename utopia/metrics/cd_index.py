@@ -23,7 +23,7 @@ class CDIndexCalculator:
         self.citation_tracker = citation_tracker
         self.paper_tracker = paper_tracker
 
-    def _paper_year(self, paper_id: str) -> Optional[int]:
+    def paper_year(self, paper_id: str) -> Optional[int]:
         paper = self.paper_tracker.get_paper_by_id(paper_id)
         if paper is None:
             return None
@@ -44,17 +44,17 @@ class CDIndexCalculator:
             'n_predecessor_only' (f=0,b=1), 'denominator'; or None if the paper
             has no references or the denominator is below min_denominator.
         """
-        focal_year = self._paper_year(paper_id)
+        focal_year = self.paper_year(paper_id)
         paper_refs = set(self.citation_tracker.get_citations_from_paper(paper_id))
         if not paper_refs:
             return None  # CD undefined without predecessors
 
-        def _eligible(citing_id: str) -> bool:
+        def eligible(citing_id: str) -> bool:
             if citing_id == paper_id:
                 return False
             if cutoff_year is None:
                 return True
-            year = self._paper_year(citing_id)
+            year = self.paper_year(citing_id)
             if year is None:
                 return True  # keep papers with unknown year rather than silently dropping
             if year > cutoff_year:
@@ -62,11 +62,11 @@ class CDIndexCalculator:
             # only papers published at/after the focal paper can be "later" papers
             return focal_year is None or year >= focal_year
 
-        focal_citers = {c for c in self.citation_tracker.get_papers_citing(paper_id) if _eligible(c)}
+        focal_citers = {c for c in self.citation_tracker.get_papers_citing(paper_id) if eligible(c)}
         predecessor_citers = set()
         for ref in paper_refs:
             predecessor_citers.update(
-                c for c in self.citation_tracker.get_papers_citing(ref) if _eligible(c)
+                c for c in self.citation_tracker.get_papers_citing(ref) if eligible(c)
             )
 
         index_set = focal_citers | predecessor_citers

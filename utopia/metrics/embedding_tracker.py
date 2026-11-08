@@ -1,10 +1,10 @@
 """Track paper embeddings for exploration vs exploitation analysis"""
 import hashlib
 import os
+from typing import Dict, List, Optional
 
 import numpy as np
 from sentence_transformers import SentenceTransformer
-from typing import Dict, List, Optional
 
 
 class EmbeddingTracker:
@@ -33,12 +33,12 @@ class EmbeddingTracker:
                 with np.load(self._cache_path) as npz:
                     self._disk_cache = {k: npz[k] for k in npz.files}
 
-    def _text_key(self, text: str) -> str:
+    def text_key(self, text: str) -> str:
         return hashlib.sha256(text.encode('utf-8')).hexdigest()
 
-    def _encode_cached(self, texts: List[str]) -> np.ndarray:
+    def encode_cached(self, texts: List[str]) -> np.ndarray:
         """Encode texts with disk-cache lookup; one batched encode for all misses."""
-        keys = [self._text_key(t) for t in texts]
+        keys = [self.text_key(t) for t in texts]
         miss_idx = [i for i, k in enumerate(keys) if k not in self._disk_cache]
         if miss_idx:
             new_embs = self.model.encode([texts[i] for i in miss_idx],
@@ -67,7 +67,7 @@ class EmbeddingTracker:
         items = [it for it in items if it[0] not in self.embeddings]
         if not items:
             return
-        embs = self._encode_cached([it[1] for it in items])
+        embs = self.encode_cached([it[1] for it in items])
         for (paper_id, _, author_id, year), emb in zip(items, embs):
             self.embeddings[paper_id] = emb
             self.paper_metadata[paper_id] = {'author_id': author_id, 'year': year}
@@ -78,7 +78,7 @@ class EmbeddingTracker:
         Used as the career reference before the agent's first paper (plan 4.8)."""
         if not direction_texts:
             return
-        embs = self._encode_cached(direction_texts)
+        embs = self.encode_cached(direction_texts)
         self.expertise_centroids[agent_id] = np.mean(embs, axis=0)
 
     def compute_direction_thresholds(self, directions: List) -> Dict[str, float]:
@@ -91,7 +91,7 @@ class EmbeddingTracker:
         texts = [d.topic + " " + " ".join(d.keywords or []) for d in directions]
         if len(texts) < 3:
             return {'near_threshold': 0.33, 'far_threshold': 0.66}
-        embs = self._encode_cached(texts)
+        embs = self.encode_cached(texts)
         normed = embs / (np.linalg.norm(embs, axis=1, keepdims=True) + 1e-10)
         sims = normed @ normed.T
         dists = 1.0 - sims[np.triu_indices(len(texts), k=1)]
@@ -223,7 +223,7 @@ class EmbeddingTracker:
         if not texts:
             return {}
 
-        dir_embeddings = self._encode_cached(texts)
+        dir_embeddings = self.encode_cached(texts)
         centroid_norm = centroid / (np.linalg.norm(centroid) + 1e-10)
         dir_norms = dir_embeddings / (np.linalg.norm(dir_embeddings, axis=1, keepdims=True) + 1e-10)
         similarities = dir_norms @ centroid_norm

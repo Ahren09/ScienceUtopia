@@ -7,20 +7,65 @@ WITHOUT modifying any original files.
 
 import logging
 import time
-from typing import List, Dict, Optional, Set, Union, Tuple
-from pydantic import BaseModel
+from enum import Enum
+from typing import Dict, List, Optional, Set, Tuple, Union
+
 import networkx as nx
 from langchain_core.documents import Document
-from enum import Enum
-from utopia.constants import REVIEW_CRITERIA, IMPORTANT_NOTES, STANDARDIZED_REVIEW_POLICY
+from pydantic import BaseModel
+
 from utopia.agents.conference import Conference
 from utopia.agents.research_direction import ResearchDirection
 from utopia.config import SIMULATION_CONFIG
+from utopia.constants import (
+    COI_NOTE,
+    IMPORTANT_NOTES,
+    REVIEW_CRITERIA,
+    STANDARDIZED_REVIEW_POLICY,
+)
 from utopia.data.paper_tracker import PaperTracker
-from utopia.models.models import BaseLLM
 from utopia.metrics.tracker import top_percentile
-from utopia.constants import COI_NOTE
+from utopia.models.models import BaseLLM
+
 logger = logging.getLogger(__name__)
+
+
+def apply_review_prompt_variant(prompt, variant='original'):
+    """Change wording or distribution instructions while preserving the paper block."""
+    if variant == 'original':
+        return prompt
+    opening = (
+        'You are a peer reviewer for an academic conference. Review the following paper '
+        'based on your expertise and past experiences (e.g. your own past submissions, '
+        'received reviews, your funding situations, your status level).'
+    )
+    variants = {
+        'paraphrase_1': (
+            'Act as a peer reviewer for an academic conference. Evaluate the paper below '
+            'using your expertise and previous experiences, including your submissions, '
+            'reviews you received, funding circumstances, and status.'
+        ),
+        'paraphrase_2': (
+            'Assess the submission below in your role as an academic conference reviewer. '
+            'Draw on your subject expertise and past experience with submitting papers, '
+            'receiving reviews, funding, and status.'
+        ),
+    }
+    if variant in variants:
+        if opening not in prompt:
+            raise ValueError('Expected original review introduction')
+        prompt = prompt.replace(opening, variants[variant], 1)
+        replacement = ('Include the following in your review:' if variant == 'paraphrase_1'
+                       else 'Your review should contain:')
+        return prompt.replace('Provide a comprehensive review with:', replacement, 1)
+    if variant == 'no_distribution':
+        import re
+        prompt = re.sub(r' \(top \d+(?:\.\d+)?%\)', '', prompt)
+        return prompt.replace(
+            '>60% papers receive a score of 2.0-2.5 or lower. Use this to calibrate your scores. ',
+            '', 1,
+        )
+    raise ValueError(f'Unknown review prompt variant: {variant}')
 
 
 class RoundIntention(BaseModel):
@@ -51,7 +96,7 @@ class MultiAgentEcosystem:
         # Initialize without inheriting from AgentManager for Phase 1 simplicity
         self.config = agent_configs
         self.citation_graph = nx.DiGraph()  # NetworkX graph for citations
-        self.simulation_metrics = self._create_metrics_tracker()
+        self.simulation_metrics = self.create_metrics_tracker()
         self.agent_population = {}  # Store all simulation agents
 
     def remove_agent(self, agent_id: str):
@@ -59,7 +104,7 @@ class MultiAgentEcosystem:
         assert self.agent_population[agent_id].is_active, f"Agent {agent_id} is already not active"
         self.agent_population[agent_id].is_active = False
 
-    def _create_metrics_tracker(self):
+    def create_metrics_tracker(self):
         """Initialize metrics tracking system"""
         return {
             'yearly_metrics': {},
@@ -94,8 +139,11 @@ class MultiAgentEcosystem:
         Returns:
             Dictionary with serialized state
         """
-        from utopia.agents.researcher_agents import UniversityResearcher, IndustryResearcher
         from utopia.agents.funding_agents import FundingAgency
+        from utopia.agents.researcher_agents import (
+            IndustryResearcher,
+            UniversityResearcher,
+        )
 
         agents_data = []
         for agent_id, agent in self.agent_population.items():
@@ -182,16 +230,19 @@ class MultiAgentEcosystem:
         Returns:
             Reconstructed MultiAgentEcosystem instance
         """
-        from utopia.agents.researcher_agents import UniversityResearcher, IndustryResearcher
         from utopia.agents.funding_agents import FundingAgency, FundingProgram
         from utopia.agents.research_direction import ResearchDirection
+        from utopia.agents.researcher_agents import (
+            IndustryResearcher,
+            UniversityResearcher,
+        )
 
         # Create new ecosystem
         ecosystem = cls(
             agent_configs=data.get('config', {}),
         )
 
-        ecosystem.simulation_metrics = data.get('simulation_metrics', ecosystem._create_metrics_tracker())
+        ecosystem.simulation_metrics = data.get('simulation_metrics', ecosystem.create_metrics_tracker())
         # Reconstruct agents
         all_agent_data = data.get('agents', [])
 
@@ -384,7 +435,7 @@ class SimulationAgent:
         Returns:
             Tuple of (prompt string, response_format dict) for generating round intention
         """
-        prompt = self._get_personality_prompt(include_exploration_strategy=True, include_funding_situation=True)
+        prompt = self.get_personality_prompt(include_exploration_strategy=True, include_funding_situation=True)
 
         prompt += f"""
 ## Your Research Direction
@@ -440,11 +491,12 @@ Respond in JSON format. An example response is below (DO NOT directly copy the e
                 'schema': RoundIntention.model_json_schema()
             },
         }
-        prompt += self._production_resource_statement(year)
+        prompt += self.production_resource_statement(year)
         return prompt, response_format
     
     def get_review_prompt(self, paper: Dict, author_info: Dict = None,
-                          review_policy: str = 'persona') -> Tuple[str, Dict]:
+                          review_policy: str = 'persona',
+                          prompt_variant: str = 'original') -> Tuple[str, Dict]:
         """Build review prompt for a paper (without calling LLM)
 
         Args:
@@ -460,6 +512,10 @@ Respond in JSON format. An example response is below (DO NOT directly copy the e
             Prompt string for review generation, response format
         """
         assert review_policy in ('persona', 'standardized'), review_policy
+        paper_text = paper.get('full_text', paper['abstract'])
+        paper_label = 'Full paper text' if 'full_text' in paper else 'Abstract'
+        if not isinstance(paper_text, str) or not paper_text.strip():
+            raise ValueError(f"Empty review input for paper {paper.get('id')}")
         expertise = [e.topic if hasattr(e, 'topic') else str(e) for e in getattr(self, 'expertise', [])]
         memory_context = self.get_memory_context() if review_policy == 'persona' else ""
 
@@ -488,8 +544,8 @@ Your Expertise: {', '.join(expertise)}
 
 Title: {paper['title']}
 
-Abstract:
-{paper['abstract']}
+{paper_label}:
+{paper_text}
 
 Paper Topics: {', '.join(paper['topics'])}
 
@@ -517,6 +573,8 @@ Provide a comprehensive review with:
             assert prompt.count(anchor) == 1, "review-prompt anchor not unique"
             prompt = prompt.replace(
                 anchor, f"## Your Review Approach\n{STANDARDIZED_REVIEW_POLICY}\n\n{anchor}")
+        if prompt_variant != 'original':
+            prompt = apply_review_prompt_variant(prompt, prompt_variant)
         response_format = {
             'type': 'json_schema',
             'json_object': {
@@ -644,6 +702,9 @@ Below are the candidate conferences you can resubmit to. For each paper, you MUS
         for conference in conferences:
             prompt += f"""- \"{conference.conference_id}\": primary topics: {', '.join(conference.topics[:3])} | less preferred topics: {', '.join(conference.topics[3:])}
 """
+            if getattr(conference, 'show_attributes', False):
+                prompt += (f"  Acceptance rate: {conference.acceptance_rate:.0%}; "
+                           f"prestige: {conference.prestige:g} (higher is more prestigious).\n")
 
         prompt += """
 ## Your Task
@@ -716,7 +777,7 @@ If you choose not to resubmit, respond with a json file that contains an empty l
         assert set(conferences) <= candidate_conference_ids
         return result
     
-    def _get_bio(self) -> str:
+    def get_bio(self) -> str:
         """Get bio prompt for this agent"""
         expertise = [research_direction.topic for research_direction in self.expertise]
         prompt = f"You are a researcher specializing in {', '.join(expertise)}. \n"
@@ -724,7 +785,7 @@ If you choose not to resubmit, respond with a json file that contains an empty l
 
     # Helper methods (private)
 
-    def _production_resource_statement(self, year):
+    def production_resource_statement(self, year):
         """Only opt-in projects change prompts. Balance is already net of the fee."""
         if getattr(self, 'production_cost_mode', 'per_paper') != 'per_project':
             return ''
@@ -739,20 +800,20 @@ If you choose not to resubmit, respond with a json file that contains an empty l
                 "Do not withhold an additional output because of its production cost. "
                 "Annual research costs remain unchanged.\n")
 
-    def _record_authoring_experience(self, idea: Dict, paper_output: Dict, year: int):
+    def record_authoring_experience(self, idea: Dict, paper_output: Dict, year: int):
         """Record paper authoring experience"""
         self.memory_bank.append({
             'type': 'paper_submission',
             'timestamp': time.time(),
-            'expects_harsh': self._had_recent_negative_experience(),
+            'expects_harsh': self.had_recent_negative_experience(),
             'year': year,
         })
 
-    def _get_personality_prompt(self) -> str:
+    def get_personality_prompt(self) -> str:
         """Get personality prompt for this agent - override in subclasses"""
         raise NotImplementedError("Subclasses must implement this method")
 
-    def _had_recent_negative_experience(self) -> bool:
+    def had_recent_negative_experience(self) -> bool:
         """Check if agent had recent negative review experiences"""
         recent = [e for e in self.review_experiences if time.time() - e['timestamp'] < 86400 * 7]
         return any(e.get('emotional_response') == 'negative' for e in recent)
@@ -780,8 +841,8 @@ If you choose not to resubmit, respond with a json file that contains an empty l
         """
         assert max_submissions >= 1, max_submissions
         use_list = max_submissions > 1 or force_list
-        production_statement = self._production_resource_statement(year)
-        prompt = self._get_personality_prompt(include_exploration_strategy=True, include_funding_situation=True) + f"""
+        production_statement = self.production_resource_statement(year)
+        prompt = self.get_personality_prompt(include_exploration_strategy=True, include_funding_situation=True) + f"""
         
 ## Your Research Direction in This Round
 Detailed Focus: {direction['detailed_focus']}
@@ -843,6 +904,9 @@ Below are the candidate conferences you can submit to. You MUST CHOOSE EXACTLY O
         for conference in conferences:
             prompt += f"""- \"{conference.conference_id}\": primary topics: {', '.join(conference.topics[:3])} | less preferred topics: {', '.join(conference.topics[3:])}
 """
+            if getattr(conference, 'show_attributes', False):
+                prompt += (f"  Acceptance rate: {conference.acceptance_rate:.0%}; "
+                           f"prestige: {conference.prestige:g} (higher is more prestigious).\n")
         # Generate Conference enum dynamically from available conferences
         Conference = Enum('Conference', {cid: cid for cid in candidate_conference_ids}, type=str)
 
@@ -965,7 +1029,7 @@ If you choose not to submit (only due to funding issues), explain using factors 
         Get potential cited papers prompt for this agent
         """
 
-        prompt = self._get_bio() + f"""
+        prompt = self.get_bio() + f"""
 You did a research project and submitted the following paper to a conference. Please give me a list of potential cited papers that you want to cite. NOTE: It is fine if you do not cite any papers due to topic mismatch.
 
 ## Your Research Direction in This Round
@@ -1029,7 +1093,7 @@ Respond in JSON format with the numeric ids (integers) of the candidate papers y
         if not own_papers:
             return None
 
-        prompt = self._get_bio() + f"""
+        prompt = self.get_bio() + f"""
 You submitted a paper to a conference. Please decide if you want to cite any of your own previous work.
 
 ## Your Current Paper
@@ -1091,7 +1155,7 @@ Respond in JSON format with the numeric ids (integers) of the candidate papers y
         return prompt, response_format
 
 
-    def _get_exploration_strategy_prompt(self) -> str:
+    def get_exploration_strategy_prompt(self) -> str:
         # Add exploration strategy guidance if applicable
         prompt = ""
         if hasattr(self, 'exploration_strategy') and self.exploration_strategy != 'balanced':

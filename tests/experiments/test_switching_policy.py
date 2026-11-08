@@ -6,20 +6,19 @@ separate worktree. Geometry is supplied explicitly: these tests do not certify
 the driver's embedding coverage or separation in future evolved states.
 """
 
-from utopia.runtime.historical import SWITCH_GATE_SEED_NAMESPACE
-
-from utopia.utils.paths import project_root
-
 import ast
-from copy import deepcopy
 import json
 import math
-from pathlib import Path
 import random
 import sys
 import types
 import unittest
+from copy import deepcopy
+from pathlib import Path
 from unittest.mock import patch
+
+from utopia.runtime.historical import SWITCH_GATE_SEED_NAMESPACE
+from utopia.utils.paths import project_root
 
 sys.dont_write_bytecode = True
 import utopia.agents.switching_policy as policy
@@ -125,7 +124,7 @@ class PolicyTests(unittest.TestCase):
 
     def test_exact_menu_sizes_previous_exclusion_and_canonical_presentation(self):
         for cell in policy.CELLS:
-            with self.subTest(cell=cell), patch.object(policy, "_gate", return_value=(7, 0.1)):
+            with self.subTest(cell=cell), patch.object(policy, "gate", return_value=(7, 0.1)):
                 row = self.decision(cell, canonical_topics53=list(reversed(self.topics)),
                                     distance_map52=dict(reversed(list(self.distances.items()))))
             self.assertTrue(row["requested_switch"])
@@ -148,7 +147,7 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(row["separation_gap"], 0.5)
 
     def test_stay_still_checks_and_logs_both_menus(self):
-        with patch.object(policy, "_gate", return_value=(8, 0.99)):
+        with patch.object(policy, "gate", return_value=(8, 0.99)):
             row = self.decision("LF")
         self.assertFalse(row["requested_switch"])
         self.assertEqual(row["candidate_topics"], [self.previous])
@@ -157,7 +156,7 @@ class PolicyTests(unittest.TestCase):
 
     def test_zero_gap_is_domain_failure_even_when_gate_says_stay(self):
         for u in (0.0, 0.99):
-            with self.subTest(u=u), patch.object(policy, "_gate", return_value=(9, u)):
+            with self.subTest(u=u), patch.object(policy, "gate", return_value=(9, u)):
                 with self.assertRaises(policy.PolicyDomainError) as caught:
                     self.decision(distance_map52=dict.fromkeys(self.eligible, 1.0))
             evidence = caught.exception.diagnostics
@@ -226,7 +225,7 @@ class PolicyTests(unittest.TestCase):
     def test_first_candidate_fallback_respects_both_switch_and_stay(self):
         for u in (0.1, 0.99):
             for cell in policy.CELLS:
-                with patch.object(policy, "_gate", return_value=(10, u)):
+                with patch.object(policy, "gate", return_value=(10, u)):
                     decision = self.decision(cell, distance_map52={
                         key: 2 - value for key, value in self.distances.items()})
                 original = deepcopy(decision)
@@ -243,7 +242,7 @@ class PolicyTests(unittest.TestCase):
                 self.assertEqual(decision, original)
 
     def test_invalid_choice_and_fallback_are_not_repaired(self):
-        with patch.object(policy, "_gate", return_value=(11, 0.1)):
+        with patch.object(policy, "gate", return_value=(11, 0.1)):
             decision = self.decision()
         for topic, kind in ((self.previous, None), ("invented", "parse"),
                             (None, None), (decision["candidate_topics"][1], "parse"),
@@ -251,7 +250,7 @@ class PolicyTests(unittest.TestCase):
                             (decision["candidate_topics"][0], True)):
             with self.subTest(topic=topic, kind=kind), self.assertRaises(policy.PolicyInputError):
                 policy.finalize_choice(decision, topic, kind)
-        with patch.object(policy, "_gate", return_value=(12, 0.99)):
+        with patch.object(policy, "gate", return_value=(12, 0.99)):
             stay = self.decision()
         with self.assertRaises(policy.PolicyInputError):
             policy.finalize_choice(stay, stay["near_topics"][0])

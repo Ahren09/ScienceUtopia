@@ -25,7 +25,6 @@ blocked_within_institution_randomization().
 Run:  python -m utopia.analysis.factorial_resource_size_analysis
 """
 
-from utopia.utils.data_utils import write_json as write_json_file
 import json
 import os
 
@@ -35,6 +34,7 @@ import pandas as pd
 from utopia.agents.research_direction import DIRECTIONS_DICT
 from utopia.analysis.statistics import benjamini_hochberg, hierarchical_bootstrap
 from utopia.metrics.tracker import calculate_gini_coefficient
+from utopia.utils.data_utils import write_json as write_json_file
 
 EXP_ID = "initial_resource_x_institution_size_qwen3_32b_i24_n112_y8_seed8301"
 DOCS_DIR = os.path.join("outputs", "docs", EXP_ID)
@@ -49,7 +49,7 @@ COMPLETE_FOLLOWUP_MAX_PUBYEAR = NUM_YEARS - CITATION_WINDOW_AGE   # <=6 -> full 
 
 
 # ---------------------------------------------------------------- data loading
-def _topic_years(topic):
+def topic_years(topic):
     d = DIRECTIONS_DICT.get(topic)
     return d.years if d is not None else np.nan
 
@@ -133,19 +133,19 @@ def load_data(docs_dir=DOCS_DIR):
                                         "size_tier": "tier"})
     key = manifest[["agent_id", "institution", "tier", "treatment", "initial_resources"]]
 
-    def _read_parquet(name):
+    def read_parquet(name):
         p = os.path.join(docs_dir, name)
         return pd.read_parquet(p) if os.path.exists(p) else pd.DataFrame()
 
-    agent_year = _read_parquet("agent_year.parquet")
+    agent_year = read_parquet("agent_year.parquet")
     if agent_year.empty or "funding" not in agent_year.columns:
         agent_year = reconstruct_agent_year(docs_dir)
         if not agent_year.empty:
             agent_year.to_parquet(os.path.join(docs_dir, "agent_year_reconstructed.parquet"),
                                   index=False)
-    paper = _read_parquet("paper.parquet")
-    paper_age = _read_parquet("paper_age.parquet")
-    ecosystem_year = _read_parquet("ecosystem_year.parquet")
+    paper = read_parquet("paper.parquet")
+    paper_age = read_parquet("paper_age.parquet")
+    ecosystem_year = read_parquet("ecosystem_year.parquet")
 
     decisions_path = os.path.join(docs_dir, "project_decisions.jsonl")
     decisions = pd.DataFrame()
@@ -208,7 +208,7 @@ def blocked_within_institution_randomization(df, value_col, n_perm=10000, seed=S
                        "vals": g[value_col].values.astype(float),
                        "n_high": int(treat.sum())})
 
-    def _statistic(assign_high_masks):
+    def statistic(assign_high_masks):
         per_inst, sizes = [], []
         tier_lists = {t: [] for t in (tiers or [])}
         for blk, mask in zip(blocks, assign_high_masks):
@@ -230,7 +230,7 @@ def blocked_within_institution_randomization(df, value_col, n_perm=10000, seed=S
     for blk in blocks:
         sub = df[df[inst_col] == blk["inst"]].dropna(subset=[value_col])
         real_masks.append(sub[treat_col].values == "HIGH")
-    observed = _statistic(real_masks)
+    observed = statistic(real_masks)
 
     null = np.empty(n_perm)
     for b in range(n_perm):
@@ -240,13 +240,13 @@ def blocked_within_institution_randomization(df, value_col, n_perm=10000, seed=S
             m = np.zeros(n, dtype=bool)
             m[rng.choice(n, size=blk["n_high"], replace=False)] = True
             perm_masks.append(m)
-        null[b] = _statistic(perm_masks)
+        null[b] = statistic(perm_masks)
     p = float((np.abs(null - np.mean(null)) >= abs(observed - np.mean(null))).mean())
     return {"observed": observed, "p_perm": p, "n_perm": n_perm,
             "n_blocks": len(blocks), "null_mean": float(np.mean(null))}
 
 
-def _institution_bootstrap_ci(per_inst, seed=SEED):
+def institution_bootstrap_ci(per_inst, seed=SEED):
     """Institution-clustered bootstrap CI for the aggregated contrast, via the
     reused hierarchical_bootstrap (single seed = institution resampling)."""
     if per_inst.empty:
@@ -266,7 +266,7 @@ def _institution_bootstrap_ci(per_inst, seed=SEED):
 def contrast_result(df, value_col, name, n_perm=10000):
     """Full within-institution HIGH-LOW result for one researcher-level endpoint."""
     per_inst = within_institution_contrasts(df, value_col)
-    ci = _institution_bootstrap_ci(per_inst)
+    ci = institution_bootstrap_ci(per_inst)
     rand = blocked_within_institution_randomization(df, value_col, n_perm=n_perm)
     return {"endpoint": name, **ci, "observed": rand["observed"],
             "p_perm": rand["p_perm"], "n_blocks": rand["n_blocks"],
@@ -294,7 +294,7 @@ def first_decision_frame(data):
     else:
         ay = data["agent_year"]
         y1 = ay[ay["year"] == 1].copy()
-        y1["first_duration"] = y1["direction_topic"].map(_topic_years).astype(float)
+        y1["first_duration"] = y1["direction_topic"].map(topic_years).astype(float)
         y1["chose_longest"] = np.nan
         out = y1[["agent_id", "first_duration", "chose_longest"]]
     return out.merge(key, on="agent_id", how="left")

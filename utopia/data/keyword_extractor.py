@@ -1,11 +1,11 @@
 """Extract keywords from paper abstracts using LLM"""
 
-from utopia.utils.data_utils import write_json as write_json_file
-
-from utopia.utils.data_utils import write_json_atomic
 import json
 import os
-from typing import List, Dict, Optional
+from typing import Dict, List, Optional
+
+from utopia.utils.data_utils import write_json as write_json_file
+from utopia.utils.data_utils import write_json_atomic
 
 KEYWORD_PROMPT_VERSION = 'v1'
 
@@ -49,7 +49,7 @@ class KeywordExtractor:
                               trailing_newline=False, streaming=True)
             self._cache_dirty = False
 
-    def _build_prompt(self, abstract: str, n_keywords: int) -> str:
+    def build_prompt(self, abstract: str, n_keywords: int) -> str:
         return f"""Extract {n_keywords} technical keywords from the following research abstract.
 Return a JSON object of the form {{"keywords": ["keyword1", "keyword2", ...]}}.
 
@@ -58,7 +58,7 @@ Abstract: {abstract}
 JSON:"""
 
     @staticmethod
-    def _parse_keywords(response, n_keywords: int) -> Optional[List[str]]:
+    def parse_keywords(response, n_keywords: int) -> Optional[List[str]]:
         if isinstance(response, dict) and 'keywords' in response:
             keywords = response['keywords']
         elif isinstance(response, list):
@@ -77,7 +77,7 @@ JSON:"""
         return out[:n_keywords] if out else None
 
     @staticmethod
-    def _fallback_keywords(abstract: str, n_keywords: int) -> List[str]:
+    def fallback_keywords(abstract: str, n_keywords: int) -> List[str]:
         words = abstract.lower().split()
         seen, out = set(), []
         for w in words:
@@ -88,7 +88,7 @@ JSON:"""
         return out[:n_keywords]
 
     @staticmethod
-    def _split_in_abstract(keywords: List[str], abstract: str) -> Dict:
+    def split_in_abstract(keywords: List[str], abstract: str) -> Dict:
         abstract_lower = abstract.lower()
         return {
             'keywords_in_abstract': [k for k in keywords if k.lower() in abstract_lower],
@@ -122,7 +122,7 @@ JSON:"""
 
         attempt = 0
         while pending and attempt <= max_retries and hasattr(llm, 'generate_batch'):
-            prompts = [self._build_prompt(abstract, n_keywords) for _, abstract in pending]
+            prompts = [self.build_prompt(abstract, n_keywords) for _, abstract in pending]
             batch_results = llm.generate_batch(
                 prompts, response_format=KEYWORD_RESPONSE_FORMAT, temperature=0.3,
                 desc=f"keywords batch ({len(prompts)} papers, attempt {attempt + 1})",
@@ -130,11 +130,11 @@ JSON:"""
             )
             still_pending = []
             for (paper_id, abstract), (response, _) in zip(pending, batch_results):
-                keywords = self._parse_keywords(response, n_keywords)
+                keywords = self.parse_keywords(response, n_keywords)
                 if keywords is None:
                     still_pending.append((paper_id, abstract))
                     continue
-                entry = {'keywords': keywords, **self._split_in_abstract(keywords, abstract)}
+                entry = {'keywords': keywords, **self.split_in_abstract(keywords, abstract)}
                 self._cache[paper_id] = entry
                 self._cache_dirty = True
                 results[paper_id] = {**entry, 'provenance': 'llm'}
@@ -143,9 +143,9 @@ JSON:"""
 
         # Deterministic fallback for members that failed all retries; flagged, never cached
         for paper_id, abstract in pending:
-            keywords = self._fallback_keywords(abstract, n_keywords)
+            keywords = self.fallback_keywords(abstract, n_keywords)
             results[paper_id] = {'keywords': keywords,
-                                 **self._split_in_abstract(keywords, abstract),
+                                 **self.split_in_abstract(keywords, abstract),
                                  'provenance': 'fallback'}
 
         self.flush_cache()
@@ -230,8 +230,10 @@ def main(argv=None):
 
     import time
     import traceback
+
     from datasets import load_dataset
     from tqdm import trange
+
     from utopia.models.models import GPT
 
     llm = GPT(model_name="gpt-4o")

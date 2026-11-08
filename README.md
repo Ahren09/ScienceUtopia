@@ -90,7 +90,7 @@ python -B -m pytest tests -q \
 
 The three excluded embedding tests require a real embedding model. Other
 optional integration tests retain their explicit environment gates. Review
-replay tests read the existing frozen preregistrations under `outputs/docs`.
+replay unit tests use small synthetic policy fixtures and need no archived outputs.
 Package-boundary tests reject domain imports from generic utilities and plotting
 code outside `utopia.visual`. Ownership regression fixtures capture original
 keyword request hashes, cache bytes, statistical estimates, and figure artists.
@@ -99,14 +99,15 @@ transport, and compare prompts, RNG states, ranking failures, and checkpoints.
 
 ## Historical records
 
-The migration changes source locations and their fingerprints. Frozen plans
-continue to bind their original worktree; a new checkout must never impersonate
-that source identity or resume a historical plan by substituting new hashes.
+Existing result, checkpoint, manifest, and audit files remain intact. Resume by
+stable world, task, request, and candidate IDs, reusing complete records and
+processing missing IDs. Source, configuration, request, and cache hashes are
+historical metadata, never conditions for execution, acceptance, or forced reruns.
+Validate scientific settings, IDs, duplicates, coverage, scores, and full rankings
+directly. Preserve the original seed derivation and checkpoint RNG state.
 
-Existing result, checkpoint, manifest, and audit files are not rewritten.
-`utopia.runtime.historical` contains read-time aliases for old names and source
-paths, plus the original strings used in seed derivation. Historical audit
-validation requires an independently trusted source manifest and checks its
-exact hashes and required source set. Aliases only resolve names.
+`utopia.runtime.historical` resolves old source paths and experiment names.
+Ordinary functions use descriptive names without a leading underscore. Python
+special methods and externally required API names retain their prescribed names.
 
 See `CLAUDE.md` for the repository engineering rules.

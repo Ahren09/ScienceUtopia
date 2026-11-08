@@ -5,12 +5,13 @@ Supports multiple conferences targeting different research topics.
 Each conference has its own submission deadlines, review processes, and acceptance criteria.
 """
 
+import random
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Dict, Optional
-import random
+from typing import Dict, List, Optional
+
 
 class ConferenceStatus(Enum):
     """Status of a conference in the yearly cycle"""
@@ -43,6 +44,9 @@ class Conference:
     topics: List[str]  # All research topics (first 3 are most preferred, sorted by preference)
     category: str = None  # General research category (e.g., "Artificial Intelligence", "Computer Networks")
     acceptance_rate: float = None  # Target acceptance rate (0-1), None = use default from config
+    prestige: Optional[float] = None
+    show_attributes: bool = False
+    use_configured_rate: bool = False
     year: int = 1
     status: ConferenceStatus = ConferenceStatus.ACCEPTING_SUBMISSIONS
 
@@ -75,7 +79,9 @@ class Conference:
             self.conference_id = f"conf_{self.name.lower().replace(' ', '_')}_{int(time.time() * 1000) % 10000}"
 
         # Use default acceptance rate if not specified
-        if self.acceptance_rate is None or SIMULATION_CONFIG['conference']['use_default_acceptance_rate']:
+        if self.acceptance_rate is None or (
+                SIMULATION_CONFIG['conference']['use_default_acceptance_rate']
+                and not self.use_configured_rate):
             self.acceptance_rate = SIMULATION_CONFIG['conference']['acceptance_rate']
 
     def is_topic_match(self, paper_topics: List[str]) -> bool:
@@ -167,7 +173,7 @@ class Conference:
                 raise ValueError(f"Paper {paper_id} has no reviews")
             else:
                 # Calculate weighted average score
-                avg_score = self._calculate_paper_score(paper_reviews)
+                avg_score = self.calculate_paper_score(paper_reviews)
 
             paper["reviews"] = paper_reviews
 
@@ -250,7 +256,7 @@ class Conference:
 
         self.submitted_papers.clear()
 
-    def _calculate_paper_score(self, reviews: List[Dict]) -> float:
+    def calculate_paper_score(self, reviews: List[Dict]) -> float:
         """Calculate aggregate score for a paper from its reviews
 
         Args:
@@ -317,6 +323,9 @@ class Conference:
             'topics': self.topics,
             'category': self.category,
             'acceptance_rate': self.acceptance_rate,
+            'prestige': self.prestige,
+            'show_attributes': self.show_attributes,
+            'use_configured_rate': self.use_configured_rate,
             'year': self.year,
             'decisions': self.decisions,
             'authors_to_accepted_papers': self.authors_to_accepted_papers,
@@ -335,6 +344,9 @@ class Conference:
             topics=data['topics'],
             category=data.get('category'),
             acceptance_rate=data.get('acceptance_rate'),
+            prestige=data.get('prestige'),
+            show_attributes=data.get('show_attributes', False),
+            use_configured_rate=data.get('use_configured_rate', False),
             year=data.get('year', 0)
         )
         # Restore status
@@ -347,6 +359,29 @@ class Conference:
         conf.reviews = defaultdict(list, data.get('reviews', {}))
         conf.fixed_slots = data.get('fixed_slots')
         return conf
+
+
+def make_venue_variants(conferences, regime, seed=42):
+    """Three topic-matched venues per category, with identical IDs across conditions."""
+    if regime == 'baseline':
+        return conferences
+    if regime not in ('uniform', 'heterogeneous_hidden', 'heterogeneous_visible'):
+        raise ValueError(f'Unknown venue regime: {regime}')
+    identifiers = list(range(1, 3 * len(conferences) + 1))
+    random.Random(seed).shuffle(identifiers)
+    result = []
+    for index, base in enumerate(conferences):
+        for tier, (rate, prestige) in enumerate(zip((0.15, 0.30, 0.45), (3, 2, 1))):
+            number = identifiers[3 * index + tier]
+            result.append(Conference(
+                conference_id=f'VENUE_{number:02d}', name=f'Venue {number:02d}',
+                topics=list(base.topics), category=base.category,
+                acceptance_rate=0.30 if regime == 'uniform' else rate,
+                prestige=2 if regime == 'uniform' else prestige,
+                show_attributes=regime == 'heterogeneous_visible',
+                use_configured_rate=True,
+            ))
+    return result
 
 
 class ConferenceSystem:

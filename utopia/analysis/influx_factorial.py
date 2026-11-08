@@ -33,12 +33,12 @@ Run (after the four cells complete):
     python -m utopia.analysis.influx_factorial
 """
 
-from utopia.utils.data_utils import write_json as write_json_file
 import argparse
 import json
 from pathlib import Path
 
 from utopia.analysis.resubmission_stats import compute_stats
+from utopia.utils.data_utils import write_json as write_json_file
 
 DEFAULT_CELLS = {
     'A': 'outputs/influx2x2_A_noinflux_noresub_seed42',
@@ -57,7 +57,7 @@ CELL_LABELS = {
 }
 
 
-def _year(stats: dict, field: str, year: int):
+def record_year(stats: dict, field: str, year: int):
     """Per-year dicts round-trip through JSON with string keys; accept both."""
     d = stats[field]
     return d.get(year, d.get(str(year)))
@@ -67,17 +67,17 @@ def cell_endpoints(stats: dict, num_years: int) -> dict:
     subs = stats['submissions_per_year']
     cumulative = sum(subs.get(y, subs.get(str(y), 0)) for y in range(1, num_years + 1))
     return {
-        'submissions_y1': _year(stats, 'submissions_per_year', 1),
-        'submissions_yT': _year(stats, 'submissions_per_year', num_years),
+        'submissions_y1': record_year(stats, 'submissions_per_year', 1),
+        'submissions_yT': record_year(stats, 'submissions_per_year', num_years),
         'submissions_cumulative': cumulative,
-        'reviews_per_active_reviewer_yT': _year(
+        'reviews_per_active_reviewer_yT': record_year(
             stats, 'reviews_per_active_reviewer_by_year', num_years),
-        'reviews_per_pool_member_yT': _year(
+        'reviews_per_pool_member_yT': record_year(
             stats, 'reviews_per_pool_member_by_year', num_years),
-        'recycling_multiplier_yT': _year(stats, 'recycling_multiplier_by_year', num_years),
-        'active_researchers_y1': _year(stats, 'active_researchers_by_year', 1),
-        'active_researchers_yT': _year(stats, 'active_researchers_by_year', num_years),
-        'population_yT': _year(stats, 'population_by_year', num_years),
+        'recycling_multiplier_yT': record_year(stats, 'recycling_multiplier_by_year', num_years),
+        'active_researchers_y1': record_year(stats, 'active_researchers_by_year', 1),
+        'active_researchers_yT': record_year(stats, 'active_researchers_by_year', num_years),
+        'population_yT': record_year(stats, 'population_by_year', num_years),
         'cascade_depth_mean': stats['cascade_depth_mean'],
         'recycle_rate_pct': stats['recycle_rate_pct'],
     }

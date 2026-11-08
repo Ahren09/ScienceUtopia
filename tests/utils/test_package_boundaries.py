@@ -6,8 +6,20 @@ import sys
 
 from utopia.utils.paths import project_root
 
-
 ROOT = project_root()
+
+
+def test_ordinary_functions_have_descriptive_public_names():
+    violations = []
+    for directory in ("utopia", "tests"):
+        for path in (ROOT / directory).rglob("*.py"):
+            for node in ast.walk(ast.parse(path.read_text())):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if node.name.startswith("_") and not (
+                        node.name.startswith("__") and node.name.endswith("__")
+                    ):
+                        violations.append((str(path.relative_to(ROOT)), node.lineno, node.name))
+    assert not violations
 
 
 def test_generic_utilities_do_not_import_domain_packages():

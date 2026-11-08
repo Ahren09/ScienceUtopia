@@ -95,22 +95,27 @@ Run:
     python -m utopia.visual.plot_network_bias_forest
 """
 
-import os
-import numpy as np
-from utopia.visual.common import save_figure
-from utopia.analysis.network_review_bias_analysis import STRATA
 import argparse
 import json
+import os
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import numpy as np
 import seaborn as sns
 from matplotlib.colors import to_rgb
 from matplotlib.legend_handler import HandlerTuple
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 
-from utopia.visual.common import MUTED, VIVID_COOL, VIVID_WARM, nature_style
+from utopia.analysis.network_review_bias_analysis import STRATA
+from utopia.visual.common import (
+    MUTED,
+    VIVID_COOL,
+    VIVID_WARM,
+    nature_style,
+    save_figure,
+)
 
 DEFAULT_RESULTS = 'outputs/docs/network_review_bias_final/results.json'
 DEFAULT_OUT_DIR = 'outputs/visual/network_review_bias_final'
@@ -127,7 +132,7 @@ CAPSULE_LW, CAPSULE_TINT, CI_LW = 5.0, 0.3, 1.0
 MARKER_SIZE = {'stratum': 5.2, 'summary': 5.0}  # circle vs. diamond (visually matched)
 
 
-def _tint(color, amount):
+def tint(color, amount):
     """Opaque mix of `color` with white (amount=1 -> color, 0 -> white).
 
     Opaque rather than alpha so the capsule never muddies over the sand band.
@@ -135,7 +140,7 @@ def _tint(color, amount):
     return tuple(1 - amount * (1 - c) for c in to_rgb(color))
 
 
-def _e(d, est_key='estimate'):
+def format_estimate(d, est_key='estimate'):
     """(estimate, ci_lo, ci_hi) straight from a results.json leaf block."""
     return d[est_key], d['ci_lo'], d['ci_hi']
 
@@ -160,22 +165,22 @@ def build_channels(res: dict):
     # parentheses so the mapping to the paper is unambiguous.
     # 中文:y 轴用大白话,括号里保留 d2/d3/far 等技术标注对照。
     channel_a = [
-        ('2-hop', *_e(p['primary_d2_minus_far']), 'stratum'),     # (C-B)@d2 - (C-B)@far | 共享一个合作者,相对陌生人
-        ('3-hop', *_e(s['S1_d3_minus_far']), 'stratum'),              # (C-B)@d3 - (C-B)@far | 隔两步,相对陌生人
+        ('2-hop', *format_estimate(p['primary_d2_minus_far']), 'stratum'),     # (C-B)@d2 - (C-B)@far | 共享一个合作者,相对陌生人
+        ('3-hop', *format_estimate(s['S1_d3_minus_far']), 'stratum'),              # (C-B)@d3 - (C-B)@far | 隔两步,相对陌生人
         (r'$\geq$4-hop',                                                 # far comparator check | 陌生人内部:松散相连 vs 完全无连接
-         *_e(s['S3_far_connected_vs_disconnected']['disconnected']), 'stratum'),
+         *format_estimate(s['S3_far_connected_vs_disconnected']['disconnected']), 'stratum'),
     ]
     channel_b = [
-        ('2-hop', *_e(s4['by_stratum']['d2']), 'stratum'),        # identity effect at d2 | 共享一个合作者(显著)
-        ('3-hop', *_e(s4['by_stratum']['d3']), 'stratum'),            # identity effect at d3 | 隔两步
-        (r'$\geq$4-hop', *_e(s4['by_stratum']['far']), 'stratum'),                # identity effect at far | 陌生人
-        ('All', *_e(s4['pooled']), 'summary'),                        # distance-pooled summary | 各距离平均(菱形)
+        ('2-hop', *format_estimate(s4['by_stratum']['d2']), 'stratum'),        # identity effect at d2 | 共享一个合作者(显著)
+        ('3-hop', *format_estimate(s4['by_stratum']['d3']), 'stratum'),            # identity effect at d3 | 隔两步
+        (r'$\geq$4-hop', *format_estimate(s4['by_stratum']['far']), 'stratum'),                # identity effect at far | 陌生人
+        ('All', *format_estimate(s4['pooled']), 'summary'),                        # distance-pooled summary | 各距离平均(菱形)
     ]
     channel_c = [
-        ('2-hop', *_e(s9['by_stratum']['d2']), 'stratum'),        # total effect at d2 | 共享一个合作者(显著)
-        ('3-hop', *_e(s9['by_stratum']['d3']), 'stratum'),            # total effect at d3 | 隔两步
-        (r'$\geq$4-hop', *_e(s9['by_stratum']['far']), 'stratum'),                # total effect at far | 陌生人
-        ('All', *_e(s9['pooled']), 'summary'),                        # distance-pooled summary | 各距离平均(菱形)
+        ('2-hop', *format_estimate(s9['by_stratum']['d2']), 'stratum'),        # total effect at d2 | 共享一个合作者(显著)
+        ('3-hop', *format_estimate(s9['by_stratum']['d3']), 'stratum'),            # total effect at d3 | 隔两步
+        (r'$\geq$4-hop', *format_estimate(s9['by_stratum']['far']), 'stratum'),                # total effect at far | 陌生人
+        ('All', *format_estimate(s9['pooled']), 'summary'),                        # distance-pooled summary | 各距离平均(菱形)
     ]
     return channel_a, channel_b, channel_c
 
@@ -194,12 +199,12 @@ def robustness_range(res: dict):
     return min(ests), max(ests)
 
 
-def _ci_glyph(color, resolved, kind):
+def ci_glyph(color, resolved, kind):
     """Artist kwargs for one CI row: (capsule, CI line, marker).
 
     Shared by the panels and the legend keys so both always match.
     """
-    capsule = dict(color=_tint(color, CAPSULE_TINT), linewidth=CAPSULE_LW,
+    capsule = dict(color=tint(color, CAPSULE_TINT), linewidth=CAPSULE_LW,
                    solid_capstyle='butt')
     line = dict(color=color, linewidth=CI_LW, solid_capstyle='butt')
     # Filled markers get a white halo so they pop off the capsule. Open markers
@@ -227,7 +232,7 @@ def forest_panel(ax, rows, title, xlabel, n_slots):
     for y, (label, est, lo, hi, kind) in zip(ys, rows):
         resolved = lo > 0 or hi < 0  # CI excludes zero -> a resolved effect
         color = RESOLVED_COLOR if resolved else NULL_COLOR
-        capsule, line, marker = _ci_glyph(color, resolved, kind)
+        capsule, line, marker = ci_glyph(color, resolved, kind)
         ax.plot([lo, hi], [y, y], zorder=2, **capsule)
         ax.plot([lo, hi], [y, y], zorder=3, **line)
         ax.plot(est, y, zorder=4, **marker)
@@ -298,8 +303,8 @@ def main():
     # Legend keys stack the same three layers as the data rows (capsule, CI
     # line, marker) via HandlerTuple.
     handles = [
-        tuple(Line2D([], [], **kw) for kw in _ci_glyph(NULL_COLOR, False, 'stratum')),
-        tuple(Line2D([], [], **kw) for kw in _ci_glyph(RESOLVED_COLOR, True, 'stratum')),
+        tuple(Line2D([], [], **kw) for kw in ci_glyph(NULL_COLOR, False, 'stratum')),
+        tuple(Line2D([], [], **kw) for kw in ci_glyph(RESOLVED_COLOR, True, 'stratum')),
         Patch(facecolor=BAND_FILL, linewidth=0),
     ]
     labels = ['CI crosses zero', 'CI excludes zero (raw)$^{\\dagger}$',
@@ -397,7 +402,9 @@ def make_figures(pairs, papers, sec, primary, stability_agreement, vis_dir):
     # 5: similarity balance
     fig, ax = plt.subplots(figsize=(5, 4))
     sim = pairs[['stratum', 'similarity']].dropna()
-    sim.boxplot(column='similarity', by='stratum', ax=ax)
+    sim.boxplot(column='similarity', by='stratum', ax=ax,
+                color={'boxes': '#1f77b4', 'whiskers': '#1f77b4',
+                       'medians': '#2ca02c', 'caps': 'k'})
     ax.set_title('Expertise-similarity balance across strata'); ax.set_ylabel('cosine sim')
     fig.suptitle('')
     save_figure(fig, os.path.join(vis_dir, 'fig5_similarity_balance.png'), dpi=150)

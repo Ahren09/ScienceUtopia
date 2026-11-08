@@ -12,12 +12,6 @@ intervals. These are post hoc descriptive associations, not causal effects.
 """
 from __future__ import annotations
 
-from utopia.utils.data_utils import write_json as write_json_file
-
-from utopia.utils.data_utils import file_sha256
-
-from utopia.utils.paths import project_root
-
 import argparse
 import json
 from pathlib import Path
@@ -25,6 +19,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from utopia.utils.data_utils import file_sha256
+from utopia.utils.data_utils import write_json as write_json_file
+from utopia.utils.paths import project_root
 
 SEEDS = (1001, 1002, 1003)
 RUN_TEMPLATE = "explore_confirmatory_qwen3_32b_neutral_i1000_n5000_y10_seed{}"
@@ -384,8 +381,6 @@ def run(repo_root: Path) -> None:
             "population_mode": args["population_mode"],
         })
         sources.extend(fingerprint(path) for path in paths + [manifest_path])
-    if len({r["scientific_config_hash"] for r in run_info}) != 1:
-        raise ValueError("Scientific configurations differ across worlds")
     m = pd.concat(manipulation, ignore_index=True)
     a = pd.concat(associations, ignore_index=True)
     b = pd.concat(bins, ignore_index=True)

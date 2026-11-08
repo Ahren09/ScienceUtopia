@@ -2,14 +2,15 @@
 import logging
 import random
 from collections import Counter
-from typing import Dict, Optional, Set, List, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from pydantic import BaseModel
 
 from utopia.config import SIMULATION_CONFIG
 from utopia.models.models import BaseLLM
+
 from .base_agent import SimulationAgent
-from .conference import DIRECTION_TO_ARXIV, ARXIV_CATEGORY_NAMES
+from .conference import ARXIV_CATEGORY_NAMES, DIRECTION_TO_ARXIV
 from .research_direction import ResearchDirection
 
 
@@ -164,16 +165,16 @@ class FundingAgency(SimulationAgent):
         SIMULATION_CONFIG['funding']['default_funding_rate']
         self.conflict_of_interest = set()
         self.funding_programs: Dict[str, FundingProgram] = {}
-        self._initialize_funding_programs(agency_name)
+        self.initialize_funding_programs(agency_name)
 
     def get_type(self) -> str:
         return "funding_agency"
 
-    def _get_personality_prompt(self) -> str:
+    def get_personality_prompt(self) -> str:
         return """You are a funding agency representative who evaluates research from a strategic funding perspective,
                considering long-term impact, resource allocation efficiency, and alignment with funding priorities."""
 
-    def _apply_agent_review_biases(self, review: Dict) -> Dict:
+    def apply_agent_review_biases(self, review: Dict) -> Dict:
         """Apply funding agency-specific biases to reviews"""
         if any(term in str(review.get('strengths', [])).lower() for term in ['impact', 'strategic', 'significant']):
             review['overall_score'] = min(10, review.get('overall_score', 5) + 0.3)
@@ -183,7 +184,7 @@ class FundingAgency(SimulationAgent):
 
         return review
 
-    def _initialize_funding_programs(self, agency_name: str):
+    def initialize_funding_programs(self, agency_name: str):
         """Initialize funding programs based on agency type"""
         from .research_direction import DIRECTIONS_DICT
 
@@ -330,6 +331,7 @@ class FundingAgency(SimulationAgent):
         for program_id, apps in program_to_applications.items():
             if panel_max_apps and len(apps) > panel_max_apps:
                 import math as _math
+
                 from utopia.utils.seeding import derive_seed
                 rng = random.Random(derive_seed(panel_seed if panel_seed is not None else 0,
                                                 'funding_panels', program_id))
@@ -351,7 +353,7 @@ class FundingAgency(SimulationAgent):
             logger.info(f"Preparing funding eval prompt(s) for {program_id} ({len(panels)} panel(s))")
             for panel_index, apps in enumerate(panels):
                 batch_prompts.append(
-                    self._build_program_prompt(program, apps, submitted_papers_dict))
+                    self.build_program_prompt(program, apps, submitted_papers_dict))
                 metadata_list.append({'program_id': program_id, 'apps': apps,
                                       'panel_index': panel_index})
 
@@ -367,7 +369,40 @@ class FundingAgency(SimulationAgent):
         return batch_prompts, response_format, metadata_list
 
     @staticmethod
-    def _build_program_prompt(program: 'FundingProgram', apps: List[Dict],
+    def mapped_evaluation_format(apps):
+        """Constrain each emitted application/applicant pair to the input panel."""
+        items = []
+        for index, app in enumerate(apps):
+            items.append({
+                'type': 'object',
+                'properties': {
+                    'application_id': {'const': index},
+                    'applicant_id': {'const': app['applicant_id']},
+                    'rank': {'type': 'integer', 'minimum': 1, 'maximum': len(apps)},
+                    'reason': {'type': 'string'},
+                },
+                'required': ['application_id', 'applicant_id', 'rank', 'reason'],
+                'additionalProperties': False,
+            })
+        return {
+            'type': 'json_schema',
+            'json_object': {
+                'name': 'FundingEvaluationResponse',
+                'strict': True,
+                'schema': {
+                    'type': 'object',
+                    'properties': {'ranked_applications': {
+                        'type': 'array', 'items': {'anyOf': items},
+                        'minItems': len(apps), 'maxItems': len(apps),
+                    }},
+                    'required': ['ranked_applications'],
+                    'additionalProperties': False,
+                },
+            },
+        }
+
+    @staticmethod
+    def build_program_prompt(program: 'FundingProgram', apps: List[Dict],
                               submitted_papers_dict: Dict[str, Dict]) -> str:
         """Build one ranking prompt for a program (or one panel of it)."""
         applications_text = ""

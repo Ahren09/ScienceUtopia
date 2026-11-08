@@ -5,8 +5,6 @@ tests/experiments/test_exploration.py). Run:
     python -m pytest tests/experiments/test_review_replay.py -v
 """
 
-from utopia.analysis import statistics
-
 import json
 import os
 import sys
@@ -15,17 +13,247 @@ import numpy as np
 import pandas as pd
 import pytest
 
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-os.chdir(ROOT)
-
 import utopia.experiments.review_replay as rr
 from utopia.analysis import review_regime_analysis as ra
+from utopia.analysis import statistics
 from utopia.utils.seeding import derive_seed
 
-PREREG = rr.load_prereg()
+# Synthetic policy fixtures keep unit tests independent of archived run outputs.
+PREREG = {
+    'prompt_construction': {
+        'policy_text_A': 'Evaluate the paper consistently and impartially.',
+        'policy_texts_B': {'rigor': 'Focus on rigor.', 'novelty': 'Focus on novelty.',
+                           'clarity': 'Focus on clarity.'},
+    },
+    'prestige_intervention': {
+        'author_identifier_both_arms': 'Researcher A',
+        'institution_high': 'Institution High', 'institution_low': 'Institution Low',
+        'relationship_both_arms': 'No known relationship.',
+    },
+}
 PAPER = {'title': 'A Study of Widgets', 'abstract': 'We study widgets thoroughly.',
          'topics': ['widgets', 'machine learning']}
 EXPERTISE = ['graph mining', 'optimization']
+
+
+def test_external_replay_queues_pending_ids_and_saves_out_of_order(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import utopia.models.models as models
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(rr, 'ACTIVE_STUDY', 'historical_direction')
+    corpus = tmp_path / 'corpus'
+    corpus.mkdir()
+    tasks = pd.DataFrame([
+        {'task_uid': f'u{i}', 'author_id': str(i), 'condition': 'history', 'prompt': f'p{i}'}
+        for i in range(4)])
+    tasks.to_parquet(corpus / 'replay_tasks_main.parquet', index=False)
+    cfg = {
+        'model': 'fixture', 'n_tasks': 4, 'response_kind': 'prediction',
+        'response_format': {'json_object': {'schema': {
+            'type': 'object', 'properties': {'topic': {'type': 'string'}},
+            'required': ['topic']}}},
+    }
+    (corpus / 'corpus_manifest.json').write_text(json.dumps(cfg))
+    prereg = tmp_path / 'protocol.json'
+    prereg.write_text('{}')
+    monkeypatch.setattr(rr, 'PREREG_V1', str(prereg))
+    args = SimpleNamespace(corpus_dir=str(corpus), model='fixture', stage='main',
+                           output_name='review_replay_fixture', batch_size=2,
+                           max_tokens=8192, vllm_url='http://fixture/v1')
+    docs = rr.external_output_dir(args)
+    docs.mkdir(parents=True)
+    result_path = docs / 'responses.jsonl'
+    saved = {'task_uid': 'u2', 'success': True, 'response': {'topic': 'old'}, 'model': 'fixture'}
+    result_path.write_text(json.dumps(saved) + '\n')
+    calls = []
+
+    class ReplayModel:
+        def __init__(self, **kwargs):
+            assert kwargs['max_concurrent_requests'] == 2
+            self.call_stats = {}
+
+        def generate_batch(self, prompts, **kwargs):
+            calls.append(kwargs['item_ids'])
+            assert prompts == ['p0', 'p1', 'p3']
+            for index in (2, 0, 1):
+                kwargs['on_result'](index, ({'topic': 'new'}, []), {
+                    'success': True, 'cache_replay': False,
+                    'finish_reason': 'stop', 'max_tokens': 8192})
+                persisted = [json.loads(line) for line in result_path.read_text().splitlines()]
+                assert persisted[-1]['task_uid'] == kwargs['item_ids'][index]
+
+    monkeypatch.setattr(models, 'VLLMServerModel', ReplayModel)
+    rr.generate_external_tasks(args)
+    assert calls == [['u0', 'u1', 'u3']]
+    rows = [json.loads(line) for line in result_path.read_text().splitlines()]
+    assert rows[0] == saved
+    assert [row['task_uid'] for row in rows] == ['u2', 'u3', 'u0', 'u1']
+    assert json.loads((docs / 'completion.json').read_text())['n_valid'] == 4
+    rr.generate_external_tasks(args)
+    assert len(calls) == 1
+
+
+def test_human_review_tasks_keep_gold_and_identity_hidden():
+    source = {
+        'paper_data': {'title': 'Target Paper', 'abstract': 'Target abstract.',
+                       'evaluation_format': 'GOLD_DERIVED_FIELD'},
+        'review_data': [{'rating': '8: accept', 'weaknesses': 'SECRET_GOLD'}],
+        'reviewer_data': {
+            str(i): {
+                'domain': ['optimization'], 'name': 'SECRET_NAME',
+                'reviewer_match_similarity': i,
+                'publications': [
+                    {'title': 'Target Paper', 'abstract': 'SELF_PAPER_LEAK'},
+                    {'title': 'Earlier work', 'abstract': 'Earlier abstract.'},
+                ],
+            } for i in range(4)
+        },
+    }
+    tasks = rr.human_review_tasks({'paper': source})
+    assert len(tasks) == 6 and tasks.task_uid.is_unique
+    assert set(tasks.profile_id) == {'1', '2', '3'}
+    for text in tasks.prompt:
+        for secret in ('GOLD_DERIVED_FIELD', 'SECRET_GOLD', 'SECRET_NAME', 'SELF_PAPER_LEAK'):
+            assert secret not in text
+    for _, pair in tasks.groupby('slot'):
+        history = pair[pair.condition == 'history'].prompt.iloc[0]
+        baseline = pair[pair.condition == 'expertise_only'].prompt.iloc[0]
+        background = history[history.index('## Reviewer Publication Background'):
+                             history.index('## Review Instructions')]
+        assert history.replace(background, '') == baseline
+
+
+def test_paired_spearman_preserves_direction_and_sampling_unit():
+    result = statistics.paired_spearman_ci(
+        [1, 2, 3, 4, 5, 6], [6, 5, 4, 3, 2, 1], [1, 2, 3, 4, 5, 6],
+        n_boot=100, seed=42,
+    )
+    assert result['history']['estimate'] == pytest.approx(1)
+    assert result['expertise_only']['estimate'] == pytest.approx(-1)
+    assert result['history_minus_expertise']['estimate'] == pytest.approx(2)
+    assert result['history']['n_papers'] == 6
+
+
+def test_review_calibration_recovers_known_bin_probabilities():
+    from scipy.special import expit
+
+    scores = np.repeat([1.0, 2.0, 3.0], 10)
+    labels = np.array([1] * 2 + [0] * 8 + [1] * 5 + [0] * 5 + [1] * 8 + [0] * 2)
+    fit = ra.fit_review_calibration(scores, labels)
+    probabilities = expit(fit['intercept'] + fit['slope'] * np.array([1.0, 2.0, 3.0]))
+    assert probabilities == pytest.approx([0.2, 0.5, 0.8], abs=1e-6)
+    reversed_fit = ra.fit_review_calibration(scores, 1 - labels)
+    assert reversed_fit['slope'] == pytest.approx(-fit['slope'], abs=1e-6)
+    with pytest.raises(ValueError, match='both decision classes'):
+        ra.fit_review_calibration(scores, np.zeros(30))
+
+
+def test_external_review_analysis_keeps_test_labels_out_of_calibration(tmp_path):
+    corpus, output = tmp_path / 'corpus', tmp_path / 'output'
+    corpus.mkdir()
+    output.mkdir()
+    calibration_scores = [1.0] * 10 + [2.0] * 10 + [3.0] * 10
+    calibration_labels = [1] * 2 + [0] * 8 + [1] * 5 + [0] * 5 + [1] * 8 + [0] * 2
+    scores = calibration_scores + [1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5]
+    labels = calibration_labels + [0, 0, 0, 1, 0, 1, 1, 1]
+    tasks, responses, gold = [], [], []
+    for i, (score, label) in enumerate(zip(scores, labels)):
+        paper_id = f'paper{i:02d}'
+        gold.append({
+            'id': paper_id, 'split': 'calibration' if i < 30 else 'test',
+            'accepted': label, 'mean_rating': score * 2, 'ratings': [score * 2] * 3,
+            'status': 'Poster' if label else 'Reject', 'primary_area': 'test',
+        })
+        for slot in range(3):
+            uid = f'{paper_id}|{slot}|expertise_only'
+            tasks.append({'task_uid': uid, 'paper_id': paper_id, 'slot': slot,
+                          'condition': 'expertise_only', 'prompt': 'Paper input'})
+            responses.append({'task_uid': uid, 'model': 'fixture', 'success': True,
+                              'response': {'overall_score': score}})
+    pd.DataFrame(tasks).to_parquet(corpus / 'replay_tasks_main.parquet', index=False)
+    (corpus / 'corpus_manifest.json').write_text(json.dumps({
+        'n_tasks': len(tasks), 'n_papers': len(scores), 'profiles_per_paper': 3,
+        'model': 'fixture', 'condition': 'expertise_only',
+    }))
+    (output / 'responses.jsonl').write_text('\n'.join(map(json.dumps, responses)) + '\n')
+    gold_path = corpus / 'evaluation_gold.jsonl'
+    gold_path.write_text('\n'.join(map(json.dumps, gold)) + '\n')
+    first = ra.analyze_review_decisions(corpus, output, n_boot=20)
+    assert first['metrics']['acceptance_auroc']['estimate'] == pytest.approx(15 / 16)
+    assert first['metrics']['quota_accuracy']['estimate'] == pytest.approx(0.75)
+    for row in gold:
+        if row['split'] == 'test':
+            row['accepted'] = 1 - row['accepted']
+    gold_path.write_text('\n'.join(map(json.dumps, gold)) + '\n')
+    second = ra.analyze_review_decisions(corpus, output, n_boot=20)
+    assert second['calibration'] == first['calibration']
+    assert second['metrics']['acceptance_auroc']['estimate'] == pytest.approx(1 / 16)
+    (output / 'responses.jsonl').write_text('\n'.join(map(json.dumps, responses[:-1])) + '\n')
+    with pytest.raises(ValueError, match='prescribed valid review IDs'):
+        ra.analyze_review_decisions(corpus, output, n_boot=20)
+
+
+def test_historical_direction_inputs_exclude_future_and_shuffle_only_history():
+    cohort = [{
+        'author_id': author, 'history_donor_id': donor,
+        'history': [{'year': year, 'title': author + '_history',
+                     'abstract': author + '_abstract', 'topics': ['cs.CV']}
+                    for year in (2017, 2018, 2020)],
+        'target': {'title': 'SECRET_2021_TARGET'},
+    } for author, donor in [('a', 'b'), ('b', 'a')]]
+    tasks, fmt = rr.historical_direction_tasks(cohort)
+    assert len(tasks) == 6 and tasks.task_uid.is_unique
+    assert len(fmt['json_object']['schema']['properties']['topic']['enum']) == 40
+    assert all('SECRET_2021_TARGET' not in prompt for prompt in tasks.prompt)
+    rows = tasks[tasks.author_id == 'a'].set_index('condition')
+    assert 'a_history' in rows.loc['history', 'prompt']
+    assert 'b_history' not in rows.loc['history', 'prompt']
+    assert 'b_history' in rows.loc['shuffled_history', 'prompt']
+    assert 'a_history' not in rows.loc['shuffled_history', 'prompt']
+    assert '_history' not in rows.loc['expertise_only', 'prompt']
+    cohort[0]['history'][0]['year'] = 2021
+    with pytest.raises(ValueError, match='pre-2021'):
+        rr.historical_direction_tasks(cohort)
+
+
+def test_review_wording_variants_keep_the_same_paper_and_scoring_rubric():
+    from utopia.agents.base_agent import SimulationAgent
+    from utopia.constants import REVIEW_CRITERIA
+    agent = SimulationAgent(reputation=5, agent_id='reviewer', llm=None)
+    agent.expertise = ['optimization']
+    original, schema = agent.get_review_prompt(PAPER)
+    paper_block = original.split('## Paper', 1)[1].split('## Review Instructions', 1)[0]
+    for variant in ('paraphrase_1', 'paraphrase_2'):
+        text, actual_schema = agent.get_review_prompt(PAPER, prompt_variant=variant)
+        assert text != original and REVIEW_CRITERIA in text
+        assert text.split('## Paper', 1)[1].split('## Review Instructions', 1)[0] == paper_block
+        assert actual_schema == schema
+    text, actual_schema = agent.get_review_prompt(PAPER, prompt_variant='no_distribution')
+    assert '%' not in text
+    assert '(1-5 scale)' in text and '1-sentence justification' in text
+    assert 'Scores in decimals' in text and actual_schema == schema
+
+
+def test_review_sensitivity_hides_titles_and_shares_rewrites_across_profiles():
+    papers = [{'paper_id': 'paper1', 'title': 'SECRET_TARGET_TITLE',
+               'abstract': 'Original scientific abstract.', 'topics': ['ML'],
+               'profile_ids': ['a', 'b', 'c']}]
+    reviews, probes = rr.review_sensitivity_tasks(
+        papers, {key: ['optimization'] for key in ['a', 'b', 'c']},
+        {'paper1': 'Rewritten scientific abstract.'})
+    assert len(reviews) == 18 and reviews.task_uid.is_unique
+    assert len(probes) == 2 and probes.task_uid.is_unique
+    for _, row in reviews.iterrows():
+        if row.condition.startswith('title_hidden'):
+            assert 'SECRET_TARGET_TITLE' not in row.prompt
+        else:
+            assert 'SECRET_TARGET_TITLE' in row.prompt
+        if row.condition == 'title_hidden_paraphrased':
+            assert 'Rewritten scientific abstract.' in row.prompt
+            assert 'Original scientific abstract.' not in row.prompt
+    assert all('SECRET_TARGET_TITLE' not in prompt for prompt in probes.prompt)
 
 
 # ------------------------------------------------------------- prompt adapter
@@ -360,14 +588,23 @@ def test_cell_table_requires_two_slots_and_uses_raw_scores():
 
 import itertools
 
-NRB_PREREG = json.load(open('outputs/docs/network_review_bias_prereg/prereg_v1.json'))
+NRB_PREREG = {
+    'reviewer_policy_and_memory': {'policy_text': 'Review the paper on its merits.'},
+    'conditions': {
+        'B_identity_only': {'relationship_value': 'Relationship undisclosed.'},
+        'C_relationship': {'d2': 'Two network steps apart.', 'd3': 'Three network steps apart.',
+                           'far_connected': 'At least four steps apart.',
+                           'disconnected': 'No network path.'},
+    },
+    "descriptive_non_blocking": ["Mention rate; frozen keyword list: ['collaborated', 'mutual friend']"],
+}
 
 
 @pytest.fixture
 def nrb_study():
-    rr._activate_study('network_proximity')
+    rr.activate_study('network_proximity')
     yield
-    rr._activate_study('reviewer_monoculture')
+    rr.activate_study('reviewer_monoculture')
 
 
 def test_registry_monoculture_literals_unchanged():
@@ -401,7 +638,7 @@ def test_nrb_path_guard(nrb_study):
 
 # ------------------------------------------------------- graph timing
 
-def _edges():
+def edges():
     return [{'a': 'u', 'b': 'v', 'weight': 1, 'years': [1]},
             {'a': 'v', 'b': 'w', 'weight': 1, 'years': [2, 3]},
             {'a': 'w', 'b': 'x', 'weight': 1, 'years': [3]},
@@ -410,15 +647,15 @@ def _edges():
 
 
 def test_snapshot_excludes_same_year_and_future_edges():
-    G = rr.nrb_graph_snapshot(_edges(), upto_year=2)  # usable for year-3 reviews
+    G = rr.nrb_graph_snapshot(edges(), upto_year=2)  # usable for year-3 reviews
     assert G.has_edge('u', 'v') and G.has_edge('v', 'w') and G.has_edge('p', 'q')
     assert not G.has_edge('w', 'x') and not G.has_edge('x', 'y')
-    G1 = rr.nrb_graph_snapshot(_edges(), upto_year=0)
+    G1 = rr.nrb_graph_snapshot(edges(), upto_year=0)
     assert G1.number_of_edges() == 0
 
 
 def test_distance_and_strata():
-    G = rr.nrb_graph_snapshot(_edges(), upto_year=3)   # u-v-w-x path, p-q apart
+    G = rr.nrb_graph_snapshot(edges(), upto_year=3)   # u-v-w-x path, p-q apart
     assert rr.nrb_distance(G, 'u', 'w')[0] == 2
     assert rr.nrb_distance(G, 'u', 'x')[0] == 3
     assert rr.nrb_distance(G, 'u', 'p') == (None, 'disconnected')
@@ -431,7 +668,7 @@ def test_distance_and_strata():
 
 # ------------------------------------------------------- eligibility
 
-def _agents():
+def sample_agents():
     ag = {}
     for i, (rid, inst) in enumerate([('u', 'i1'), ('v', 'i2'), ('w', 'i3'), ('x', 'i4'),
                                      ('y', 'i5'), ('p', 'i6'), ('q', 'i7'), ('z', 'i8'),
@@ -444,8 +681,8 @@ def _agents():
 
 def test_multiauthor_eligibility_and_focal_distance():
     # chain u-v-w-x-y plus disconnected p-q; z absent from graph
-    G = rr.nrb_graph_snapshot(_edges(), upto_year=4)
-    agents = _agents()
+    G = rr.nrb_graph_snapshot(edges(), upto_year=4)
+    agents = sample_agents()
     agents['c2']['coi'] = {'u'}          # reviewer-side COI with focal author
     paper = {'focal_author_id': 'u', 'author_list': ['u', 'v']}  # v is co-author
     pools, meta = rr.nrb_candidates_for_paper(G, paper, agents, 
@@ -467,8 +704,8 @@ def test_multiauthor_eligibility_and_focal_distance():
 
 
 def test_author_side_coi_also_excludes():
-    G = rr.nrb_graph_snapshot(_edges(), upto_year=4)
-    agents = _agents()
+    G = rr.nrb_graph_snapshot(edges(), upto_year=4)
+    agents = sample_agents()
     coi = {r: a['coi'] for r, a in agents.items()}
     coi['u'] = {'x'}                    # author's list names reviewer x
     paper = {'focal_author_id': 'u', 'author_list': ['u']}
@@ -478,7 +715,7 @@ def test_author_side_coi_also_excludes():
 
 # ------------------------------------------------------- matching
 
-def _brute_force_triplet(pools, sims, use_counts, cap, tol):
+def brute_force_triplet(pools, sims, use_counts, cap, tol):
     best = None
     for t in itertools.product(*(sorted(pools[s]) for s in rr.NRB_STRATA)):
         if any(use_counts.get(r, 0) >= cap for r in t):
@@ -503,7 +740,7 @@ def test_best_triplet_matches_brute_force():
         sims = {r: float(rng.uniform(0, 1)) for s in pools for r in pools[s]}
         use = {r: int(rng.integers(0, 3)) for s in pools for r in pools[s]}
         fast = rr.nrb_best_triplet(pools, sims, use, reuse_cap=3, tol=0.25)
-        slow = _brute_force_triplet(pools, sims, use, 3, 0.25)
+        slow = brute_force_triplet(pools, sims, use, 3, 0.25)
         if slow is None:
             assert fast is None
         else:
@@ -542,7 +779,7 @@ def test_matching_excludes_over_tolerance():
 
 # ------------------------------------------------------- prompt adapter
 
-def _nrb_prompts(stratum='d2', far_kind=''):
+def nrb_prompts(stratum='d2', far_kind=''):
     syn = rr.nrb_synthetic_id('institution_0001_researcher_2')
     inst = 'institution_0001'
     policy = NRB_PREREG['reviewer_policy_and_memory']['policy_text']
@@ -558,7 +795,7 @@ def _nrb_prompts(stratum='d2', far_kind=''):
 
 
 def test_nrb_condition_A_has_no_author_block():
-    prompts, syn, inst = _nrb_prompts()
+    prompts, syn, inst = nrb_prompts()
     assert '## Author Information' not in prompts['A']
     assert syn not in prompts['A'] and inst not in prompts['A']
     for sentence in NRB_PREREG['conditions']['C_relationship'].values():
@@ -568,7 +805,7 @@ def test_nrb_condition_A_has_no_author_block():
 def test_nrb_B_and_C_differ_only_in_relationship_field():
     for stratum, far_kind in [('d2', ''), ('d3', ''), ('far', 'connected_ge4'),
                               ('far', 'disconnected')]:
-        prompts, syn, inst = _nrb_prompts(stratum, far_kind)
+        prompts, syn, inst = nrb_prompts(stratum, far_kind)
         b_rel = NRB_PREREG['conditions']['B_identity_only']['relationship_value']
         c_rel = rr.nrb_relationship_value(NRB_PREREG, 'C', stratum, far_kind)
         assert b_rel in prompts['B'] and c_rel in prompts['C']
@@ -612,7 +849,7 @@ def test_nrb_seed_map_deterministic_and_stage_scoped():
 
 # ------------------------------------------------------- analysis pipeline
 
-def _synthetic_reviews(n_papers=80, d2_effect=0.5, seed=0):
+def synthetic_reviews(n_papers=80, d2_effect=0.5, seed=0):
     rng = np.random.default_rng(seed)
     rows = []
     for i in range(n_papers):
@@ -638,7 +875,7 @@ def _synthetic_reviews(n_papers=80, d2_effect=0.5, seed=0):
 
 def test_primary_estimator_recovers_injected_effect():
     from utopia.analysis import network_review_bias_analysis as na
-    rev = _synthetic_reviews(d2_effect=0.5)
+    rev = synthetic_reviews(d2_effect=0.5)
     pairs = na.pair_frame(rev)
     papers = na.paper_frame(pairs)
     assert len(papers) == 80 and papers.paper_effect.notna().all()
@@ -653,7 +890,7 @@ def test_primary_estimator_recovers_injected_effect():
 
 def test_null_effect_gives_null_primary():
     from utopia.analysis import network_review_bias_analysis as na
-    rev = _synthetic_reviews(d2_effect=0.0, seed=3)
+    rev = synthetic_reviews(d2_effect=0.0, seed=3)
     pairs = na.pair_frame(rev)
     papers = na.paper_frame(pairs)
     res = na.compute_primary(pairs, papers, n_boot=400)
@@ -662,7 +899,7 @@ def test_null_effect_gives_null_primary():
 
 def test_incomplete_papers_excluded_from_primary():
     from utopia.analysis import network_review_bias_analysis as na
-    rev = _synthetic_reviews(n_papers=10)
+    rev = synthetic_reviews(n_papers=10)
     rev = rev[~((rev.paper_id == 's:000') & (rev.stratum == 'far') & (rev.condition == 'C'))]
     papers = na.paper_frame(na.pair_frame(rev))
     assert papers[papers.paper_id == 's:000'].paper_effect.isna().all()
@@ -671,7 +908,7 @@ def test_incomplete_papers_excluded_from_primary():
 
 def test_descriptive_mention_rate():
     from utopia.analysis import network_review_bias_analysis as na
-    rev = _synthetic_reviews(n_papers=4)
+    rev = synthetic_reviews(n_papers=4)
     rev.loc[rev.condition == 'C', 'justification'] = 'we have collaborated via a mutual friend'
     out = na.descriptives(rev, NRB_PREREG)
     assert out['C']['mention_rate'] == 1.0
@@ -682,8 +919,9 @@ def test_descriptive_mention_rate():
 
 def test_pa_blind_review_env_switch(monkeypatch):
     import inspect
+
     import utopia.simulation as rs
-    if 'UTOPIA_PA_BLIND_REVIEW' not in inspect.getsource(rs.Simulation._build_author_info_for_review):
+    if 'UTOPIA_PA_BLIND_REVIEW' not in inspect.getsource(rs.Simulation.build_author_info_for_review):
         pytest.skip('blind-review switch not applied (archived+reverted; see '
                     'outputs/docs/network_review_bias_execution/code_snapshots/)')
 
@@ -702,9 +940,9 @@ def test_pa_blind_review_env_switch(monkeypatch):
         experiment_name = 'preferential_attachment'
         collaboration_tracker = DummyTracker()
         ecosystem = DummyEco()
-        _get_lead_author_id = staticmethod(rs.Simulation._get_lead_author_id)
-        _describe_network_relationship = rs.Simulation._describe_network_relationship
-        _build_author_info_for_review = rs.Simulation._build_author_info_for_review
+        get_lead_author_id = staticmethod(rs.Simulation.get_lead_author_id)
+        describe_network_relationship = rs.Simulation.describe_network_relationship
+        build_author_info_for_review = rs.Simulation.build_author_info_for_review
 
     class DummyReviewer:
         id = 'reviewer_7'
@@ -713,13 +951,13 @@ def test_pa_blind_review_env_switch(monkeypatch):
     reviewer = DummyReviewer()
     paper = {'author_id': 'institution_0001_researcher_2'}
     monkeypatch.delenv('UTOPIA_PA_BLIND_REVIEW', raising=False)
-    info = sim._build_author_info_for_review(reviewer, paper)
+    info = sim.build_author_info_for_review(reviewer, paper)
     assert info is not None and info['network_distance'] == 2   # default unchanged
     monkeypatch.setenv('UTOPIA_PA_BLIND_REVIEW', '1')
-    assert sim._build_author_info_for_review(reviewer, paper) is None  # blind source mode
+    assert sim.build_author_info_for_review(reviewer, paper) is None  # blind source mode
     monkeypatch.delenv('UTOPIA_PA_BLIND_REVIEW', raising=False)
     sim.experiment_name = 'exploration_vs_exploitation'
-    assert sim._build_author_info_for_review(reviewer, paper) is None  # other modes untouched
+    assert sim.build_author_info_for_review(reviewer, paper) is None  # other modes untouched
 
 
 # --------------------------- expanding collaboration growth mode (prereg v1.1)
@@ -729,18 +967,18 @@ from types import SimpleNamespace
 import networkx as nx
 
 
-def _channel(run_seed, year, agent_id):
+def review_channel(run_seed, year, agent_id):
     # Frozen contract from prereg_v1_1_source_fix.json
     return ('new_tie'
             if derive_seed(run_seed, 'collab_growth_channel', year, agent_id) % 100 < 70
             else 'repeat_tie')
 
 
-def _ids_with_channel(run_seed, year, channel, n, prefix='ag'):
+def ids_with_channel(run_seed, year, channel, n, prefix='ag'):
     ids, i = [], 0
     while len(ids) < n:
         aid = f'{prefix}{i:03d}'
-        if _channel(run_seed, year, aid) == channel:
+        if review_channel(run_seed, year, aid) == channel:
             ids.append(aid)
         i += 1
     return ids
@@ -775,22 +1013,22 @@ class GrowthSim:
         self.args = SimpleNamespace(seed=seed)
         self._collaboration_pairs = {}
         self.paper_tracker = SimpleNamespace(get_papers_by_author=lambda aid: [])
-        self._agents = {a.id: a for a in agents}
+        self.sample_agents = {a.id: a for a in agents}
         self.agents = agents
-        self.ecosystem = SimpleNamespace(get_agent_by_id=lambda aid: self._agents[aid])
+        self.ecosystem = SimpleNamespace(get_agent_by_id=lambda aid: self.sample_agents[aid])
         self.network_metrics = SimpleNamespace(record_network_snapshot=lambda y, m: None)
         decisions = decisions or {}
         self.llm = SimpleNamespace(generate=lambda prompt, response_format: (
             {'collaborate': True, 'collaborator_id': decisions[prompt]}
             if prompt in decisions else {'collaborate': False, 'collaborator_id': None}, None))
 
-    def _initialize_preferential_attachment_trackers(self):
+    def initialize_preferential_attachment_trackers(self):
         pass
 
     def run_phase(self, year):
         import utopia.simulation as rs
         year_results = {}
-        rs.Simulation._run_phase_1_5_collaboration_formation(
+        rs.Simulation.run_phase_1_5_collaboration_formation(
             self, year, {}, self.agents, year_results)
         return year_results
 
@@ -800,13 +1038,13 @@ class GrowthSim:
         pa_config = SIMULATION_CONFIG['preferential_attachment_experiment']
         agent_topics = {a.id: set(a.expertise) for a in self.agents}
         inst = lambda a: getattr(a, 'university_name', None)  # noqa: E731
-        return rs.Simulation._expanding_candidate_selection(
+        return rs.Simulation.expanding_candidate_selection(
             self, year, self.agents, agent_topics, inst,
             self.collaboration_mode, pa_config)
 
     def form(self, year, collab_decisions, agent_candidates, growth_ctx):
         import utopia.simulation as rs
-        return rs.Simulation._expanding_form_pairs(
+        return rs.Simulation.expanding_form_pairs(
             self, year, collab_decisions, agent_candidates, growth_ctx)
 
 
@@ -820,8 +1058,8 @@ def test_growth_flag_default_is_legacy():
 
 def test_growth_channel_assignment_deterministic_and_split():
     ids = [f'inst_{i:04d}_researcher_{j}' for i in range(100) for j in range(5)]
-    a = [_channel(7100, 3, aid) for aid in ids]
-    b = [_channel(7100, 3, aid) for aid in ids]
+    a = [review_channel(7100, 3, aid) for aid in ids]
+    b = [review_channel(7100, 3, aid) for aid in ids]
     assert a == b
     frac_new = a.count('new_tie') / len(a)
     assert 0.60 <= frac_new <= 0.80, f'~70% expected, got {frac_new:.2f}'
@@ -831,13 +1069,13 @@ def test_growth_channel_assignment_deterministic_and_split():
     sim = GrowthSim(agents, seed=7100)
     _, ctx = sim.select(3)
     for aid, ch in ctx['channels'].items():
-        assert ch == _channel(7100, 3, aid)
+        assert ch == review_channel(7100, 3, aid)
 
 
 def test_new_tie_excludes_d1_coi_self_and_repeat_requires_d1():
     seed, year = 7100, 2
-    p_new = _ids_with_channel(seed, year, 'new_tie', 1, 'pn')[0]
-    p_rep = _ids_with_channel(seed, year, 'repeat_tie', 1, 'pr')[0]
+    p_new = ids_with_channel(seed, year, 'new_tie', 1, 'pn')[0]
+    p_rep = ids_with_channel(seed, year, 'repeat_tie', 1, 'pr')[0]
     partner_new, partner_rep = 'cand_dnew', 'cand_drep'
     open_cand, coi_cand = 'cand_open', 'cand_coi'
     agents = [GrowthAgent(p_new, 'U', ['a', 'b']),
@@ -849,7 +1087,7 @@ def test_new_tie_excludes_d1_coi_self_and_repeat_requires_d1():
     sim = GrowthSim(agents, seed=seed)
     sim.collaboration_tracker.add_collaboration(p_new, partner_new, 1)   # d1 for p_new
     sim.collaboration_tracker.add_collaboration(p_rep, partner_rep, 1)   # d1 for p_rep
-    sim._agents[coi_cand].add_conflict_of_interest(p_new)                # COI (other side)
+    sim.sample_agents[coi_cand].add_conflict_of_interest(p_new)                # COI (other side)
     cands, ctx = sim.select(year)
     assert ctx['channels'][p_new] == 'new_tie' and ctx['channels'][p_rep] == 'repeat_tie'
     new_ids = [c[0] for c in cands[p_new]]
@@ -863,7 +1101,7 @@ def test_new_tie_excludes_d1_coi_self_and_repeat_requires_d1():
 
 def test_new_tie_degree_and_d2_score_components():
     seed, year = 7100, 2
-    prop = _ids_with_channel(seed, year, 'new_tie', 1, 'px')[0]
+    prop = ids_with_channel(seed, year, 'new_tie', 1, 'px')[0]
     hub, leaf1, leaf2, leaf3 = 'cand_hub', 'cand_lf1', 'cand_lf2', 'cand_lf3'
     agents = [GrowthAgent(prop, 'U', ['a', 'b'])] + [
         GrowthAgent(x, 'V', ['a', 'b']) for x in (hub, leaf1, leaf2, leaf3)]
@@ -888,21 +1126,21 @@ def test_new_tie_degree_and_d2_score_components():
     assert ctx2['components'][(prop, leaf1)]['d2_indicator'] == 1.0
 
 
-def _hand_ctx(pre_edges, distances, run_seed=99, channels=None):
+def hand_ctx(pre_edges, distances, run_seed=99, channels=None):
     g = nx.Graph()
     g.add_edges_from(pre_edges)
     return {'pre_graph': g, 'channels': channels or {}, 'distances': distances,
             'components': {}, 'run_seed': run_seed}
 
 
-def _plain_agents(ids):
+def plain_agents(ids):
     return [GrowthAgent(a, 'U', ['a']) for a in ids]
 
 
 def test_realized_events_classified_from_preformation_graph():
     ids = ['n0', 'n1', 'n2', 'n3', 'n4', 'n5', 'n6', 'n7', 'n8', 'n9', 'n10']
-    sim = GrowthSim(_plain_agents(ids))
-    ctx = _hand_ctx(
+    sim = GrowthSim(plain_agents(ids))
+    ctx = hand_ctx(
         pre_edges=[('n0', 'n1'), ('n2', 'n3'), ('n6', 'n7'), ('n8', 'n9'), ('n9', 'n10')],
         distances={'n0': {'n1': 1}, 'n8': {'n9': 1, 'n10': 2}})
     decisions = {
@@ -933,8 +1171,8 @@ def test_realized_events_classified_from_preformation_graph():
 
 
 def test_one_sided_rejected_and_unmatched_logged():
-    sim = GrowthSim(_plain_agents(['p', 'q', 'r', 'z1', 'z2']))
-    ctx = _hand_ctx(pre_edges=[], distances={})
+    sim = GrowthSim(plain_agents(['p', 'q', 'r', 'z1', 'z2']))
+    ctx = hand_ctx(pre_edges=[], distances={})
     decisions = {'p': (True, 'q'), 'q': (True, 'r')}
     agent_candidates = {'z1': [('z2', 0.5, {})], 'p': [('q', 0.5, {})],
                         'q': [('r', 0.5, {})]}
@@ -952,8 +1190,8 @@ def test_one_sided_rejected_and_unmatched_logged():
 def test_growth_logs_reproducible_same_seed():
     def build_and_run():
         ids = [f'm{i}' for i in range(8)]
-        sim = GrowthSim(_plain_agents(ids), seed=7100)
-        ctx = _hand_ctx(pre_edges=[('m0', 'm1')], distances={'m0': {'m1': 1}},
+        sim = GrowthSim(plain_agents(ids), seed=7100)
+        ctx = hand_ctx(pre_edges=[('m0', 'm1')], distances={'m0': {'m1': 1}},
                         run_seed=7100)
         decisions = {'m0': (True, 'm1'), 'm2': (True, 'm3'), 'm3': (True, 'm2'),
                      'm4': (True, 'm3'), 'm5': (True, 'm6'), 'm6': (True, 'm7')}
@@ -985,12 +1223,12 @@ def test_legacy_end_to_end_regression():
     for k in ('growth_mode', 'realized', 'growth_log', 'channel_assigned'):
         assert k not in yr1['collaboration_formation']
     # COI updated exactly as before
-    assert sim._agents['A1'].conflict_of_interest == {'A2'}
+    assert sim.sample_agents['A1'].conflict_of_interest == {'A2'}
 
 
 def test_legacy_ranks_existing_partner_first_expanding_excludes_them():
     seed, year = 7100, 2
-    prop = _ids_with_channel(seed, year, 'new_tie', 1, 'pz')[0]
+    prop = ids_with_channel(seed, year, 'new_tie', 1, 'pz')[0]
 
     def mk(growth):
         agents = [GrowthAgent(prop, 'U', ['a', 'b']),
@@ -1003,10 +1241,10 @@ def test_legacy_ranks_existing_partner_first_expanding_excludes_them():
 
     # Legacy: the d1 partner outranks an identical fresh candidate (lock-in)
     sim_legacy = mk('legacy')
-    from utopia.config import SIMULATION_CONFIG
     import utopia.simulation as rs
+    from utopia.config import SIMULATION_CONFIG
     yr = {}
-    rs.Simulation._run_phase_1_5_collaboration_formation(
+    rs.Simulation.run_phase_1_5_collaboration_formation(
         sim_legacy, year, {}, sim_legacy.agents, yr)
     assert sim_legacy.collaboration_tracker.graph[prop]['partner']['weight'] == 2
 

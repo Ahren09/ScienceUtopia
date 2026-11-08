@@ -4,12 +4,13 @@ Specialized Agent Types for Multi-Agent Scientific Ecosystem
 EXTENDS base agent classes WITHOUT modifying existing AI-Scientist code
 """
 
-from typing import List, Dict, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from pydantic import BaseModel
 
 from utopia.config import SIMULATION_CONFIG
 from utopia.models.models import BaseLLM
+
 from .base_agent import SimulationAgent
 from .funding_agents import FundingProgram
 from .research_direction import ResearchDirection
@@ -77,13 +78,13 @@ class UniversityResearcher(SimulationAgent):
     def get_type(self) -> str:
         return "university"
 
-    def _get_personality_prompt(self, include_exploration_strategy: bool = False, include_funding_situation: bool = False) -> str:
+    def get_personality_prompt(self, include_exploration_strategy: bool = False, include_funding_situation: bool = False) -> str:
         prompt = f"""You are a university researcher at {self.university_name}.
 You author papers and review them for conferences.
 Compared with industry researchers, you focus more on theoretical contributions, novel methodologies, and advancing fundamental knowledge.
 """
         if include_exploration_strategy:
-            prompt += self._get_exploration_strategy_prompt()
+            prompt += self.get_exploration_strategy_prompt()
 
         if include_funding_situation:
             prompt += f"""
@@ -95,7 +96,7 @@ Your current funding level is {self.resources}.
 
 
 
-    def _apply_agent_review_biases(self, review: Dict) -> Dict:
+    def apply_agent_review_biases(self, review: Dict) -> Dict:
         """Apply university-specific biases to reviews"""
         # Universities tend to value theoretical rigor and reproducibility
         strengths_text = ' '.join(review.get('strengths', []))
@@ -322,13 +323,13 @@ class IndustryResearcher(SimulationAgent):
     def get_type(self) -> str:
         return "industry"
 
-    def _get_personality_prompt(self, include_exploration_strategy: bool = False, include_funding_situation: bool = False) -> str:
+    def get_personality_prompt(self, include_exploration_strategy: bool = False, include_funding_situation: bool = False) -> str:
         prompt = f"""You are an industry researcher at {self.company_name}.
 You author papers and review them for conferences.
 Compared with university researchers, you focus more on practical applications, scalable solutions, and commercially viable innovations.
 """
         if include_exploration_strategy:
-            prompt += self._get_exploration_strategy_prompt()
+            prompt += self.get_exploration_strategy_prompt()
 
         if include_funding_situation:
             prompt += f"""
@@ -336,7 +337,7 @@ Your current funding level is {self.resources}.
 """
         return prompt
 
-    def _apply_agent_review_biases(self, review: Dict) -> Dict:
+    def apply_agent_review_biases(self, review: Dict) -> Dict:
         """Apply industry-specific biases to reviews"""
         # Industry agents prefer practical applications and scalability
         strengths_text = ' '.join(review.get('strengths', []))
@@ -432,13 +433,13 @@ class FreelancerAgent(SimulationAgent):
         # Store inherent expertise (3 research directions)
         self.expertise_directions = expertise_directions or []
 
-    def _get_personality_prompt(self) -> str:
+    def get_personality_prompt(self) -> str:
         return """You are an independent researcher who challenges conventional wisdom
                and pursues unconventional approaches. You value radical innovation,
                interdisciplinary thinking, and paradigm-shifting discoveries. When reviewing,
                you appreciate bold ideas and are willing to champion unconventional work."""
 
-    def _apply_agent_review_biases(self, review: Dict) -> Dict:
+    def apply_agent_review_biases(self, review: Dict) -> Dict:
         """Apply freelancer-specific biases to reviews"""
         # Freelancers appreciate novelty and unconventional approaches
         if any(term in str(review.get('strengths', [])).lower()

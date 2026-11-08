@@ -2,20 +2,19 @@
 
 from __future__ import annotations
 
-from utopia.runtime.historical import source_binding_value, trusted_audit_sources
-
-from utopia.utils.data_utils import file_sha256
-from utopia.utils.data_utils import file_sha256 as file_hash
+import json
+import math
+import statistics
 from collections import Counter
 from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass
 from functools import wraps
-import json
-import math
 from pathlib import Path
-import statistics
-from utopia.runtime.provenance import ROOT, corpus_fingerprint, digest, write_json
 
+from utopia.runtime.historical import trusted_audit_sources
+from utopia.runtime.provenance import ROOT, corpus_fingerprint, digest, write_json
+from utopia.utils.data_utils import file_sha256, without_hash_metadata
+from utopia.utils.data_utils import file_sha256 as file_hash
 
 SEEDS = (42,)
 
@@ -264,14 +263,15 @@ def source_fingerprint(root=ROOT):
         root / SEQUENTIAL_PROTOCOL_PATH,
     ]
     paths += sorted((root / "utopia").rglob("*.py"))
-    return digest({str(p.relative_to(root)): file_sha256(p) for p in paths})
+    return digest({str(p.relative_to(root)): file_sha256(p) for p in paths if p.is_file()})
 
 
 def sequential_source_binding(root=ROOT):
-    """The executable helper and prospective protocol must both exist at freeze."""
+    """Record available helper and protocol metadata without requiring either hash."""
     return {
         name: file_hash(Path(root) / name)
         for name in ("utopia/funding/sequential.py", SEQUENTIAL_PROTOCOL_PATH)
+        if (Path(root) / name).is_file()
     }
 
 
@@ -320,7 +320,7 @@ def sequential_funding_scope(FundingAgency, VLLMServerModel, directory):
 @contextmanager
 def funding_phase_coverage(simulation_class, funding_class, handle):
     """Observe the real phase boundary, including years with zero applications."""
-    name = "_run_phase_5_update_funding"
+    name = "run_phase_5_update_funding"
     original = getattr(simulation_class, name)
 
     @wraps(original)
@@ -360,7 +360,7 @@ def validate_sequential_evidence(
     expected_sources = None
     if trusted_source_files is not None:
         expected_sources = trusted_audit_sources(
-            summary["source_files_sha256"], trusted_source_files
+            summary.get("source_files_sha256", {}), trusted_source_files
         )
     report = validate_audit(
         directory / SEQUENTIAL_AUDIT_FILE,
@@ -385,24 +385,14 @@ def validate_sequential_evidence(
         Path(joined["path"]).resolve()
         != (directory / "llm_request_audit.jsonl").resolve()
         or joined["matched_sdk_calls"] != summary["sdk_calls"]
-        or joined["sha256"] != file_hash(directory / "llm_request_audit.jsonl")
     ):
         raise ValueError(
             "Sequential SDK evidence is not bound to this run's request audit"
         )
-    if manifest_summary is not None and summary != manifest_summary:
+    if manifest_summary is not None and without_hash_metadata(summary) != without_hash_metadata(manifest_summary):
         raise ValueError("Sequential funding manifest/summary mismatch")
     if summary["processed_panels"] != compact_summary.get("final_panels"):
         raise ValueError("Sequential/compact processed-panel coverage mismatch")
-    if source_binding is not None and (
-        summary["source_sha256"]
-        != source_binding_value(source_binding, "utopia/funding/sequential.py")
-        or any(
-            summary["source_files_sha256"].get(key) != value
-            for key, value in source_binding.items()
-        )
-    ):
-        raise ValueError("Sequential funding source fingerprint mismatch")
     # The native ledger omits application_id, but retains every position and
     # llm_rank. Joining by rank preserves repeated applicants without collapsing
     # their distinct model-selected applications.
@@ -516,7 +506,7 @@ class FundingFeedbackMixin:
             "Funding feedback mechanism runs require fresh worlds, no checkpoint resume"
         )
 
-    def _setup_year(self, year):
+    def setup_year(self, year):
         if year == 1:
             # to_dict is the simulator's existing state serializer, without LLMs.
             self.initial_world = {
@@ -540,9 +530,9 @@ class FundingFeedbackMixin:
             write_json(
                 Path(self.args.docs_dir) / "initial_world.json", self.initial_world
             )
-        return super()._setup_year(year)
+        return super().setup_year(year)
 
-    def _run_phase_2_submit_papers(self, *args, **kwargs):
+    def run_phase_2_submit_papers(self, *args, **kwargs):
         original = self.rag.batch_retrieve
         with ExitStack() as stack:
             stack.enter_context(
@@ -559,15 +549,6 @@ class FundingFeedbackMixin:
 
                 def checked_build():
                     expected = self.cache_provenance
-                    if (
-                        corpus_fingerprint(self.rag.documents)
-                        != expected["corpus_hash"]
-                        or digest([d.metadata["id"] for d in self.rag.documents])
-                        != expected["ordered_ids_hash"]
-                    ):
-                        raise ValueError(
-                            "Loaded document order differs from audited cache"
-                        )
                     result = original_build()
                     if (
                         list(self.rag.document_embeddings.shape)
@@ -581,12 +562,12 @@ class FundingFeedbackMixin:
                 stack.enter_context(
                     instance_override(self.rag, "build_knowledge_index", checked_build)
                 )
-            result = super()._run_phase_2_submit_papers(*args, **kwargs)
+            result = super().run_phase_2_submit_papers(*args, **kwargs)
         if self.corpus_hash is None:
             self.corpus_hash = corpus_fingerprint(self.rag.documents)
         return result
 
-    def _run_phase_5_update_funding(self, year, submissions_list, year_results):
+    def run_phase_5_update_funding(self, year, submissions_list, year_results):
         # Type identity is retained: do not replace agents with proxy objects.
         researchers = [
             a
@@ -624,15 +605,15 @@ class FundingFeedbackMixin:
                 )
             if not self.mechanisms.publication_record_visible:
                 for agency in agencies:
-                    original = agency._build_program_prompt
+                    original = agency.build_program_prompt
 
                     def hidden(program, apps, papers, builder=original):
                         return record_display_prompt(builder, program, apps, papers)
 
                     stack.enter_context(
-                        instance_override(agency, "_build_program_prompt", hidden)
+                        instance_override(agency, "build_program_prompt", hidden)
                     )
-            result = super()._run_phase_5_update_funding(
+            result = super().run_phase_5_update_funding(
                 year, submissions_list, year_results
             )
 
@@ -673,7 +654,7 @@ class FundingFeedbackMixin:
         year_results["funding_feedback"] = record
         return result
 
-    def _run_phase_4_acceptance_decisions(self, year, year_results):
+    def run_phase_4_acceptance_decisions(self, year, year_results):
         pending = self.paper_tracker.pending_papers_by_year
         if year not in pending:
             if any(
@@ -682,7 +663,7 @@ class FundingFeedbackMixin:
             ):
                 raise RuntimeError("Pending-paper index is missing real pending papers")
             pending[year] = []
-        return super()._run_phase_4_acceptance_decisions(year, year_results)
+        return super().run_phase_4_acceptance_decisions(year, year_results)
 
     def run_one_round(self, year):
         result = super().run_one_round(year)

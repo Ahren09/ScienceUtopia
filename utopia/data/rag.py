@@ -11,29 +11,182 @@ References:
 """
 
 import asyncio
-import numpy as np
-import os
-import re
 import datetime
+import os
 import pickle
+import re
 from collections import Counter
-import torch
-import torch.nn.functional as F
 from dataclasses import dataclass
-# LangChain imports
-from langchain_core.documents import Document
+
 # Scientific computing
 from time import time
-from tqdm import trange, tqdm
-from typing import List, Dict, Optional
+from typing import Dict, List, Optional
 
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn.functional as F
 from datasets import load_dataset
-
 from langchain_community.vectorstores import FAISS
+
+# LangChain imports
+from langchain_core.documents import Document
+from tqdm import tqdm, trange
 
 from utopia.agents.conference import ALL_CS_TOPICS, ARXIV_CATEGORY_NAMES
 
-import pandas as pd
+
+class FullTextCorpus:
+    """Read complete UTF-8 papers from the existing papers/offset/nbytes index."""
+
+    def __init__(self, index_path, cache_dir=None):
+        import json
+        from pathlib import Path
+        index_path = Path(index_path)
+        index = json.loads(index_path.read_text())
+        self.papers = index['papers']
+        self.text_path = index_path.parent / index['text_file']
+        self.cache_dir = Path(cache_dir) if cache_dir else None
+        self.supplement = {'text_file': 'texts.utf8', 'papers': {}}
+        if self.cache_dir:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_index = self.cache_dir / 'index.json'
+            if cache_index.exists():
+                self.supplement = json.loads(cache_index.read_text())
+
+    def text(self, paper_id):
+        paper_id = re.sub(r'v\d+$', '', str(paper_id).split('/abs/')[-1])
+        if paper_id in self.papers or self.cache_dir is None:
+            entry, text_path = self.papers[paper_id], self.text_path
+        else:
+            if paper_id not in self.supplement['papers']:
+                self.fetch_paper(paper_id)
+            entry = self.supplement['papers'][paper_id]
+            text_path = self.cache_dir / self.supplement['text_file']
+        with text_path.open('rb') as stream:
+            stream.seek(entry['offset'])
+            content = stream.read(entry['nbytes'])
+        if len(content) != entry['nbytes'] or not content.strip():
+            raise ValueError(f'Missing or incomplete full text: {paper_id}')
+        return content.decode('utf-8')
+
+    def fetch_paper(self, paper_id):
+        """Fill missing SciEvo bodies from arXiv; preserve PDF and offset-indexed text."""
+        import json
+
+        import pymupdf
+        import requests
+        if not re.fullmatch(r'\d{4}\.\d{4,5}', paper_id):
+            raise ValueError(f'Invalid arXiv paper ID: {paper_id}')
+        url = f'https://arxiv.org/pdf/{paper_id}'
+        response = requests.get(url, timeout=60)
+        if response.status_code == 404:
+            # Withdrawn latest versions can retain the original full paper.
+            url += 'v1'
+            response = requests.get(url, timeout=60)
+        source_format = 'pdf'
+        if response.status_code == 404:
+            url = f'https://arxiv.org/html/{paper_id}v1'
+            response = requests.get(url, timeout=60)
+            source_format = 'html'
+        response.raise_for_status()
+        pages = None
+        if source_format == 'pdf':
+            with pymupdf.open(stream=response.content, filetype='pdf') as pdf:
+                content = '\n'.join(page.get_text(sort=True) for page in pdf).encode('utf-8')
+                pages = len(pdf)
+        else:
+            from html.parser import HTMLParser
+
+            class PaperText(HTMLParser):
+                def __init__(self):
+                    super().__init__()
+                    self.parts, self.hidden = [], 0
+
+                def handle_starttag(self, tag, attrs):
+                    if tag in ('head', 'script', 'style'):
+                        self.hidden += 1
+
+                def handle_endtag(self, tag):
+                    if tag in ('head', 'script', 'style'):
+                        self.hidden = max(0, self.hidden - 1)
+
+                def handle_data(self, data):
+                    if not self.hidden and data.strip():
+                        self.parts.append(data.strip())
+
+            parser = PaperText()
+            parser.feed(response.text)
+            content = '\n'.join(parser.parts).encode('utf-8')
+        if not content.strip():
+            raise ValueError(f'No extracted full text: {paper_id}')
+        (self.cache_dir / f'{paper_id}.{source_format}').write_bytes(response.content)
+        with (self.cache_dir / self.supplement['text_file']).open('ab') as stream:
+            offset = stream.tell()
+            stream.write(content)
+        self.supplement['papers'][paper_id] = {
+            'offset': offset, 'nbytes': len(content), 'source_url': url, 'pages': pages, 'format': source_format,
+        }
+        temporary = self.cache_dir / 'index.json.tmp'
+        temporary.write_text(json.dumps(self.supplement, ensure_ascii=True))
+        temporary.replace(self.cache_dir / 'index.json')
+        print(f'[Full text] Saved {paper_id}: {source_format}, {pages} pages, {len(content)} bytes', flush=True)
+
+
+def historical_author_cohort(cached_documents, semantic_scholar_dir, n_authors=1000, seed=42):
+    """Join stable author IDs to dated CS papers; freeze history before target selection."""
+    from collections import defaultdict
+    from pathlib import Path
+
+    import pyarrow.parquet as pq
+
+    with open(cached_documents, 'rb') as stream:
+        documents = pickle.load(stream)['documents']
+    papers = {}
+    for document in documents:
+        metadata = document.metadata
+        year = int(metadata['publication_year'])
+        topics = [tag for tag in metadata.get('tags', []) if tag.startswith('cs.')]
+        if 2016 <= year <= 2021 and topics and document.page_content.strip():
+            arxiv_id = re.sub(r'v\d+$', '', metadata['id'].split('/abs/')[-1])
+            papers[arxiv_id] = {
+                'paper_id': arxiv_id, 'title': metadata['title'],
+                'abstract': document.page_content, 'year': year,
+                'date': str(metadata['published']), 'topics': topics,
+            }
+    del documents
+    authors = defaultdict(set)
+    for path in sorted(Path(semantic_scholar_dir).glob('*.parquet')):
+        for batch in pq.ParquetFile(path).iter_batches(
+                columns=['arXivId', 'externalIds', 'authors'], batch_size=8192):
+            for row in batch.to_pylist():
+                paper_id = row['arXivId'] or (row['externalIds'] or {}).get('ArXiv')
+                paper_id = re.sub(r'v\d+$', '', paper_id or '')
+                if paper_id not in papers:
+                    continue
+                for author in row['authors'] or []:
+                    if author.get('authorId'):
+                        authors[str(author['authorId'])].add(paper_id)
+    eligible = []
+    for author_id, paper_ids in sorted(authors.items()):
+        ordered = sorted((papers[p] for p in paper_ids), key=lambda p: (p['date'], p['paper_id']))
+        history = [p for p in ordered if p['year'] <= 2020]
+        targets = [p for p in ordered if p['year'] == 2021]
+        if len(history) >= 3 and targets:
+            eligible.append({
+                'author_id': author_id, 'history': history[-10:],
+                'n_history_total': len(history), 'target': targets[0],
+            })
+    if len(eligible) < n_authors:
+        raise ValueError(f'Need {n_authors} eligible stable authors; found {len(eligible)}')
+    rng = np.random.default_rng(seed)
+    selected = sorted(rng.choice(len(eligible), size=n_authors, replace=False))
+    cohort = [eligible[index] for index in selected]
+    order = rng.permutation(n_authors)
+    # A single cycle is a derangement: nobody receives their own history.
+    for index, donor in zip(order, np.roll(order, 1)):
+        cohort[index]['history_donor_id'] = cohort[donor]['author_id']
+    return cohort, len(eligible)
 
 
 @dataclass
@@ -92,10 +245,10 @@ class RAG:
             num_years: Number of simulation years
         """
 
-        def _normalize_whitespace(text: str) -> str:
+        def normalize_whitespace(text: str) -> str:
             return re.sub(r'\s+', ' ', (text or '').replace('\n', ' ')).strip()
 
-        def _as_datetime(ts):
+        def as_datetime(ts):
             """Ensure 'published' is a datetime-like object (prefer pd.Timestamp)."""
             if ts is None or ts == '':
                 return pd.NaT
@@ -139,7 +292,7 @@ class RAG:
                 # Parallel path: use HF datasets built-in multiprocessing
                 print(f"[RAG] Processing dataset with {n_workers} workers...")
 
-                def _parse_pub_year(item):
+                def parse_pub_year(item):
                     ts = item.get('published', '')
                     if ts is None or ts == '':
                         return {'_pub_year': -1}
@@ -149,7 +302,7 @@ class RAG:
                     except Exception:
                         return {'_pub_year': -1}
 
-                dataset = dataset.map(_parse_pub_year, num_proc=num_proc, desc="Parsing dates")
+                dataset = dataset.map(parse_pub_year, num_proc=num_proc, desc="Parsing dates")
 
                 nat_count = sum(1 for y in dataset['_pub_year'] if y == -1)
 
@@ -184,10 +337,10 @@ class RAG:
                 # Sequential path (original)
                 nat_count = 0
                 for item in tqdm(dataset, desc="Processing dataset"):
-                    title = _normalize_whitespace(item.get('title', ''))
-                    abstract = _normalize_whitespace(item.get('summary', ''))
+                    title = normalize_whitespace(item.get('title', ''))
+                    abstract = normalize_whitespace(item.get('summary', ''))
 
-                    published = _as_datetime(item.get('published', ''))
+                    published = as_datetime(item.get('published', ''))
                     if pd.isna(published):
                         nat_count += 1
                         continue
@@ -402,6 +555,8 @@ class RAG:
                 normalize_embeddings=self.config.normalize_embeddings,
                 device=self.device
             )  # (Q, dim)
+
+        query_embeddings = query_embeddings.to(document_embeddings)
 
         print(f"Query embeddings shape: {query_embeddings.shape}")
         print(f"Document embeddings shape: {document_embeddings.shape}")

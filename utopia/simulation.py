@@ -9,19 +9,20 @@ This script runs the full multi-agent simulation with:
 - Yearly cycles with funding management
 """
 
-from utopia.utils.data_utils import write_json as write_json_file
-
-from utopia.utils.data_utils import write_json_atomic, write_json_gzip_atomic
-
 # CRITICAL: Set environment variables for vLLM multiprocessing BEFORE any imports
 # This tells vLLM to use 'spawn' instead of 'fork' for CUDA compatibility
 import os
+
+from utopia.utils.data_utils import write_json as write_json_file
+from utopia.utils.data_utils import write_json_atomic, write_json_gzip_atomic
+
 os.environ.setdefault('VLLM_WORKER_MULTIPROC_METHOD', 'spawn')
 # Disable tokenizers parallelism to avoid fork issues
 os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
 
 # Set multiprocessing start method before any CUDA imports
 import multiprocessing
+
 try:
     multiprocessing.set_start_method('spawn', force=True)
 except RuntimeError:
@@ -33,7 +34,7 @@ import random
 import time
 import traceback
 from collections import Counter, defaultdict
-from typing import List, Dict, Set, Tuple
+from typing import Dict, List, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -42,21 +43,40 @@ from tqdm import tqdm
 from utopia.agents.base_agent import MultiAgentEcosystem
 from utopia.agents.conference import ConferenceSystem, select_conferences_for_simulation
 from utopia.agents.funding_agents import FundingAgency, IndustryFundingSystem
-from utopia.agents.research_direction import assign_directions_individual, create_research_directions_batch, get_strategy_filtered_candidate_directions, AVAILABLE_DIRECTIONS
-from utopia.agents.researcher_agents import UniversityResearcher, IndustryResearcher
-from utopia.metrics.wandb_logger import WandbLogger
+from utopia.agents.research_direction import (
+    AVAILABLE_DIRECTIONS,
+    assign_directions_individual,
+    create_research_directions_batch,
+    get_strategy_filtered_candidate_directions,
+)
+from utopia.agents.researcher_agents import IndustryResearcher, UniversityResearcher
 from utopia.analysis.analyze_all_results import SimulationAnalyzer
 from utopia.arguments import parse_arguments
 from utopia.config import SIMULATION_CONFIG
 from utopia.data.paper_tracker import PaperTracker
-from utopia.data.rag import RAG, RAGConfig
-from utopia.data.tracker import CitationTracker, AgentTracker, FundingTracker
-from utopia.metrics.tracker import calculate_gini_coefficient, calculate_conference_score_metrics
-from utopia.models.models import GPT, BaseLLM, VLLMModel, VLLMServerModel, Gemini
-from utopia.runtime.setup import project_setup
-from utopia.utils.seeding import set_seed, derive_seed
+from utopia.data.rag import RAG, FullTextCorpus, RAGConfig
+from utopia.data.tracker import AgentTracker, CitationTracker, FundingTracker
+from utopia.metrics.tracker import (
+    calculate_conference_score_metrics,
+    calculate_gini_coefficient,
+)
+from utopia.metrics.wandb_logger import WandbLogger
+from utopia.models.models import (
+    GPT,
+    BaseLLM,
+    BedrockModel,
+    Gemini,
+    VLLMModel,
+    VLLMServerModel,
+)
 from utopia.runtime.provenance import write_run_manifest
-
+from utopia.runtime.setup import project_setup
+from utopia.utils.seeding import (
+    capture_rng_state,
+    derive_seed,
+    restore_rng_state,
+    set_seed,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +89,7 @@ def check_citation_integrity(paper_tracker, citation_tracker) -> List[str]:
     failures = []
     papers = paper_tracker.papers_by_id
 
-    def _first_year(paper):
+    def first_year(paper):
         # ArchivedPaper.year moves forward on resubmission; the temporal rule
         # must use the FIRST submission year (a paper is citable from then on).
         years = [r.get('year') for r in getattr(paper, 'review_history', []) or []
@@ -80,7 +100,7 @@ def check_citation_integrity(paper_tracker, citation_tracker) -> List[str]:
         if cited_id not in papers:
             failures.append(f"citation target {cited_id} not in paper tracker")
             continue
-        cited_year = _first_year(papers[cited_id])
+        cited_year = first_year(papers[cited_id])
         for citer in citers:
             if citer == cited_id:
                 failures.append(f"self-loop citation on {cited_id}")
@@ -336,6 +356,10 @@ class Simulation:
             args: Command-line arguments object (optional)
         """
         self.llm: BaseLLM = llm
+        fulltext_index = getattr(args, 'fulltext_index', None)
+        self.fulltext_corpus = (FullTextCorpus(
+            fulltext_index, cache_dir=os.path.join(args.data_cache_dir, 'fulltext'))
+            if fulltext_index else None)
         self.num_years = num_years
         self.output_dir = output_dir
         self.current_year = 1
@@ -362,7 +386,7 @@ class Simulation:
         # ---- Scale-expansion design factors (all default = legacy behaviour) ----
         _a = args if args is not None else argparse_namespace_placeholder()
         self.papers_per_project = int(getattr(_a, 'papers_per_project', 1) or 1)
-        from utopia.funding.accounting import resolve_cost_policy, ResourceLedger
+        from utopia.funding.accounting import ResourceLedger, resolve_cost_policy
         self.cost_policy = resolve_cost_policy(_a, SIMULATION_CONFIG)
         self.resource_ledger = ResourceLedger() if self.cost_policy['log_resource_ledger'] else None
         self.funding_budget_mode = getattr(_a, 'funding_budget_mode', 'track') or 'track'
@@ -446,7 +470,7 @@ class Simulation:
         logger.info("Initializing agent population...")
 
         if getattr(self.args, 'population_mode', 'default') == 'university_only':
-            return self._initialize_university_only_population()
+            return self.initialize_university_only_population()
 
         # Rosters hoisted to module constants (shared with build_influx_cohort)
         rich_universities = RICH_UNIVERSITIES
@@ -587,12 +611,12 @@ class Simulation:
             logger.info(f"Added {freelancer.id}")
         """
 
-        self._record_initial_university_count()
-        self._add_funding_agencies()
+        self.record_initial_university_count()
+        self.add_funding_agencies()
 
         logger.info(f"Total agents initialized: {len(self.ecosystem.agent_population)}")
 
-    def _record_initial_university_count(self):
+    def record_initial_university_count(self):
         """N0 per sector at initialization: anchors for --funding_budget_mode fixed
         (agency slots = round(f x N0_university); industry pool = round(f x N0_industry) x base budget)."""
         self.initial_university_count = sum(
@@ -600,7 +624,7 @@ class Simulation:
         self.initial_industry_count = sum(
             1 for a in self.ecosystem.agent_population.values() if isinstance(a, IndustryResearcher))
 
-    def _fixed_industry_pool_per_unit(self, denominator: int) -> Tuple[int, Dict]:
+    def fixed_industry_pool_per_unit(self, denominator: int) -> Tuple[int, Dict]:
         """--funding_budget_mode fixed for the industry sector (symmetric with the agency slots).
 
         Annual industry pool = round(f x N0_industry) x industry_base_budget, paid out per
@@ -618,7 +642,7 @@ class Simulation:
                 'paid': int(per_unit * denominator)}
         return per_unit, info
 
-    def _add_funding_agencies(self):
+    def add_funding_agencies(self):
         """Add the funding agencies shared by all population modes.
 
         NSF: foundational scientific advancement (patient, lower thresholds).
@@ -636,7 +660,7 @@ class Simulation:
             llm=self.llm
         ))
 
-    def _initialize_university_only_population(self):
+    def initialize_university_only_population(self):
         """Balanced university-only population for the exploration experiment (plan 4.2).
 
         Equal initial funding, synthetic institutions, and exactly the configured
@@ -683,8 +707,8 @@ class Simulation:
                     f"{num_institutions} institutions (equal funding {initial_funding}); "
                     f"blueprint saved to {blueprint_path}")
 
-        self._record_initial_university_count()
-        self._add_funding_agencies()
+        self.record_initial_university_count()
+        self.add_funding_agencies()
 
         logger.info(f"Total agents initialized: {len(self.ecosystem.agent_population)}")
 
@@ -694,7 +718,7 @@ class Simulation:
                           getattr(agent, "resources", None) is not None]
         return np.mean(funding_levels)
 
-    def _initialize_experiment_trackers(self):
+    def initialize_experiment_trackers(self):
         """Lazy initialization of exploration experiment trackers"""
         if not self.is_exploration_experiment:
             return
@@ -740,23 +764,23 @@ class Simulation:
                 model_id=getattr(self.llm, 'model_name', 'unknown'))
             logger.info("Initialized KeywordExtractor")
 
-    def _parse_intention(self, result_json, direction_dict: Dict) -> str:
+    def parse_intention(self, result_json, direction_dict: Dict) -> str:
         """Parse intention from LLM response, falling back to old-style query on failure."""
         if result_json and isinstance(result_json, dict) and result_json.get('intention'):
             return result_json['intention']
-        return self._build_fallback_query(direction_dict)
+        return self.build_fallback_query(direction_dict)
 
-    def _build_fallback_query(self, direction_dict: Dict) -> str:
+    def build_fallback_query(self, direction_dict: Dict) -> str:
         """Build old-style RAG query when intention generation fails."""
         if direction_dict.get('detailed_focus'):
             return direction_dict['detailed_focus']
         return " ".join(direction_dict['direction'].keywords)
 
-    def _record_paper_metadata(self, paper_dict: Dict, author_id: str, year: int):
+    def record_paper_metadata(self, paper_dict: Dict, author_id: str, year: int):
         """Enqueue a paper for batched metadata processing (plan 4.6).
 
         The actual keyword extraction and embedding happen once per year in
-        _record_paper_metadata_batch() — never one LLM/encode call per paper.
+        record_paper_metadata_batch() — never one LLM/encode call per paper.
         """
         if not self.is_exploration_experiment:
             return
@@ -765,12 +789,12 @@ class Simulation:
             return
         self._pending_paper_metadata.append((paper_dict, author_id, year))
 
-    def _record_paper_metadata_batch(self, year: int):
+    def record_paper_metadata_batch(self, year: int):
         """Process all enqueued papers with batched keywords + embeddings + novelty."""
         if not self.is_exploration_experiment or not self._pending_paper_metadata:
             return
 
-        self._initialize_experiment_trackers()
+        self.initialize_experiment_trackers()
         exp_config = SIMULATION_CONFIG['exploration_experiment']
         pending = self._pending_paper_metadata
         self._pending_paper_metadata = []
@@ -823,7 +847,7 @@ class Simulation:
         logger.info(f"Year {year}: batched metadata for {len(pending)} papers "
                     f"({n_fallback} keyword fallbacks)")
 
-    def _collect_exploration_metrics(self, year: int):
+    def collect_exploration_metrics(self, year: int):
         """Collect exploration vs exploitation metrics at end of year
 
         Args:
@@ -832,7 +856,7 @@ class Simulation:
         if not self.is_exploration_experiment:
             return
 
-        self._initialize_experiment_trackers()
+        self.initialize_experiment_trackers()
 
         exp_config = SIMULATION_CONFIG['exploration_experiment']
 
@@ -843,7 +867,7 @@ class Simulation:
 
         if not paper_ids_this_year:
             logger.info(f"Year {year}: No new papers; still collecting paper-age panel")
-            self._collect_paper_age_panel(year)
+            self.collect_paper_age_panel(year)
             self.exploration_metrics.export_tables(getattr(self.args, 'docs_dir', self.output_dir))
             return
 
@@ -1058,14 +1082,14 @@ class Simulation:
                     'strategy': strategy, 'year': year, **metrics_dict})
 
         # Paper-age panel + annual CD recomputation for ALL prior accepted papers
-        self._collect_paper_age_panel(year)
+        self.collect_paper_age_panel(year)
 
         # Persist structured tables (small; atomic rewrite per year)
         self.exploration_metrics.export_tables(getattr(self.args, 'docs_dir', self.output_dir))
 
         logger.info(f"Year {year}: Collected exploration metrics for {len(paper_ids_this_year)} papers")
 
-    def _collect_paper_age_panel(self, year: int):
+    def collect_paper_age_panel(self, year: int):
         """Append paper-age outcomes for every accepted paper each year (plan 4.10).
 
         Records cumulative citations (graph in-degree), time to first citation,
@@ -1109,7 +1133,7 @@ class Simulation:
                 'novelty_score': (self._paper_novelty_scores.get(pid) or (None,))[0],
             })
 
-    def _run_integrity_checks(self, year: int) -> Dict:
+    def run_integrity_checks(self, year: int) -> Dict:
         """Graph and temporal integrity checks, written per year (plan 11.4).
 
         Any failure is recorded (and loudly logged) rather than silently ignored.
@@ -1148,7 +1172,7 @@ class Simulation:
 
     # ==================== Preferential Attachment Experiment ====================
 
-    def _initialize_preferential_attachment_trackers(self):
+    def initialize_preferential_attachment_trackers(self):
         """Lazily initialize trackers for the preferential attachment experiment."""
         if self.experiment_name != 'preferential_attachment':
             return
@@ -1159,7 +1183,7 @@ class Simulation:
             from utopia.metrics.network_metrics import NetworkMetrics
             self.network_metrics = NetworkMetrics()
 
-    def _run_phase_1_5_collaboration_formation(self, year: int, directions: Dict,
+    def run_phase_1_5_collaboration_formation(self, year: int, directions: Dict,
                                                 active_authors: List, year_results: Dict):
         """Phase 1.5: Form collaboration pairs for co-authored papers.
 
@@ -1169,7 +1193,7 @@ class Simulation:
         if self.experiment_name != 'preferential_attachment':
             return
 
-        self._initialize_preferential_attachment_trackers()
+        self.initialize_preferential_attachment_trackers()
 
         pa_config = SIMULATION_CONFIG['preferential_attachment_experiment']
         top_k = pa_config['top_k_candidates']
@@ -1187,7 +1211,7 @@ class Simulation:
                                 for e in getattr(agent, 'expertise', [])}
             agent_topics[agent.id] = keywords | expertise_topics
 
-        def _get_institution(agent):
+        def get_institution(agent):
             return getattr(agent, 'university_name', None) or getattr(agent, 'company_name', None)
 
         # --- Step 1: Heuristic scoring for each agent ---
@@ -1198,8 +1222,8 @@ class Simulation:
         # (prereg_v1_1_source_fix); 'legacy' keeps the original path untouched.
         growth_ctx = None
         if self.collaboration_network_growth_mode == 'expanding':
-            agent_candidates, growth_ctx = self._expanding_candidate_selection(
-                year, active_authors, agent_topics, _get_institution,
+            agent_candidates, growth_ctx = self.expanding_candidate_selection(
+                year, active_authors, agent_topics, get_institution,
                 collaboration_mode, pa_config)
         else:
             for agent in active_authors:
@@ -1207,7 +1231,7 @@ class Simulation:
                 if not topics_a:
                     continue
 
-                inst_a = _get_institution(agent)
+                inst_a = get_institution(agent)
                 recent_papers_a = self.paper_tracker.get_papers_by_author(agent.id)
                 recent_topics_a = set()
                 for p in sorted(recent_papers_a, key=lambda x: x.year, reverse=True)[:3]:
@@ -1217,7 +1241,7 @@ class Simulation:
                 for other in active_authors:
                     if other.id == agent.id:
                         continue
-                    inst_b = _get_institution(other)
+                    inst_b = get_institution(other)
 
                     # Filter by collaboration mode
                     if collaboration_mode == 'intra_institute' and inst_a != inst_b:
@@ -1315,7 +1339,7 @@ class Simulation:
         # --- Step 3: Form pairs (mutual or one-sided matching) ---
         growth_stats = None
         if growth_ctx is not None:
-            collaboration_pairs, growth_stats = self._expanding_form_pairs(
+            collaboration_pairs, growth_stats = self.expanding_form_pairs(
                 year, collab_decisions, agent_candidates, growth_ctx)
         else:
             claimed = set()
@@ -1363,14 +1387,16 @@ class Simulation:
                      f"(total: {self.collaboration_tracker.graph.number_of_edges()} edges, "
                      f"{self.collaboration_tracker.graph.number_of_nodes()} nodes)")
 
-    def _expanding_candidate_selection(self, year, active_authors, agent_topics,
-                                       _get_institution, collaboration_mode, pa_config):
+    def expanding_candidate_selection(self, year, active_authors, agent_topics,
+                                       get_institution, collaboration_mode, pa_config):
         """Expanding growth mode (prereg_v1_1_source_fix): deterministic 70/30
         new-tie/repeat-tie proposal channels, scored against the pre-formation
         graph snapshot. Returns (agent_candidates, growth_ctx).
         """
         import math
+
         import networkx as nx
+
         from utopia.utils.seeding import derive_seed
 
         run_seed = getattr(self.args, 'seed', 42)
@@ -1379,7 +1405,7 @@ class Simulation:
         pre_graph = self.collaboration_tracker.graph.copy()
         max_log1p_deg = max((math.log1p(d) for _, d in pre_graph.degree()), default=0.0)
 
-        def _recent_topics(agent_id):
+        def recent_topics(agent_id):
             topics = set()
             papers = self.paper_tracker.get_papers_by_author(agent_id)
             for p in sorted(papers, key=lambda x: x.year, reverse=True)[:3]:
@@ -1399,18 +1425,18 @@ class Simulation:
                        if derive_seed(run_seed, 'collab_growth_channel', year, agent.id) % 100 < 70
                        else 'repeat_tie')
             channels[agent.id] = channel
-            inst_a = _get_institution(agent)
+            inst_a = get_institution(agent)
             dist_map = (dict(nx.single_source_shortest_path_length(pre_graph, agent.id))
                         if pre_graph.has_node(agent.id) else {})
             distances[agent.id] = dist_map
-            recent_topics_a = _recent_topics(agent.id)
+            recent_topics_a = recent_topics(agent.id)
             coi_a = set(getattr(agent, 'conflict_of_interest', set()) or set())
 
             scored = []
             for other in active_authors:
                 if other.id == agent.id:
                     continue
-                inst_b = _get_institution(other)
+                inst_b = get_institution(other)
                 if collaboration_mode == 'intra_institute' and inst_a != inst_b:
                     continue
                 if collaboration_mode == 'cross_institute' and inst_a == inst_b:
@@ -1435,7 +1461,7 @@ class Simulation:
                 if not union:
                     continue
                 topic_score = len(topics_a & topics_b) / len(union)
-                recent_topics_b = _recent_topics(other.id)
+                recent_topics_b = recent_topics(other.id)
                 pub_union = recent_topics_a | recent_topics_b
                 pub_score = (len(recent_topics_a & recent_topics_b) / len(pub_union)
                              if pub_union else 0.0)
@@ -1478,7 +1504,7 @@ class Simulation:
                       'run_seed': run_seed}
         return agent_candidates, growth_ctx
 
-    def _expanding_form_pairs(self, year, collab_decisions, agent_candidates, growth_ctx):
+    def expanding_form_pairs(self, year, collab_decisions, agent_candidates, growth_ctx):
         """Pair formation for the expanding mode: same mutual/one-sided rules
         as legacy, but iterated in a seeded deterministic order, with every
         proposal and realized event logged and classified against the
@@ -1486,7 +1512,9 @@ class Simulation:
         """
         import random
         from collections import Counter
+
         import networkx as nx
+
         from utopia.utils.seeding import derive_seed
 
         pre_graph = growth_ctx['pre_graph']
@@ -1627,7 +1655,7 @@ class Simulation:
 
         return collaboration_pairs, growth_stats
 
-    def _apply_coauthorship(self, paper_dict: Dict, agent, year: int):
+    def apply_coauthorship(self, paper_dict: Dict, agent, year: int):
         """If agent has a collaboration partner this round, update paper_dict with co-author info."""
         collab_pairs = self._collaboration_pairs.get(year, {})
         co_author_id = collab_pairs.get(agent.id)
@@ -1637,18 +1665,18 @@ class Simulation:
             paper_dict['author_type'] = [agent.get_type(), co_author.get_type()]
 
     @staticmethod
-    def _get_lead_author_id(paper: Dict) -> str:
+    def get_lead_author_id(paper: Dict) -> str:
         """Get the lead (first) author ID from a paper dict, handling both single and co-authored papers."""
         aid = paper['author_id']
         return aid[0] if isinstance(aid, list) else aid
 
     @staticmethod
-    def _get_all_author_ids(paper: Dict) -> List[str]:
+    def get_all_author_ids(paper: Dict) -> List[str]:
         """Get all author IDs from a paper dict as a list."""
         aid = paper['author_id']
         return aid if isinstance(aid, list) else [aid]
 
-    def _describe_network_relationship(self, distance: int) -> str:
+    def describe_network_relationship(self, distance: int) -> str:
         """Describe the collaboration network relationship for non-blind review prompts."""
         if distance == 1:
             return "You have directly collaborated with this author before."
@@ -1661,7 +1689,7 @@ class Simulation:
         else:
             return "You have no collaboration history with this author."
 
-    def _build_author_info_for_review(self, reviewer, paper: Dict) -> Dict:
+    def build_author_info_for_review(self, reviewer, paper: Dict) -> Dict:
         """Build author info dict for non-blind review in the preferential attachment experiment.
 
         Returns None if the experiment is not active.
@@ -1675,7 +1703,7 @@ class Simulation:
         if os.environ.get('UTOPIA_PA_BLIND_REVIEW') == '1':
             return None
 
-        lead_id = self._get_lead_author_id(paper)
+        lead_id = self.get_lead_author_id(paper)
         author = self.ecosystem.get_agent_by_id(lead_id)
         institution = getattr(author, 'university_name', None) or getattr(author, 'company_name', None) or 'Unknown'
         distance = self.collaboration_tracker.get_network_distance(reviewer.id, lead_id)
@@ -1683,15 +1711,15 @@ class Simulation:
         return {
             'author_name': lead_id,
             'institution': institution,
-            'network_relationship': self._describe_network_relationship(distance),
+            'network_relationship': self.describe_network_relationship(distance),
             'network_distance': distance,
         }
 
-    def _collect_preferential_attachment_metrics(self, year: int):
+    def collect_preferential_attachment_metrics(self, year: int):
         """Collect preferential attachment metrics at end of year."""
         if self.experiment_name != 'preferential_attachment':
             return
-        self._initialize_preferential_attachment_trackers()
+        self.initialize_preferential_attachment_trackers()
 
         all_metrics = self.network_metrics.compute_all_metrics(
             year, self.collaboration_tracker, self.ecosystem
@@ -1701,8 +1729,8 @@ class Simulation:
                         f"Pearson r={all_metrics['pearson_r']:.3f} (p={all_metrics['pearson_p']:.4f}), "
                         f"Spearman r={all_metrics['spearman_r']:.3f}")
 
-    def _apply_annual_influx(self, year: int) -> List[str]:
-        """Influx2x2: inject this year's junior cohort at the top of _setup_year.
+    def apply_annual_influx(self, year: int) -> List[str]:
+        """Influx2x2: inject this year's junior cohort at the top of setup_year.
 
         OFF (annual_influx_rate <= 0, the default): returns [] immediately —
         no RNG use, no side effects, byte-identical to the pre-influx code path.
@@ -1761,18 +1789,18 @@ class Simulation:
                     f"(population={len(self.ecosystem.agent_population)})")
         return entrant_ids
 
-    def _account_resources(self, agent, delta, *, category, year, project=None,
+    def account_resources(self, agent, delta, *, category, year, project=None,
                            paper=None, program=None, reason=None):
         from utopia.funding.accounting import apply_resource_change
         return apply_resource_change(
             agent, delta, category=category, year=year, project=project,
             paper=paper, program=program, reason=reason)
 
-    def _resubmission_fee(self):
+    def resubmission_fee(self):
         override = getattr(self.args, 'resubmission_cost', None)
         return SIMULATION_CONFIG['conference']['resubmission_cost'] if override is None else override
 
-    def _prepare_project_production(self, year, active_authors):
+    def prepare_project_production(self, year, active_authors):
         """Completed lead projects pay before any selection, including failed selection."""
         from utopia.funding.accounting import enter_project_production
         policy = getattr(self, 'cost_policy', None)
@@ -1785,31 +1813,31 @@ class Simulation:
                 admitted.append(agent)
         return admitted
 
-    def _record_output_cost(self, agent, paper_dict, year):
+    def record_output_cost(self, agent, paper_dict, year):
         """The native baseline debits no per-paper fee. Link each output to its project."""
-        from utopia.funding.accounting import project_id, cost_policy_enabled
+        from utopia.funding.accounting import cost_policy_enabled, project_id
         policy = getattr(self, 'cost_policy', None)
         if policy is None or not cost_policy_enabled(policy):
             return
         pid = project_id(agent)
         paper_dict['project_id'] = pid
         if getattr(agent, 'resource_ledger', None) is not None:
-            self._account_resources(agent, 0, category='production_submission_cost',
+            self.account_resources(agent, 0, category='production_submission_cost',
                                     year=year, project=pid, paper=paper_dict['id'],
                                     reason='output_included')
 
-    def _charge_resubmission(self, agent, paper_dict, year):
+    def charge_resubmission(self, agent, paper_dict, year):
         from utopia.funding.accounting import stable_id
         pid = paper_dict.get('project_id')
         if pid is None and all(k in paper_dict for k in ('project_start_year', 'project_end_year')):
-            pid = stable_id('project', self._get_lead_author_id(paper_dict),
+            pid = stable_id('project', self.get_lead_author_id(paper_dict),
                             paper_dict['project_start_year'], paper_dict['project_end_year'])
-        fee = self._resubmission_fee()
-        if self._account_resources(agent, -fee, category='resubmission_cost', year=year,
+        fee = self.resubmission_fee()
+        if self.account_resources(agent, -fee, category='resubmission_cost', year=year,
                                    project=pid, paper=paper_dict['id']):
             self.funding_tracker.record_funding_consumption(year, fee, agent.get_type())
 
-    def _setup_year(self, year: int) -> Dict:
+    def setup_year(self, year: int) -> Dict:
         """Setup year: (influx2x2) inject junior cohort, log start, reset funding
         tracker, reset conferences
 
@@ -1825,7 +1853,7 @@ class Simulation:
         # Influx2x2: entrants join BEFORE funding_tracker.start_cycle so their
         # resources count in the year's opening total and they participate in
         # every phase of their entry year (no-op when the flag is off).
-        influx_entrants = self._apply_annual_influx(year)
+        influx_entrants = self.apply_annual_influx(year)
         if getattr(self, 'resource_ledger', None) is not None:
             self.resource_ledger.start_year(year, self.ecosystem.agent_population)
 
@@ -1842,7 +1870,7 @@ class Simulation:
             year_results['influx_entrants'] = influx_entrants
         return year_results
 
-    def _run_phase_0_resubmissions(self, year: int, year_results: Dict) -> List[Dict]:
+    def run_phase_0_resubmissions(self, year: int, year_results: Dict) -> List[Dict]:
         """Resubmit rejected papers when the experiment and current year allow it."""
         if getattr(self.args, 'disable_resubmission', False):
             logger.info(f"Year {year} Phase 0: resubmissions disabled (--disable_resubmission); skipping")
@@ -1851,10 +1879,10 @@ class Simulation:
             return []
         logger.info(f"Year {year} Preparation: Processing resubmissions from year {year - 1}...")
         if hasattr(self.llm, 'generate_batch'):
-            return self._resubmit_papers_batch(year)
-        return self._resubmit_papers_sequential(year)
+            return self.resubmit_papers_batch(year)
+        return self.resubmit_papers_sequential(year)
 
-    def _record_resubmission(self, agent, rejected_papers, metadata, year, resubmissions, submitted_ids):
+    def record_resubmission(self, agent, rejected_papers, metadata, year, resubmissions, submitted_ids):
         """Restore a rejected paper to pending once, preserving reviews and charging its fee."""
         arxiv_id = metadata['arxiv_id']
         if arxiv_id in submitted_ids:
@@ -1871,10 +1899,10 @@ class Simulation:
         paper['review_history'] = review_history
         resubmissions.append(paper)
         self.paper_tracker.add_or_update_paper(paper)
-        self._charge_resubmission(agent, paper, year)
+        self.charge_resubmission(agent, paper, year)
         submitted_ids.add(arxiv_id)
 
-    def _process_resubmission_response(self, result, request, conference_ids, year, resubmissions, submitted_ids):
+    def process_resubmission_response(self, result, request, conference_ids, year, resubmissions, submitted_ids):
         """Record valid choices and return unresolved rejected papers for a retry."""
         agent = request['agent']
         rejected_papers = request['rejected_papers']
@@ -1887,13 +1915,13 @@ class Simulation:
                 logger.warning(f"Invalid resubmission entry for agent {agent.id}: {metadata}, skipping")
                 has_invalid = True
                 continue
-            self._record_resubmission(agent, rejected_papers, metadata, year, resubmissions, submitted_ids)
+            self.record_resubmission(agent, rejected_papers, metadata, year, resubmissions, submitted_ids)
         if not has_invalid:
             return None
         remaining = {pid: paper for pid, paper in rejected_papers.items() if pid not in submitted_ids}
         return {'agent': agent, 'rejected_papers': remaining} if remaining else None
 
-    def _resubmit_papers_batch(self, year):
+    def resubmit_papers_batch(self, year):
         """Batch resubmission decisions and retry unresolved rejected papers."""
         resubmissions_list = []
         resubmissions_paper_ids = set()
@@ -1908,11 +1936,11 @@ class Simulation:
                 continue
 
             rejected_papers = {paper.id: paper.to_dict() for paper in papers if paper.status == 'reject'}
-            if agent.resources < self._resubmission_fee() or not rejected_papers:
+            if agent.resources < self.resubmission_fee() or not rejected_papers:
                 continue
 
             prompt, response_format = agent.get_resubmission_prompt(
-                rejected_papers, self.conference_system.conferences, self._resubmission_fee())
+                rejected_papers, self.conference_system.conferences, self.resubmission_fee())
             batch_prompts.append(prompt)
             batch_metadata.append({
                 'agent': agent,
@@ -1936,7 +1964,7 @@ class Simulation:
             # Step 3: Process results
             candidate_conference_ids = set([c.conference_id for c in self.conference_system.conferences])
             for i, (result, _) in enumerate(batch_results):
-                retry = self._process_resubmission_response(
+                retry = self.process_resubmission_response(
                     result, batch_metadata[i], candidate_conference_ids,
                     year, resubmissions_list, resubmissions_paper_ids)
                 if retry is not None:
@@ -1953,11 +1981,11 @@ class Simulation:
                 agent = retry_info['agent']
                 remaining_rejected = retry_info['rejected_papers']
 
-                if agent.resources < self._resubmission_fee() or not remaining_rejected:
+                if agent.resources < self.resubmission_fee() or not remaining_rejected:
                     continue
 
                 prompt, response_format = agent.get_resubmission_prompt(
-                    remaining_rejected, self.conference_system.conferences, self._resubmission_fee())
+                    remaining_rejected, self.conference_system.conferences, self.resubmission_fee())
                 batch_prompts.append(prompt)
                 batch_metadata.append({
                     'agent': agent,
@@ -1972,7 +2000,7 @@ class Simulation:
 
         return resubmissions_list
 
-    def _resubmit_papers_sequential(self, year):
+    def resubmit_papers_sequential(self, year):
         """Use agent resubmission decisions with the shared recording logic."""
         resubmissions_list = []
         resubmissions_paper_ids = set()
@@ -1987,15 +2015,15 @@ class Simulation:
                 continue
 
             resubmissions_of_author = agent.decide_resubmission(
-                rejected_papers, self.conference_system.conferences, self._resubmission_fee())
+                rejected_papers, self.conference_system.conferences, self.resubmission_fee())
 
             for metadata in resubmissions_of_author:
-                self._record_resubmission(
+                self.record_resubmission(
                     agent, rejected_papers, metadata, year, resubmissions_list, resubmissions_paper_ids)
 
         return resubmissions_list
 
-    def _run_phase_1_research_directions(self, year: int, year_results: Dict):
+    def run_phase_1_research_directions(self, year: int, year_results: Dict):
         """Phase 1: Assign research directions to agents
 
         Args:
@@ -2034,7 +2062,7 @@ class Simulation:
         # same set (plan 4.1) — no hidden agent attribute.
         candidate_map = None
         if self.is_exploration_experiment and authors_with_directions_pending:
-            self._initialize_experiment_trackers()
+            self.initialize_experiment_trackers()
             exp_config = SIMULATION_CONFIG['exploration_experiment']
             candidate_map = {}
             for agent in authors_with_directions_pending:
@@ -2118,7 +2146,7 @@ class Simulation:
 
         return directions, active_authors, average_funding_level
 
-    def _build_candidate_papers(self, rag_documents, indices):
+    def build_candidate_papers(self, rag_documents, indices):
         """Build enriched candidate paper dicts with author_id and institution."""
         candidate_papers = []
         for idx in indices:
@@ -2138,7 +2166,7 @@ class Simulation:
             })
         return candidate_papers
 
-    def _run_phase_2_submit_papers(self, year: int, directions: Dict, active_authors: List,
+    def run_phase_2_submit_papers(self, year: int, directions: Dict, active_authors: List,
                                     resubmissions_list: List[Dict], year_results: Dict) -> List[Dict]:
         """Prepare authors, submit new papers, select citations, and register venues."""
         logger.info(f"Year {year} Phase 2: Submitting papers...")
@@ -2148,10 +2176,10 @@ class Simulation:
             active_authors = [a for a in active_authors if a.id not in co_author_ids]
             logger.info(f"Phase 2: {original_count - len(active_authors)} agents are co-authors this round, "
                         f"{len(active_authors)} agents will submit as lead authors")
-        active_authors = self._prepare_project_production(year, active_authors)
+        active_authors = self.prepare_project_production(year, active_authors)
 
-        self._prepare_paper_index(year)
-        intentions = self._generate_round_intentions(year, directions, active_authors)
+        self.prepare_paper_index(year)
+        intentions = self.generate_round_intentions(year, directions, active_authors)
         year_results['round_intentions'] = intentions
         queries = [
             f"{intentions[agent.id]}\nKeywords: {', '.join(directions[agent.id]['direction'].keywords)}"
@@ -2162,17 +2190,17 @@ class Simulation:
         assert topk_indices.shape[0] == len(active_authors)
 
         if hasattr(self.llm, 'generate_batch'):
-            submissions = self._submit_papers_batch(year, directions, active_authors, topk_indices)
+            submissions = self.submit_papers_batch(year, directions, active_authors, topk_indices)
         else:
-            submissions = self._submit_papers_sequential(year, directions, active_authors, topk_indices)
+            submissions = self.submit_papers_sequential(year, directions, active_authors, topk_indices)
 
         if year >= 2:
-            self._record_submission_citations(year, directions, submissions, resubmissions_list)
+            self.record_submission_citations(year, directions, submissions, resubmissions_list)
 
         submitted_by_author = {}
         for paper in submissions + resubmissions_list:
             conference = self.conference_system.conference_map[paper['conference']]
-            lead_id = self._get_lead_author_id(paper)
+            lead_id = self.get_lead_author_id(paper)
             submitted_by_author.setdefault(lead_id, [])
             if not conference.submit_paper(paper, year=year):
                 raise ValueError(f"Paper {paper['id']} submission to conference {paper['conference']} failed")
@@ -2183,7 +2211,7 @@ class Simulation:
         }
         return submissions
 
-    def _prepare_paper_index(self, year: int):
+    def prepare_paper_index(self, year: int):
         """Load the paper index and preserve submission statuses when resuming."""
         if year == 1:
             self.rag.load_documents(num_years=self.num_years)
@@ -2199,7 +2227,7 @@ class Simulation:
         # Set the current simulation year for year-based data partitioning
         self.rag.set_current_year(year)
 
-    def _generate_round_intentions(self, year, directions, active_authors):
+    def generate_round_intentions(self, year, directions, active_authors):
         """Generate intentions in author order using the existing model transport."""
         intention_prompts = []
         intention_response_format = None
@@ -2220,18 +2248,18 @@ class Simulation:
                 seed_ctx=('phase2_intentions', year),
             )
             for agent, (result_json, _) in zip(active_authors, intention_results):
-                intention = self._parse_intention(result_json, directions[agent.id])
+                intention = self.parse_intention(result_json, directions[agent.id])
                 round_intentions[agent.id] = intention
         else:
             for agent, prompt in zip(active_authors, intention_prompts):
                 result_json, _ = self.llm.generate(prompt=prompt, response_format=intention_response_format)
-                intention = self._parse_intention(result_json, directions[agent.id])
+                intention = self.parse_intention(result_json, directions[agent.id])
                 round_intentions[agent.id] = intention
 
         logger.info(f"Generated {len(round_intentions)} intentions")
         return round_intentions
 
-    def _record_new_submission(self, agent, arxiv_id, conference, year, direction, submissions):
+    def record_new_submission(self, agent, arxiv_id, conference, year, direction, submissions):
         """Record one paper, including costs, coauthors, metadata, and retrieval status."""
         paper_doc = self.rag.id2docs[arxiv_id]
         assert agent.project_start_year <= year, (
@@ -2254,14 +2282,14 @@ class Simulation:
             'maturity': direction['direction'].years,
             'status': 'pending',
         }
-        self._record_output_cost(agent, paper, year)
-        self._apply_coauthorship(paper, agent, year)
+        self.record_output_cost(agent, paper, year)
+        self.apply_coauthorship(paper, agent, year)
         submissions.append(paper)
         self.paper_tracker.add_or_update_paper(paper)
-        self._record_paper_metadata(paper, agent.id, year)
+        self.record_paper_metadata(paper, agent.id, year)
         self.rag.document_status.loc[self.rag.document_status['id'] == arxiv_id, 'status'] = 'submitted'
 
-    def _validate_submission_entry(self, entry, candidate_papers):
+    def validate_submission_entry(self, entry, candidate_papers):
         """Validate one model-selected paper and venue, including the opt-out sentinel."""
         arxiv_id = entry['arxiv_id']
         assert "reason" in entry, f"Reason is not in the submission metadata: {entry}"
@@ -2270,7 +2298,7 @@ class Simulation:
             f"Generated invalid conference name: {entry['conference']}")
         return arxiv_id
 
-    def _process_submission_response(self, response, metadata, year, directions, submissions):
+    def process_submission_response(self, response, metadata, year, directions, submissions):
         """Record valid entries and return the remaining work when a retry is needed."""
         agent = metadata['agent']
         candidate_papers = metadata['candidate_papers']
@@ -2299,7 +2327,7 @@ class Simulation:
         needs_fallback = False
         for entry in entries:
             try:
-                arxiv_id = self._validate_submission_entry(entry, candidate_papers)
+                arxiv_id = self.validate_submission_entry(entry, candidate_papers)
                 assert arxiv_id not in seen_ids, f"Duplicate arxiv_id in one response: {arxiv_id}"
             except (KeyError, AssertionError) as error:
                 traceback.print_exc()
@@ -2316,7 +2344,7 @@ class Simulation:
                 needs_fallback = True
                 break
             logger.info(f"{agent.id} - {entry['conference']} - submitted '{self.rag.id2docs[arxiv_id].metadata['title']}'")
-            self._record_new_submission(agent, arxiv_id, entry['conference'], year, directions[agent.id], submissions)
+            self.record_new_submission(agent, arxiv_id, entry['conference'], year, directions[agent.id], submissions)
             n_submitted += 1
 
         remaining = n_needed - n_submitted
@@ -2325,7 +2353,7 @@ class Simulation:
             return fallback
         return None
 
-    def _submit_papers_batch(self, year, directions, active_authors, topk_indices):
+    def submit_papers_batch(self, year, directions, active_authors, topk_indices):
         """Submit in batches, retry invalid selections, then fill unresolved requests."""
         submissions = []
         batch_prompts = []
@@ -2367,7 +2395,7 @@ class Simulation:
             )
             unresolved = []
             for index, (response, _) in enumerate(results):
-                retry = self._process_submission_response(response, batch_metadata[index], year, directions, submissions)
+                retry = self.process_submission_response(response, batch_metadata[index], year, directions, submissions)
                 if retry is not None:
                     unresolved.append(retry)
             if not unresolved:
@@ -2389,10 +2417,10 @@ class Simulation:
                 batch_metadata.append({'agent': agent, 'candidate_papers': candidates, 'n_needed': retry['n_needed']})
 
         if unresolved:
-            self._assign_fallback_submissions(unresolved, year, directions, submissions)
+            self.assign_fallback_submissions(unresolved, year, directions, submissions)
         return submissions
 
-    def _assign_fallback_submissions(self, unresolved, year, directions, submissions):
+    def assign_fallback_submissions(self, unresolved, year, directions, submissions):
         """Draw remaining papers before the venue to preserve the legacy RNG stream."""
         logger.info(f"After retries, {len(unresolved)} agents need random assignment")
         for retry in unresolved:
@@ -2409,10 +2437,10 @@ class Simulation:
             conference = retry['conference'] or random.choice(list(self.conference_system.conference_map.keys()))
             for paper in chosen_papers:
                 logger.info(f"{agent.id} random fallback - {conference} - submitted '{paper.metadata['title']}'")
-                self._record_new_submission(
+                self.record_new_submission(
                     agent, paper.metadata['id'], conference, year, directions[agent.id], submissions)
 
-    def _submit_papers_sequential(self, year, directions, active_authors, topk_indices):
+    def submit_papers_sequential(self, year, directions, active_authors, topk_indices):
         """Keep the single-paper transport and its existing retry behavior."""
         submissions = []
         assert self.papers_per_project == 1, "papers_per_project>1 requires the batched path"
@@ -2446,7 +2474,7 @@ class Simulation:
                 try:
                     submission_metadata, message_history = self.llm.generate(prompt=prompt,
                                                                              response_format=response_format)
-                    arxiv_id = self._validate_submission_entry(submission_metadata, candidate_papers)
+                    arxiv_id = self.validate_submission_entry(submission_metadata, candidate_papers)
 
                     if arxiv_id != "DO_NOT_SUBMIT":
                         logger.info(
@@ -2474,12 +2502,12 @@ class Simulation:
                 logger.info(f"Agent {agent.id} did not submit any paper due to funding issues")
                 continue
 
-            self._record_new_submission(
+            self.record_new_submission(
                 agent, arxiv_id, submission_metadata['conference'], year, directions[agent.id], submissions)
 
         return submissions
 
-    def _record_submission_citations(self, year, directions, submissions_list, resubmissions_list):
+    def record_submission_citations(self, year, directions, submissions_list, resubmissions_list):
         """Retrieve citation candidates and record citations for new submissions."""
         retrieval_prompts = []
 
@@ -2501,15 +2529,15 @@ class Simulation:
             self.rag.document_status[self.rag.document_status['status'] == "accept"].id.values.tolist())
 
         if hasattr(self.llm, 'generate_batch'):
-            self._record_batch_citations(
+            self.record_batch_citations(
                 year, directions, submissions_list, topk_indices_citation_accepted,
                 topk_indices_citation_both, accepted_papers_arxiv_ids)
         else:
-            self._record_sequential_citations(
+            self.record_sequential_citations(
                 year, directions, submissions_list, topk_indices_citation_accepted,
                 topk_indices_citation_both, accepted_papers_arxiv_ids)
 
-    def _select_citations_batch(self, year, directions, submissions_list, paper_indices,
+    def select_citations_batch(self, year, directions, submissions_list, paper_indices,
                                 candidate_indices, citation_kind, citation_response_format=None, accepted_ids=None):
         """Run a regular or extended citation pass, retrying only invalid responses."""
         max_attempts = 4
@@ -2518,10 +2546,10 @@ class Simulation:
 
         for i in paper_indices:
             submitted_paper = submissions_list[i]
-            agent = self.ecosystem.get_agent_by_id(self._get_lead_author_id(submitted_paper))
-            candidate_papers = self._build_candidate_papers(
+            agent = self.ecosystem.get_agent_by_id(self.get_lead_author_id(submitted_paper))
+            candidate_papers = self.build_candidate_papers(
                 self.rag.documents,
-                self._rerank_citation_candidates(
+                self.rerank_citation_candidates(
                     candidate_indices[i],
                     SIMULATION_CONFIG['citation']['num_candidate_papers'])
             )
@@ -2592,7 +2620,7 @@ class Simulation:
 
         return citations_by_paper, citation_response_format
 
-    def _select_self_citations_batch(self, year, directions, submissions_list):
+    def select_self_citations_batch(self, year, directions, submissions_list):
         """Select each author's earlier papers, retrying invalid citation indices."""
         max_attempts = 4
         self_citations_dict = {}  # paper_idx -> self-citation list
@@ -2602,7 +2630,7 @@ class Simulation:
 
         for i in range(len(submissions_list)):
             submitted_paper = submissions_list[i]
-            agent = self.ecosystem.get_agent_by_id(self._get_lead_author_id(submitted_paper))
+            agent = self.ecosystem.get_agent_by_id(self.get_lead_author_id(submitted_paper))
             own_papers = self.paper_tracker.get_papers_by_author(agent.id)
             own_papers = [p for p in own_papers if p.project_end_year < year]
             if not own_papers:
@@ -2664,9 +2692,9 @@ class Simulation:
 
         return self_citations_dict
 
-    def _record_batch_citations(self, year, directions, submissions_list, accepted_indices, all_indices, accepted_ids):
+    def record_batch_citations(self, year, directions, submissions_list, accepted_indices, all_indices, accepted_ids):
         """Select accepted-paper citations, extend sparse lists, then add self-citations."""
-        regular, response_format = self._select_citations_batch(
+        regular, response_format = self.select_citations_batch(
             year, directions, submissions_list, range(len(submissions_list)),
             accepted_indices, 'regular', accepted_ids=accepted_ids)
         for index, paper in enumerate(submissions_list):
@@ -2678,16 +2706,16 @@ class Simulation:
             index for index in range(len(submissions_list))
             if len(regular[index]) <= SIMULATION_CONFIG['citation']['expected_citation_per_round']
         ]
-        extended, _ = self._select_citations_batch(
+        extended, _ = self.select_citations_batch(
             year, directions, submissions_list, sparse_indices, all_indices, 'extended', response_format)
-        self_citations = self._select_self_citations_batch(year, directions, submissions_list)
+        self_citations = self.select_self_citations_batch(year, directions, submissions_list)
         for index, paper in enumerate(submissions_list):
             citations = extended.get(index, regular.get(index, []))
             if index in self_citations:
                 citations = list(set(citations + self_citations[index]))
             self.citation_tracker.add_citations(paper['id'], citations, year)
 
-    def _select_citations_sequential(self, agent, paper, direction, candidates, institution):
+    def select_citations_sequential(self, agent, paper, direction, candidates, institution):
         """Select candidate IDs, preserving the single-request failure policy."""
         prompt, response_format = agent.get_citation_prompt(
             paper=paper, direction=direction, candidate_papers=candidates,
@@ -2707,7 +2735,7 @@ class Simulation:
                 if num_retries >= self.max_retries:
                     raise Exception("Failed to get potential cited papers after 3 retries")
 
-    def _select_self_citations_sequential(self, agent, paper, direction, year):
+    def select_self_citations_sequential(self, agent, paper, direction, year):
         """Return selected self-citations, or None when unavailable or retries fail."""
         logger.info(f"[Self-Citation] Getting self-citations for {agent.id} in year {year}.")
         own_papers = [p for p in self.paper_tracker.get_papers_by_author(agent.id) if p.project_end_year < year]
@@ -2733,31 +2761,31 @@ class Simulation:
                     logger.warning("Failed to get self-citations after retries, skipping self-citation")
                     return None
 
-    def _record_sequential_citations(self, year, directions, submissions_list,
+    def record_sequential_citations(self, year, directions, submissions_list,
                                      topk_indices_citation_accepted, topk_indices_citation_both, accepted_papers_arxiv_ids):
         """Select accepted-paper citations, extend sparse lists, and merge self-citations."""
         for index, paper in enumerate(submissions_list):
-            agent = self.ecosystem.get_agent_by_id(self._get_lead_author_id(paper))
-            candidates = self._build_candidate_papers(
+            agent = self.ecosystem.get_agent_by_id(self.get_lead_author_id(paper))
+            candidates = self.build_candidate_papers(
                 self.rag.documents,
-                self._rerank_citation_candidates(
+                self.rerank_citation_candidates(
                     topk_indices_citation_accepted[index], SIMULATION_CONFIG['citation']['num_candidate_papers']))
             assert {candidate['id'] for candidate in candidates} <= accepted_papers_arxiv_ids, (
                 f"Submitted paper {paper['id']} is trying to cite non-accepted papers")
             institution = getattr(agent, 'university_name', None) or getattr(agent, 'company_name', None)
-            citations = self._select_citations_sequential(agent, paper, directions[agent.id], candidates, institution)
+            citations = self.select_citations_sequential(agent, paper, directions[agent.id], candidates, institution)
             if len(citations) <= SIMULATION_CONFIG['citation']['expected_citation_per_round']:
-                candidates = self._build_candidate_papers(
+                candidates = self.build_candidate_papers(
                     self.rag.documents,
-                    self._rerank_citation_candidates(
+                    self.rerank_citation_candidates(
                         topk_indices_citation_both[index], SIMULATION_CONFIG['citation']['num_candidate_papers']))
-                citations = self._select_citations_sequential(agent, paper, directions[agent.id], candidates, institution)
-            self_citations = self._select_self_citations_sequential(agent, paper, directions[agent.id], year)
+                citations = self.select_citations_sequential(agent, paper, directions[agent.id], candidates, institution)
+            self_citations = self.select_self_citations_sequential(agent, paper, directions[agent.id], year)
             if self_citations is not None:
                 citations = list(set(citations + self_citations))
             self.citation_tracker.add_citations(paper['id'], citations, year)
 
-    def _charge_annual_costs(self, year: int):
+    def charge_annual_costs(self, year: int):
         """Charge annual costs for all active researchers working on projects
 
         Args:
@@ -2768,11 +2796,17 @@ class Simulation:
                 continue
             annual_cost = SIMULATION_CONFIG['conference']['annual_cost']
             from utopia.funding.accounting import project_id
-            if self._account_resources(agent, -annual_cost, category='annual_research_cost',
+            if self.account_resources(agent, -annual_cost, category='annual_research_cost',
                                        year=year, project=project_id(agent)):
                 self.funding_tracker.record_funding_consumption(year, annual_cost, agent.get_type())
 
-    def _run_phase_3_peer_review(self, year: int, year_results: Dict) -> Dict[str, Dict[str, float]]:
+    def review_input(self, paper):
+        """Attach the indexed body only to the review input, not to checkpoints."""
+        if getattr(self, 'fulltext_corpus', None) is None:
+            return paper
+        return dict(paper, full_text=self.fulltext_corpus.text(paper['id']))
+
+    def run_phase_3_peer_review(self, year: int, year_results: Dict) -> Dict[str, Dict[str, float]]:
         """Phase 3: Conduct peer reviews
 
         Args:
@@ -2807,15 +2841,20 @@ class Simulation:
             peer_review_response_format = None
             # Capacity-aware assignment (factor K) is computed up front from a dedicated
             # RNG; the legacy path below is untouched when the flags are off.
-            capacity_assignment = (self._assign_reviewers_with_capacity(year, year_results)
+            capacity_assignment = (self.assign_reviewers_with_capacity(year, year_results)
                                    if self._capacity_mode_on else None)
             for conference in self.conference_system.conferences:
                 for paper in conference.submitted_papers:
+                    if getattr(self.args, 'review_reuse', False) and paper.get('review_history'):
+                        for review in self.reuse_paper_reviews(paper, year):
+                            conference.add_review(paper['id'], review)
+                            reviews_by_reviewer[review['reviewer_id']].append(review['overall_score'])
+                        continue
                     if capacity_assignment is not None:
                         selected_reviewers = capacity_assignment[paper['id']]
                     else:
                         # Assign reviewers (excluding all paper authors + their COIs)
-                        author_ids = self._get_all_author_ids(paper)
+                        author_ids = self.get_all_author_ids(paper)
                         all_coi = set(author_ids)
                         for aid in author_ids:
                             author = self.ecosystem.get_agent_by_id(aid)
@@ -2829,9 +2868,10 @@ class Simulation:
 
                     for reviewer in selected_reviewers:
                         # reviewer: SimulationAgent
-                        author_info = self._build_author_info_for_review(reviewer, paper)
+                        author_info = self.build_author_info_for_review(reviewer, paper)
                         prompt, response_format = reviewer.get_review_prompt(
-                            paper, author_info=author_info, review_policy=self.review_policy)
+                            self.review_input(paper), author_info=author_info, review_policy=self.review_policy,
+                            prompt_variant=getattr(self.args, 'review_prompt_variant', 'original'))
 
                         if peer_review_response_format is None:
                             peer_review_response_format = response_format
@@ -2864,7 +2904,7 @@ class Simulation:
                     # Validate response
                     try:
                         assert all(field in review_json for field in ['overall_score', "justification"])
-                        review_json['overall_score'] = self._cast_review_score(review_json['overall_score'])
+                        review_json['overall_score'] = self.cast_review_score(review_json['overall_score'])
                         review = {
                             'overall_score': review_json['overall_score'],
                             'justification': review_json['justification'],
@@ -2883,7 +2923,7 @@ class Simulation:
                             self.network_metrics.record_review_with_distance(
                                 year=year,
                                 reviewer_id=reviewer.id,
-                                author_id=self._get_lead_author_id(paper),
+                                author_id=self.get_lead_author_id(paper),
                                 distance=ai['network_distance'] if ai else -1,
                                 score=review['overall_score'],
                                 paper_id=paper['id'],
@@ -2913,7 +2953,7 @@ class Simulation:
             for conference in tqdm(self.conference_system.conferences, desc="Peer reviews"):
                 for paper in tqdm(conference.submitted_papers, desc=f"{conference.conference_id}"):
                     # Assign reviewers (excluding all paper authors + their COIs)
-                    author_ids = self._get_all_author_ids(paper)
+                    author_ids = self.get_all_author_ids(paper)
                     all_coi = set(author_ids)
                     for aid in author_ids:
                         author = self.ecosystem.get_agent_by_id(aid)
@@ -2926,12 +2966,12 @@ class Simulation:
                     selected_reviewers = random.sample(reviewers, min(3, len(reviewers)))
 
                     for reviewer in selected_reviewers:
-                        author_info = self._build_author_info_for_review(reviewer, paper)
+                        author_info = self.build_author_info_for_review(reviewer, paper)
                         num_retries = 0
                         review = None
                         while True:
                             try:
-                                review = reviewer.review_paper(paper, author_info=author_info)
+                                review = reviewer.review_paper(self.review_input(paper), author_info=author_info)
                                 conference.add_review(paper['id'], review)
                                 reviews_by_reviewer[reviewer.id].append(review['overall_score'])
 
@@ -2940,7 +2980,7 @@ class Simulation:
                                     self.network_metrics.record_review_with_distance(
                                         year=year,
                                         reviewer_id=reviewer.id,
-                                        author_id=self._get_lead_author_id(paper),
+                                        author_id=self.get_lead_author_id(paper),
                                         distance=author_info['network_distance'] if author_info else -1,
                                         score=review['overall_score'],
                                         paper_id=paper['id'],
@@ -2980,6 +3020,13 @@ class Simulation:
             'reviews_conducted': sum(len(c.reviews) for c in self.conference_system.conferences),
             'score_metrics': conference_score_metrics,
         }
+        reports = [review for conference in self.conference_system.conferences
+                   for reviews in conference.reviews.values() for review in reviews]
+        year_results['peer_review'].update({
+            'new_reports': sum(not report.get('reused', False) for report in reports),
+            'reused_reports': sum(bool(report.get('reused', False)) for report in reports),
+            'total_reports': len(reports),
+        })
 
         # Process received reviews for authors
         logger.info(f"Year {year} Phase 3: Processing author experiences from received reviews...")
@@ -2988,18 +3035,31 @@ class Simulation:
                 paper_reviews = conference.reviews.get(paper['id'], [])
                 if paper_reviews:
                     # Send reviews to ALL co-authors
-                    for aid in self._get_all_author_ids(paper):
+                    for aid in self.get_all_author_ids(paper):
                         author = self.ecosystem.get_agent_by_id(aid)
                         author.process_received_reviews(paper_reviews, paper_id=paper['id'], year=year,
                                                         average_scores_of_venue=average_scores[conference.conference_id])
 
         return average_scores
 
-    def _cast_review_score(self, value):
+    def reuse_paper_reviews(self, paper, year):
+        """Reuse the last complete report set; the resubmission phase still charges its fee."""
+        from copy import deepcopy
+        previous = paper['review_history'][-1]['reviews']
+        if len(previous) != self.reviews_per_paper:
+            raise ValueError(f"Cannot reuse incomplete report set for {paper['id']}")
+        reports = deepcopy(previous)
+        for review in reports:
+            review['reused'] = True
+            review['source_year'] = review.get('source_year', review['year'])
+            review['year'] = year
+        return reports
+
+    def cast_review_score(self, value):
         """--review_score_mode: 'int' (legacy truncation) or 'float' (keep decimals)."""
         return float(value) if self.review_score_mode == 'float' else int(value)
 
-    def _assign_reviewers_with_capacity(self, year: int, year_results: Dict) -> Dict[str, List]:
+    def assign_reviewers_with_capacity(self, year: int, year_results: Dict) -> Dict[str, List]:
         """Capacity-aware reviewer assignment (scale experiment factor K).
 
         reviews per paper r = min(reviews_per_paper, floor(c * N_reviewers / N_submissions))
@@ -3054,7 +3114,7 @@ class Simulation:
         assignment = {}
         for idx in order:
             paper = papers[idx]
-            author_ids = self._get_all_author_ids(paper)
+            author_ids = self.get_all_author_ids(paper)
             all_coi = set(author_ids)
             for aid in author_ids:
                 author = self.ecosystem.get_agent_by_id(aid)
@@ -3092,7 +3152,7 @@ class Simulation:
                     f"r={r}, cap={c}, max load {max(loads)}")
         return assignment
 
-    def _fixed_budget_slots(self, eval_metadata: List[Dict]) -> Tuple[Dict[str, int], Dict]:
+    def fixed_budget_slots(self, eval_metadata: List[Dict]) -> Tuple[Dict[str, int], Dict]:
         """--funding_budget_mode fixed: annual agency slots anchored to N0.
 
         total_slots = round(f * N0); split across programs by largest remainder over this
@@ -3118,7 +3178,7 @@ class Simulation:
         }
         return slot_override, info
 
-    def _run_phase_4_acceptance_decisions(self, year: int, year_results: Dict):
+    def run_phase_4_acceptance_decisions(self, year: int, year_results: Dict):
         """Phase 4: Make acceptance decisions
 
         Args:
@@ -3167,7 +3227,7 @@ class Simulation:
 
         logger.info(f"  Accepted: {total_accepted}, Rejected: {total_rejected}")
 
-    def _validate_single_funding_proposal(self, proposal, metadata):
+    def validate_single_funding_proposal(self, proposal, metadata):
         """Validate a single-program funding proposal from batch generation.
 
         Returns:
@@ -3211,7 +3271,7 @@ class Simulation:
 
         return True, proposal, "ok"
 
-    def _run_phase_5_update_funding(self, year: int, submissions_list: List[Dict], year_results: Dict):
+    def run_phase_5_update_funding(self, year: int, submissions_list: List[Dict], year_results: Dict):
         """Allocate industry income, collect and evaluate grants, then close the funding cycle."""
         logger.info(f"Year {year} Phase 5: Updating funding...")
         consumed = self.funding_tracker.get_funding_consumption(year)
@@ -3222,16 +3282,16 @@ class Simulation:
             agent for agent in self.ecosystem.agent_population.values()
             if isinstance(agent, FundingAgency)
         ]
-        self._allocate_industry_funding(year, active_papers, year_results)
-        applications = self._collect_funding_applications(year, funding_agencies)
+        self.allocate_industry_funding(year, active_papers, year_results)
+        applications = self.collect_funding_applications(year, funding_agencies)
         cost_events = charge_application_costs(
             applications, getattr(self.args, 'funding_application_cost', 0) or 0, year)
-        winners = self._evaluate_funding_applications(year, applications, funding_agencies, year_results)
-        funding_per_unit = self._allocate_university_funding(year, winners, active_papers)
-        self._record_funding_costs(year, cost_events, winners, funding_per_unit)
-        self._finish_funding_cycle(year, year_results, winners, applications)
+        winners = self.evaluate_funding_applications(year, applications, funding_agencies, year_results)
+        funding_per_unit = self.allocate_university_funding(year, winners, active_papers)
+        self.record_funding_costs(year, cost_events, winners, funding_per_unit)
+        self.finish_funding_cycle(year, year_results, winners, applications)
 
-    def _allocate_industry_funding(self, year, active_papers_dataframe, year_results):
+    def allocate_industry_funding(self, year, active_papers_dataframe, year_results):
         """Credit accepted industry papers using the configured annual funding rule."""
         logger.info(f"[Funding Allocation] Update fundings for industry researchers in year {year}")
         # Calculate the number of recipients of industry funding
@@ -3245,7 +3305,7 @@ class Simulation:
             industry_funding_per_unit = 0
         elif self.funding_budget_mode == 'fixed':
             # factor R for the industry sector: fixed annual pool instead of pay-per-paper
-            industry_funding_per_unit, industry_budget_info = self._fixed_industry_pool_per_unit(int(denominator))
+            industry_funding_per_unit, industry_budget_info = self.fixed_industry_pool_per_unit(int(denominator))
             year_results['funding_budget_industry'] = industry_budget_info
             logger.info(f"Year {year} fixed industry pool: {industry_budget_info['pool']} for "
                         f"{industry_budget_info['maturity_units_accepted']} maturity units")
@@ -3268,11 +3328,11 @@ class Simulation:
                 )
                 if new_budget <= 0:
                     continue
-                if self._account_resources(agent, int(new_budget), category='industry_income',
+                if self.account_resources(agent, int(new_budget), category='industry_income',
                                            year=year, paper=paper['id']):
                     self.funding_tracker.record_funding_allocation(year, new_budget, 'industry')
 
-    def _collect_funding_applications(self, year, funding_agencies):
+    def collect_funding_applications(self, year, funding_agencies):
         """Prepare each selected program and group successful proposals by applicant."""
         # Batch process university researcher funding applications
         all_programs = {pid: program for funding_agent in funding_agencies for pid, program in funding_agent.funding_programs.items()}
@@ -3310,10 +3370,10 @@ class Simulation:
         if not batch_prompts:
             return []
         if hasattr(self.llm, 'generate_batch'):
-            successful_items = self._generate_funding_applications_batch(
+            successful_items = self.generate_funding_applications_batch(
                 year, all_programs, batch_prompts, batch_metadata, funding_response_format)
         else:
-            successful_items = self._generate_funding_applications_sequential(batch_prompts, batch_metadata)
+            successful_items = self.generate_funding_applications_sequential(batch_prompts, batch_metadata)
 
         agent_applications = {}
         for agent_id, program_id, app_data, agent in successful_items:
@@ -3321,7 +3381,7 @@ class Simulation:
             agent_applications.setdefault(agent_id, {})[program_id] = app_data
         return list(agent_applications.values())
 
-    def _generate_funding_applications_batch(self, year, all_programs, batch_prompts, batch_metadata, funding_response_format):
+    def generate_funding_applications_batch(self, year, all_programs, batch_prompts, batch_metadata, funding_response_format):
         """Retry failed proposal requests while retaining successful proposals in arrival order."""
         MAX_FUNDING_RETRIES = 5
         # Collect successful (agent_id, program_id, app_data) tuples
@@ -3350,7 +3410,7 @@ class Simulation:
                 agent = meta['agent']
                 program_id = meta['program_id']
 
-                is_valid, cleaned, reason = self._validate_single_funding_proposal(proposal, meta)
+                is_valid, cleaned, reason = self.validate_single_funding_proposal(proposal, meta)
                 if not is_valid:
                     logger.warning(f"Funding proposal invalid for agent {agent.id} program {program_id} (attempt {attempt+1}): {reason}")
                     items_needing_retry.append(meta)
@@ -3384,7 +3444,7 @@ class Simulation:
 
         return successful_items
 
-    def _generate_funding_applications_sequential(self, batch_prompts, batch_metadata):
+    def generate_funding_applications_sequential(self, batch_prompts, batch_metadata):
         """Generate proposals with the existing single-request retry behavior."""
         sequential_items = []
         for i, prompt in enumerate(tqdm(batch_prompts, desc="Generating funding applications")):
@@ -3396,7 +3456,7 @@ class Simulation:
                 try:
                     proposal, _ = self.llm.generate(prompt=prompt)
 
-                    is_valid, cleaned, reason = self._validate_single_funding_proposal(proposal, metadata)
+                    is_valid, cleaned, reason = self.validate_single_funding_proposal(proposal, metadata)
                     if not is_valid:
                         raise ValueError(f"Invalid proposal: {reason}")
 
@@ -3413,17 +3473,28 @@ class Simulation:
 
         return sequential_items
 
-    def _rank_funding_applications(self, year, all_funding_proposal_eval_prompts, all_eval_metadata, eval_response_format):
+    def rank_funding_applications(self, year, all_funding_proposal_eval_prompts, all_eval_metadata, eval_response_format):
         """Retry invalid rankings and preserve final failures for the configured fallback."""
         MAX_FUNDING_EVAL_RETRIES = 3
         final_eval_results = []
         final_eval_metadata = []
+        strict = getattr(getattr(self, 'args', None), 'strict_funding_rankings', False)
+        if strict:
+            from utopia.funding.validation import inspect_funding_result
 
         for attempt in range(MAX_FUNDING_EVAL_RETRIES):
             if not all_funding_proposal_eval_prompts:
                 break
 
             if hasattr(self.llm, 'generate_batch'):
+                panel_formats = {}
+                if strict:
+                    if not getattr(self.llm, 'supports_response_formats', False):
+                        raise ValueError("Strict panel schemas require a backend with per-request schema support")
+                    panel_formats['response_formats'] = [
+                        FundingAgency.mapped_evaluation_format(meta['apps'])
+                        for meta in all_eval_metadata
+                    ]
                 # Ranking ALL panel applications produces long JSON after thinking
                 # tokens; the 2048 default truncated ~13% of program-years in E3.
                 eval_results = self.llm.generate_batch(
@@ -3431,6 +3502,7 @@ class Simulation:
                     max_tokens=8192,
                     desc=f"{len(all_funding_proposal_eval_prompts)} funding evaluations (attempt {attempt+1}/{MAX_FUNDING_EVAL_RETRIES})",
                     seed_ctx=('phase5_funding_eval', year, attempt),
+                    **panel_formats,
                 )
             else:
                 eval_results = []
@@ -3443,7 +3515,11 @@ class Simulation:
             retry_metadata = []
 
             for i, (result, msg_hist) in enumerate(eval_results):
-                if FundingAgency.validate_funding_result(result, all_eval_metadata[i]['apps']):
+                apps = all_eval_metadata[i]['apps']
+                valid = FundingAgency.validate_funding_result(result, apps)
+                if strict:
+                    valid = valid and inspect_funding_result(result, apps)['valid']
+                if valid:
                     final_eval_results.append((result, msg_hist))
                     final_eval_metadata.append(all_eval_metadata[i])
                     continue
@@ -3453,6 +3529,11 @@ class Simulation:
                     retry_prompts.append(all_funding_proposal_eval_prompts[i])
                     retry_metadata.append(all_eval_metadata[i])
                     continue
+                if strict:
+                    raise RuntimeError(
+                        f"Incomplete funding ranking in year {year}, program {program_id}, "
+                        f"panel {all_eval_metadata[i]['panel_index']}; saved replies retained"
+                    )
                 # Preserve final failures for the funding evaluator's fallback.
                 final_eval_results.append((result, msg_hist))
                 final_eval_metadata.append(all_eval_metadata[i])
@@ -3465,7 +3546,7 @@ class Simulation:
 
         return final_eval_results, final_eval_metadata
 
-    def _evaluate_funding_applications(self, year, university_applications, funding_agencies, year_results):
+    def evaluate_funding_applications(self, year, university_applications, funding_agencies, year_results):
         """Build funding panels and apply the configured ranking, novelty, and budget rules."""
         # Evaluate applications across all funding agencies
         all_funding_winners_dict, all_funding_programs_dict = {}, {}
@@ -3501,7 +3582,7 @@ class Simulation:
 
         if not all_funding_proposal_eval_prompts:
             return {}
-        final_eval_results, final_eval_metadata = self._rank_funding_applications(
+        final_eval_results, final_eval_metadata = self.rank_funding_applications(
             year, all_funding_proposal_eval_prompts, all_eval_metadata, eval_response_format)
         # Step 3: Process all results (valid + any final failures with fallback).
         # Funding-conservatism intervention: novelty penalties are applied to
@@ -3511,7 +3592,7 @@ class Simulation:
         if self.is_exploration_experiment and getattr(self.args, 'funding_intervention', False):
             applicant_ids = list({app['applicant_id']
                                   for meta in final_eval_metadata for app in meta['apps']})
-            novelty_penalties = self._compute_recent_novelty_percentiles(applicant_ids)
+            novelty_penalties = self.compute_recent_novelty_percentiles(applicant_ids)
             lambda_funding = SIMULATION_CONFIG['exploration_experiment']['novelty_penalty_in_funding']
 
         # Matthew-RD experiment: persist full pre-decision rankings so the
@@ -3522,7 +3603,7 @@ class Simulation:
         # per-program int(n x rate) rule; 'track' (default) passes None.
         slot_override = None
         if self.funding_budget_mode == 'fixed':
-            slot_override, budget_info = self._fixed_budget_slots(final_eval_metadata)
+            slot_override, budget_info = self.fixed_budget_slots(final_eval_metadata)
             year_results['funding_budget'] = budget_info
             logger.info(f"Year {year} fixed agency budget: {budget_info['total_slots']} slots "
                         f"for {budget_info['total_applications']} applications")
@@ -3543,7 +3624,7 @@ class Simulation:
 
         return all_funding_winners_dict
 
-    def _allocate_university_funding(self, year, all_funding_winners_dict, active_papers_dataframe):
+    def allocate_university_funding(self, year, all_funding_winners_dict, active_papers_dataframe):
         """Credit each awarded program and update funding history once per applied credit."""
         winners_list = [winner['applicant_id'] for winners in all_funding_winners_dict.values() for winner in winners]
         active_papers_dataframe = active_papers_dataframe.set_index('author_id')
@@ -3572,7 +3653,7 @@ class Simulation:
 
                 funding_to_researcher = academic_funding_per_unit
 
-                applied = self._account_resources(agent, funding_to_researcher, category='grant_income',
+                applied = self.account_resources(agent, funding_to_researcher, category='grant_income',
                                                   year=year, program=program_id)
                 if not applied:
                     continue
@@ -3584,7 +3665,7 @@ class Simulation:
 
         return academic_funding_per_unit
 
-    def _record_funding_costs(self, year, funding_cost_events, all_funding_winners_dict, academic_funding_per_unit):
+    def record_funding_costs(self, year, funding_cost_events, all_funding_winners_dict, academic_funding_per_unit):
         """Write application costs after awards so records include final balances."""
         if not funding_cost_events:
             return
@@ -3605,7 +3686,7 @@ class Simulation:
         logger.info(f"Funding cost log: {len(funding_cost_events)} records "
                     f"-> {cost_log_path}")
 
-    def _finish_funding_cycle(self, year, year_results, all_funding_winners_dict, university_applications):
+    def finish_funding_cycle(self, year, year_results, all_funding_winners_dict, university_applications):
         """Apply the legacy attrition rule and record resources and ecosystem statistics."""
         for agent_id, agent in self.ecosystem.agent_population.items():
             if getattr(agent, 'resources', None) and agent.resources <= 10 and hasattr(agent,
@@ -3638,7 +3719,7 @@ class Simulation:
         # Get conference statistics
         year_results['conference_statistics'] = self.conference_system.get_all_statistics()
 
-    def _apply_strategy_quality_adjustment(self, year: int):
+    def apply_strategy_quality_adjustment(self, year: int):
         """SYNTHETIC STRESS TEST ONLY — never part of the main (neutral) results.
 
         Adds strategy-dependent bias/variance noise directly to review scores.
@@ -3659,7 +3740,7 @@ class Simulation:
 
         for conference in self.conference_system.conferences:
             for paper in conference.submitted_papers:
-                lead_id = self._get_lead_author_id(paper)
+                lead_id = self.get_lead_author_id(paper)
                 agent = self.ecosystem.get_agent_by_id(lead_id)
                 strategy = getattr(agent, 'exploration_strategy', 'balanced')
 
@@ -3672,7 +3753,7 @@ class Simulation:
                     adjustment = np.random.normal(bias, variance)
                     review['overall_score'] = max(1, min(10, review['overall_score'] + adjustment))
 
-    def _assign_citation_potential(self, year: int):
+    def assign_citation_potential(self, year: int):
         """Assign a deterministic latent citation-potential multiplier to each
         newly accepted paper (plan 6.3).
 
@@ -3701,7 +3782,7 @@ class Simulation:
                     np.exp(rng.gauss(0.15 * q, 0.10 + 0.40 * q)), clip_lo, clip_hi))
                 self._citation_potential_multipliers[paper['id']] = multiplier
 
-    def _compute_recent_novelty_percentiles(self, applicant_ids: List[str]) -> Dict[str, float]:
+    def compute_recent_novelty_percentiles(self, applicant_ids: List[str]) -> Dict[str, float]:
         """Recent-novelty percentile per applicant for the funding-conservatism
         intervention (plan 6.2). Percentiles are computed among the given
         applicants; applicants with no scored papers get 0.0."""
@@ -3720,7 +3801,7 @@ class Simulation:
                 if aid in avg_novelty else 0.0
                 for aid in applicant_ids}
 
-    def _rerank_citation_candidates(self, indices, k: int):
+    def rerank_citation_candidates(self, indices, k: int):
         """Select k citation candidates from semantically ranked indices.
 
         Neutral mode: top-k by semantic rank (unchanged legacy behavior).
@@ -3756,56 +3837,56 @@ class Simulation:
             Dictionary with year results
         """
         # Year setup
-        year_results = self._setup_year(year)
+        year_results = self.setup_year(year)
 
         # Phase 0: Resubmissions (year 2+)
-        resubmissions_list = self._run_phase_0_resubmissions(year, year_results)
+        resubmissions_list = self.run_phase_0_resubmissions(year, year_results)
         self.wandb_logger.log_phase(year, 0, year_results, self, num_resubmissions=len(resubmissions_list))
 
         # Phase 1: Assign research directions
-        directions, active_authors, avg_funding = self._run_phase_1_research_directions(year, year_results)
+        directions, active_authors, avg_funding = self.run_phase_1_research_directions(year, year_results)
         self.wandb_logger.log_phase(year, 1, year_results, self, num_active_authors=len(active_authors), avg_funding=avg_funding)
 
         # Phase 1.5: Collaboration formation (preferential_attachment experiment only)
-        self._run_phase_1_5_collaboration_formation(year, directions, active_authors, year_results)
+        self.run_phase_1_5_collaboration_formation(year, directions, active_authors, year_results)
 
         # Phase 2: Generate and submit papers
-        submissions_list = self._run_phase_2_submit_papers(
+        submissions_list = self.run_phase_2_submit_papers(
             year, directions, active_authors, resubmissions_list, year_results
         )
         # Batched metadata (keywords + embeddings + novelty) for all new papers this year
-        self._record_paper_metadata_batch(year)
+        self.record_paper_metadata_batch(year)
         self.wandb_logger.log_phase(year, 2, year_results, self)
 
         # Charge annual costs
-        self._charge_annual_costs(year)
+        self.charge_annual_costs(year)
 
         # Phase 3: Peer review
-        average_scores = self._run_phase_3_peer_review(year, year_results)
+        average_scores = self.run_phase_3_peer_review(year, year_results)
         self.wandb_logger.log_phase(year, 3, year_results, self)
 
         # Apply strategy-dependent quality adjustment (between review and acceptance)
-        self._apply_strategy_quality_adjustment(year)
+        self.apply_strategy_quality_adjustment(year)
 
         # Phase 4: Make acceptance decisions
-        self._run_phase_4_acceptance_decisions(year, year_results)
+        self.run_phase_4_acceptance_decisions(year, year_results)
         self.wandb_logger.log_phase(year, 4, year_results, self)
 
         # Assign latent citation-potential metadata to newly accepted papers
-        self._assign_citation_potential(year)
+        self.assign_citation_potential(year)
 
         # Phase 5: Update funding
-        self._run_phase_5_update_funding(year, submissions_list, year_results)
+        self.run_phase_5_update_funding(year, submissions_list, year_results)
 
         # Collect exploration metrics (if enabled)
-        self._collect_exploration_metrics(year)
+        self.collect_exploration_metrics(year)
 
         # Graph/temporal integrity checks, written per year (exploration experiment)
         if self.is_exploration_experiment:
-            self._run_integrity_checks(year)
+            self.run_integrity_checks(year)
 
         # Collect preferential attachment metrics (if enabled)
-        self._collect_preferential_attachment_metrics(year)
+        self.collect_preferential_attachment_metrics(year)
 
         # Get conference statistics
         year_results['conference_statistics'] = self.conference_system.get_all_statistics()
@@ -3882,6 +3963,11 @@ class Simulation:
                 agents=research_agents,
                 num_conferences=num_conferences
             )
+            from utopia.agents.conference import make_venue_variants
+            selected_conferences = make_venue_variants(
+                selected_conferences, getattr(self.args, 'venue_regime', 'baseline'),
+                seed=getattr(self.args, 'seed', 42),
+            )
 
             # Create conference system with selected conferences
             self.conference_system = ConferenceSystem(conferences=selected_conferences)
@@ -3915,9 +4001,9 @@ class Simulation:
         for year in range(start_year, self.num_years + 1):
             year_results = self.run_one_round(year)
             self.yearly_results.append(year_results)
-            self._save_checkpoint(year, phase=5)
+            self.save_checkpoint(year, phase=5)
         # Generate final report
-        self._generate_final_report()
+        self.generate_final_report()
         self.wandb_logger.finish()
 
         write_run_manifest(
@@ -3930,7 +4016,7 @@ class Simulation:
         logger.info("\nSimulation completed!")
         logger.info(f"Results saved to: {self.output_dir}")
 
-    def _save_checkpoint(self, year: int, phase: int = 5):
+    def save_checkpoint(self, year: int, phase: int = 5):
         """Save complete simulation state as checkpoint
 
         Args:
@@ -3944,6 +4030,7 @@ class Simulation:
         checkpoint_data = {
             'year': year,
             'phase': phase,
+            'rng_state': capture_rng_state(),
             'ecosystem_data': self.ecosystem.to_dict(),
             'conference_system': self.conference_system.to_dict(),
             'citation_tracker': self.citation_tracker.to_dict(),
@@ -4025,7 +4112,11 @@ class Simulation:
             checkpoint_path += '.gz'
         checkpoint_data = read_json(checkpoint_path)
 
-        from utopia.funding.accounting import resolve_cost_policy, cost_policy_enabled, ResourceLedger
+        from utopia.funding.accounting import (
+            ResourceLedger,
+            cost_policy_enabled,
+            resolve_cost_policy,
+        )
         current_policy = getattr(self, 'cost_policy', resolve_cost_policy(self.args, SIMULATION_CONFIG))
         saved_policy = checkpoint_data.get('project_cost_policy')
         if saved_policy is not None and saved_policy != current_policy:
@@ -4086,7 +4177,7 @@ class Simulation:
         self.initial_university_count = checkpoint_data.get('initial_university_count')
         self.initial_industry_count = checkpoint_data.get('initial_industry_count')
         if self.initial_university_count is None or self.initial_industry_count is None:
-            self._record_initial_university_count()
+            self.record_initial_university_count()
             if self.funding_budget_mode == 'fixed':
                 logger.warning("Checkpoint has no initial_university_count; using current count as N0")
 
@@ -4154,12 +4245,15 @@ class Simulation:
                 self._collaboration_pairs = {int(k): v for k, v in pa_data['collaboration_pairs'].items()}
                 logger.info(f"  Loaded {len(self._collaboration_pairs)} collaboration pair records")
 
+        if checkpoint_data.get('rng_state'):
+            restore_rng_state(checkpoint_data['rng_state'])
+
         logger.info(f"Checkpoint loaded successfully from year {checkpoint_data['year']}")
         logger.info(f"  Loaded {len(self.ecosystem.agent_population)} agents")
         logger.info(f"  Loaded {len(self.submitted_paper_ids)} submitted paper IDs")
         return True
 
-    def _generate_final_report(self):
+    def generate_final_report(self):
         """Generate final simulation report using analyzer module"""
         report_file = os.path.join(self.output_dir, "simulation_report.json")
 
@@ -4173,6 +4267,9 @@ class Simulation:
 def main():
     """Main entry point"""
 
+    import signal
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
     project_setup()
 
     args = parse_arguments()
@@ -4183,7 +4280,18 @@ def main():
 
     # Auto-select LLM based on model name
     t0 = time.time()
-    if "gpt" in args.model:
+    if args.backend == 'bedrock':
+        llm = BedrockModel(
+            model_name=args.model, max_concurrent_requests=args.batch_size,
+            run_seed=args.seed, stop_at_utc=args.stop_at_utc,
+            response_cache_path=(os.path.join(args.log_dir, 'model_replies.jsonl')
+                                 if args.save_model_replies else None),
+            completion_token_floor=args.completion_token_floor or 32768,
+            input_tokens_per_minute=args.input_tokens_per_minute,
+            output_tokens_per_minute=args.output_tokens_per_minute,
+            api_budget_usd=args.api_budget_usd,
+        )
+    elif "gpt" in args.model:
         logger.info(f"Using OpenAI API for model: {args.model}")
         llm = GPT(model_name=args.model)
 
@@ -4197,6 +4305,12 @@ def main():
             base_url=args.vllm_url,
             max_concurrent_requests=args.batch_size,
             run_seed=args.seed,
+            response_cache_path=(
+                os.path.join(args.log_dir, 'model_replies.jsonl')
+                if args.save_model_replies else None),
+            stop_at_utc=args.stop_at_utc,
+            completion_token_floor=args.completion_token_floor,
+            thinking_token_budget=args.thinking_token_budget,
         )
     else:
         # Any non-OpenAI model uses vLLM (e.g., "Qwen/Qwen3-8B", "meta-llama/Llama-3-8B")

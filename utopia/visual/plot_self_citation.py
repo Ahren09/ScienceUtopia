@@ -37,7 +37,6 @@ Run
     default; override with --out)
 """
 
-from utopia.analysis.statistics import wilson_ci
 import argparse
 import os
 
@@ -46,7 +45,14 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 
-from utopia.visual.common import ACCENT_COOL, INK, STRATEGY_NICE, STRATEGY_PALETTE, nature_style
+from utopia.analysis.statistics import wilson_ci
+from utopia.visual.common import (
+    ACCENT_COOL,
+    INK,
+    STRATEGY_NICE,
+    STRATEGY_PALETTE,
+    nature_style,
+)
 
 DEFAULT_ANALYSIS_DIR = 'outputs/docs/self_citation_e4a'
 DEFAULT_OUT = 'outputs/visual/self_citation_e4a/fig_self_citation.pdf'
@@ -55,7 +61,7 @@ STRATEGY_ORDER = ['explorer', 'cautious_explorer', 'exploiter']
 
 
 
-def _rates_ci(ks, ns):
+def rates_ci(ks, ns):
     """Percent-scale rates with asymmetric Wilson CI half-widths (2, n)."""
     rates = np.array([100 * k / n for k, n in zip(ks, ns)])
     los, his = zip(*[wilson_ci(k, n, clip_lower=True) for k, n in zip(ks, ns)])
@@ -81,7 +87,7 @@ def main():
     fig, axes = plt.subplots(1, 2, figsize=(3.2, 1.6), dpi=300)
 
     # (a) forest-style dot-and-whisker: rate by strategy, pooled over 3 seeds
-    rates, err = _rates_ci(pooled['n_self'].values, pooled['n_edges'].values)
+    rates, err = rates_ci(pooled['n_self'].values, pooled['n_edges'].values)
     ys = np.arange(len(STRATEGY_ORDER))[::-1]  # explorer on top
     # axes[0].axvline(0, ls='--', lw=0.7, color=INK, zorder=1)
     for y, s, r, e_lo, e_hi in zip(ys, STRATEGY_ORDER, rates, err[0], err[1]):
@@ -104,7 +110,7 @@ def main():
     axes[0].set_xlabel('Self-citation rate (%)')
 
     # (b) dot-and-whisker over career-funding quartiles, connected
-    rates, err = _rates_ci(funding['n_self'].values, funding['n_edges'].values)
+    rates, err = rates_ci(funding['n_self'].values, funding['n_edges'].values)
     x = np.arange(len(funding))
     axes[1].plot(x, rates, color=ACCENT_COOL, lw=1.1, zorder=2)
     axes[1].errorbar(x, rates, yerr=err, fmt='o', ms=3.6, color=ACCENT_COOL,

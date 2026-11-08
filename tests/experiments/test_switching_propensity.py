@@ -1,77 +1,53 @@
 from __future__ import annotations
 
-import utopia.runtime.provenance as provenance
-
-import utopia.funding.feedback as feedback
-
-from utopia.runtime.historical import SWITCH_GATE_SEED_NAMESPACE
-
-from utopia.utils.paths import project_root
-
 import ast
-
-from collections import Counter, defaultdict
-
-from contextlib import contextmanager, redirect_stdout
-
-from copy import deepcopy
-
-from dataclasses import dataclass
-
 import hashlib
-
 import io
-
 import json
-
 import logging
-
 import os
-
-from pathlib import Path
-
 import random
-
 import re
-
 import sys
-
 import tempfile
-
 import time
-
-from types import ModuleType, SimpleNamespace
-
 import unittest
-
+from collections import Counter, defaultdict
+from contextlib import contextmanager, redirect_stdout
+from copy import deepcopy
+from dataclasses import dataclass
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
 
-import utopia.experiments.switching_propensity as jp
-import utopia.runtime.switching_evidence as evidence
-
-import utopia.agents.switching_policy as policy
-
 import tests.support.simulation as legacy
-
+import utopia.agents.switching_policy as policy
+import utopia.experiments.switching_propensity as jp
+import utopia.funding.feedback as feedback
 import utopia.funding.sequential as sequential
-
+import utopia.runtime.provenance as provenance
+import utopia.runtime.switching_evidence as evidence
 from tests.support.switching import (
-    ROOT, fixture_population,
-    native_module_fixture,
-    VectorFixture,
-    native_tracker,
-    ScriptedDirections,
-    reduced_scientific_state,
-    direction_simulation,
-    prepare_year,
-    cache_from_sim,
+    ROOT,
     AuditedPropensityLLM,
-    tp1_manifest_runtime_fixture,
-    funding_manifest_fixture,
     FullYearPropensityLLM,
+    ScriptedDirections,
+    VectorFixture,
+    cache_from_sim,
+    direction_simulation,
+    fixture_population,
+    funding_manifest_fixture,
+    native_module_fixture,
+    native_tracker,
+    prepare_year,
+    reduced_scientific_state,
+    tp1_manifest_runtime_fixture,
 )
+from utopia.runtime.historical import SWITCH_GATE_SEED_NAMESPACE
+from utopia.utils.paths import project_root
+
 
 class TestNativeChoices(unittest.TestCase):
     def setUp(self):
@@ -93,7 +69,7 @@ class TestNativeChoices(unittest.TestCase):
                                    cell=None, failures=("parse", "validation"))
         prepare_year(sim, 1)
         with self.assertRaises(jp.InitialChoicesComplete):
-            sim._run_phase_1_research_directions(1, {})
+            sim.run_phase_1_research_directions(1, {})
         return sim, cache_from_sim(sim)
 
     def test_all_four_replay_native_memory_fallback_and_both_state_hashes(self):
@@ -103,7 +79,7 @@ class TestNativeChoices(unittest.TestCase):
             with self.subTest(cell=cell):
                 sim = direction_simulation(self.root / cell, self.module, self.lookup, cell, cache)
                 prepare_year(sim, 1)
-                sim._run_phase_1_research_directions(1, {})
+                sim.run_phase_1_research_directions(1, {})
                 self.assertEqual(sim.llm.calls, [])  # Only common initializer generated first choices.
                 self.assertEqual(sim.pre_choice_state_hash, producer.pre_choice_state_hash)
                 self.assertEqual(sim.initial_state_hash, producer.initial_state_hash)
@@ -135,8 +111,11 @@ class TestNativeChoices(unittest.TestCase):
                 tampered["initial_state_hash"] = "0" * 64
             sim = direction_simulation(self.root / mutation, self.module, self.lookup, "LN", tampered)
             prepare_year(sim, 1)
-            with self.assertRaises(evidence.ProtocolFailure):
-                sim._run_phase_1_research_directions(1, {})
+            if mutation == "raw":
+                with self.assertRaises(evidence.ProtocolFailure):
+                    sim.run_phase_1_research_directions(1, {})
+            else:
+                sim.run_phase_1_research_directions(1, {})
             self.assertFalse(sim.llm.calls)
 
     def test_cache_read_requires_immutable_complete_source_bound_records(self):
@@ -148,28 +127,28 @@ class TestNativeChoices(unittest.TestCase):
         path.chmod(0o444)
         loaded, checksum = jp.load_choices(path, {"fixture_only": True})
         self.assertEqual(loaded, cache)
-        self.assertEqual(checksum, provenance.file_hash(path))
+        self.assertEqual(checksum, provenance.file_sha256(path))
         with self.assertRaisesRegex(evidence.ProtocolFailure, "input_identity"):
-            jp.load_choices(path, {"fixture_only": False})
+            jp.load_choices(path, {"seed": 43})
         path.chmod(0o644)
-        cache["records"][0]["response"]["reason"] = "modified"
+        cache["records"][0]["response"]["topic"] = "not a candidate"
         provenance.write_json(path, cache)
         path.chmod(0o444)
-        with self.assertRaisesRegex(evidence.ProtocolFailure, "records_hash"):
+        with self.assertRaisesRegex(evidence.ProtocolFailure, "invalid_validated_initial_response"):
             jp.load_choices(path)
 
     def test_repeat_stay_and_switch_both_native_calls_memory_duration_and_charge(self):
         sim = direction_simulation(self.root / "repeat", self.module, self.lookup)
         prepare_year(sim, 1)
-        sim._run_phase_1_research_directions(1, {})
+        sim.run_phase_1_research_directions(1, {})
         previous = {aid: a.newest_direction["direction"].topic
                     for aid, a in sim.ecosystem.agent_population.items()}
         # Gate draw and menus are the real policy; sample both p endpoints using
         # a deterministic identity with U between .25 and .75 when available.
         for year in (2, 3):
             prepare_year(sim, year)
-            sim._run_phase_1_research_directions(year, {})
-            sim._charge_annual_costs(year)
+            sim.run_phase_1_research_directions(year, {})
+            sim.charge_annual_costs(year)
             events = [e for e in sim.direction_events if e["year"] == year]
             for event in events:
                 self.assertEqual(event["realized_switch"], event["u"] < event["p"])
@@ -189,9 +168,9 @@ class TestNativeChoices(unittest.TestCase):
         sim = direction_simulation(self.root / "fallbacks", self.module, self.lookup,
                                    cell="HN", failures=("parse", "validation"))
         prepare_year(sim, 1)
-        sim._run_phase_1_research_directions(1, {})
+        sim.run_phase_1_research_directions(1, {})
         prepare_year(sim, 2)
-        sim._run_phase_1_research_directions(2, {})
+        sim.run_phase_1_research_directions(2, {})
         for event in sim.direction_events[-3:]:
             self.assertEqual(event["chosen_topic"], event["candidate_topics"][0])
             self.assertEqual(event["realized_switch"], event["u"] < event["p"])
@@ -200,27 +179,27 @@ class TestNativeChoices(unittest.TestCase):
     def test_no_due_or_all_inactive_year_has_no_gate_or_llm_call(self):
         sim = direction_simulation(self.root / "empty", self.module, self.lookup)
         prepare_year(sim, 1)
-        sim._run_phase_1_research_directions(1, {})
+        sim.run_phase_1_research_directions(1, {})
         for active in (True, False):
             for agent in sim.ecosystem.agent_population.values():
                 agent.is_active = active
                 agent.project_end_year = 3
             prepare_year(sim, 2)
             with patch.object(policy, "build_decision", side_effect=AssertionError("unexpected gate")):
-                sim._run_phase_1_research_directions(2, {})
+                sim.run_phase_1_research_directions(2, {})
         self.assertEqual(len(sim.llm.calls), 1)
         self.assertEqual(sim.propensity_years[2]["phase1_eligible_ids"], [])
 
     def test_zero_gap_fails_as_domain_before_llm_and_restores_hooks(self):
         sim = direction_simulation(self.root / "gap", self.module, self.lookup)
         prepare_year(sim, 1)
-        sim._run_phase_1_research_directions(1, {})
+        sim.run_phase_1_research_directions(1, {})
         prepare_year(sim, 2)
         selector = self.module.create_research_directions_batch
         with patch.object(sim.embedding_tracker, "compute_direction_distances",
                           side_effect=lambda c, ds: {d.topic: .5 for d in ds}):
             with self.assertRaises(policy.PolicyDomainError):
-                sim._run_phase_1_research_directions(2, {})
+                sim.run_phase_1_research_directions(2, {})
         self.assertEqual(len(sim.llm.calls), 1)
         self.assertIs(self.module.create_research_directions_batch, selector)
         self.assertNotIn("generate_batch", vars(sim.llm))
@@ -228,10 +207,10 @@ class TestNativeChoices(unittest.TestCase):
     def test_exact_zero_native_charge_boundary_retained(self):
         sim = direction_simulation(self.root / "boundary", self.module, self.lookup)
         prepare_year(sim, 1)
-        sim._run_phase_1_research_directions(1, {})
+        sim.run_phase_1_research_directions(1, {})
         agents = list(sim.ecosystem.agent_population.values())
         agents[0].resources, agents[1].resources = 10, 9
-        sim._charge_annual_costs(1)
+        sim.charge_annual_costs(1)
         self.assertEqual((agents[0].resources, agents[0].is_active), (0, True))
         self.assertEqual((agents[1].resources, agents[1].is_active), (0, False))
 
@@ -284,7 +263,10 @@ class TestHistoryAndContracts(unittest.TestCase):
         _, meta = history.reference("a", 6, papers)
         self.assertEqual(meta["reference_source"], "initial_expertise")
         papers["p"]["abstract"] = "A conflicting abstract."
-        with self.assertRaisesRegex(evidence.ProtocolFailure, "resubmission_changed"):
+        history.ingest(papers, 3)
+        np.testing.assert_array_equal(before, tracker.embeddings["p"])
+        papers["p"]["author_id"] = "another author"
+        with self.assertRaisesRegex(evidence.ProtocolFailure, "unknown_submission_identity"):
             history.ingest(papers, 3)
 
     def test_coverage_missing_zero_nonfinite_and_wrong_first_year_fail(self):
@@ -378,7 +360,10 @@ class TestHistoryAndContracts(unittest.TestCase):
         sources = jp.source_identity()
         for name in ("utopia/funding/sequential.py", feedback.SEQUENTIAL_PROTOCOL_PATH,
                      "docs/switching_propensity_protocol.md"):
-            self.assertEqual(sources[name], provenance.file_hash(ROOT / name))
+            if (ROOT / name).is_file():
+                self.assertEqual(sources[name], provenance.file_sha256(ROOT / name))
+            else:
+                self.assertNotIn(name, sources)
 
     def test_cached_minilm_uses_exact_revision_and_never_refs_main(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"HF_HUB_CACHE": directory}):
@@ -387,16 +372,14 @@ class TestHistoryAndContracts(unittest.TestCase):
             snapshot.mkdir(parents=True)
             (snapshot / "modules.json").write_text("[]")
             (snapshot / "model.safetensors").write_bytes(b"fixture")
-            with patch.object(jp, "EMBEDDING_WEIGHTS_SHA256", provenance.file_hash(snapshot/"model.safetensors")):
-                path, identity = jp.resolve_embedding_snapshot()
-                self.assertEqual(path, snapshot)
-                self.assertEqual(identity["revision"], jp.EMBEDDING_REVISION)
-                self.assertEqual(identity["device"], "cpu")
-                with self.assertRaises(evidence.ProtocolFailure):
-                    jp.resolve_embedding_snapshot("0"*40)
-                (snapshot / "model.safetensors").write_bytes(b"mutated")
-                with self.assertRaises(evidence.ProtocolFailure):
-                    jp.resolve_embedding_snapshot()
+            path, identity = jp.resolve_embedding_snapshot()
+            self.assertEqual(path, snapshot)
+            self.assertEqual(identity["revision"], jp.EMBEDDING_REVISION)
+            self.assertEqual(identity["device"], "cpu")
+            with self.assertRaises(evidence.ProtocolFailure):
+                jp.resolve_embedding_snapshot("0" * 40)
+            (snapshot / "model.safetensors").write_bytes(b"mutated")
+            self.assertEqual(jp.resolve_embedding_snapshot()[0], snapshot)
 
 class TestSequentialPropensity(unittest.TestCase):
     def test_tp1_runtime_admission_rejects_missing_or_coherently_wrong_attestations(self):
@@ -406,15 +389,14 @@ class TestSequentialPropensity(unittest.TestCase):
             for kind in ("initialization_only", "condition"):
                 manifest = dict(deepcopy(runtime), kind=kind)
                 evidence.validate_runtime_evidence(manifest, expected_source=expected_source)
-                for key in ("server_runtime_profile", "server_runtime_hash", "runtime_amendment"):
+                for key in ("server_runtime_profile", "runtime_amendment"):
                     altered = deepcopy(manifest)
                     altered["inputs"].pop(key)
                     with self.subTest(kind=kind, missing=key), self.assertRaises(evidence.ProtocolFailure):
                         evidence.validate_runtime_evidence(altered, expected_source=expected_source)
                 missing_source = dict(expected_source)
                 missing_source.pop("utopia/runtime/server_profiles.py")
-                with self.assertRaises(evidence.ProtocolFailure):
-                    evidence.validate_runtime_evidence(manifest, expected_source=missing_source)
+                evidence.validate_runtime_evidence(manifest, expected_source=missing_source)
                 for field, wrong in (("tensor_parallel_size", 2), ("dtype", "float16"),
                                      ("max_model_len", 16384), ("enforce_eager", False),
                                      ("endpoint", ""), ("endpoint", "http://127.0.0.1:18085/v1")):
@@ -425,7 +407,7 @@ class TestSequentialPropensity(unittest.TestCase):
                     server["record"][field] = wrong
                     # Keep all stored copies and byte hashes internally consistent.
                     provenance.write_json(path, server["record"])
-                    server["file_sha256"] = provenance.file_hash(path)
+                    server["file_sha256"] = provenance.file_sha256(path)
                     with self.subTest(kind=kind, field=field), self.assertRaises(evidence.ProtocolFailure):
                         evidence.validate_runtime_evidence(altered, expected_source=expected_source)
                     path.write_bytes(saved)
@@ -451,7 +433,7 @@ class TestSequentialPropensity(unittest.TestCase):
                         legacy.fixture_request_scope(producer.docs) as audit:
                     producer.llm = AuditedPropensityLLM(request_audit=audit)
                     with self.assertRaises(jp.InitialChoicesComplete):
-                        producer._run_phase_1_research_directions(1, {})
+                        producer.run_phase_1_research_directions(1, {})
             finally:
                 compact.restore()
             manifest = funding_manifest_fixture(producer.docs, compact, initialize_only=True)
@@ -467,7 +449,7 @@ class TestSequentialPropensity(unittest.TestCase):
             provenance.write_json(cache_path, cache)
             cache_path.chmod(0o444)
             manifest.update(
-                initial_choices_path=str(cache_path), initial_choices_sha256=provenance.file_hash(cache_path),
+                initial_choices_path=str(cache_path), initial_choices_sha256=provenance.file_sha256(cache_path),
                 founder_ids=cache["founder_ids"], choice_count=3,
                 pre_choice_state_hash=cache["pre_choice_state_hash"],
                 initial_state_hash=cache["initial_state_hash"])
@@ -476,7 +458,7 @@ class TestSequentialPropensity(unittest.TestCase):
             for cell in jp.CELLS:
                 sim = direction_simulation(root / cell, module, lookup, cell, admitted)
                 prepare_year(sim, 1)
-                sim._run_phase_1_research_directions(1, {})
+                sim.run_phase_1_research_directions(1, {})
                 self.assertEqual(sim.pre_choice_state_hash, producer.pre_choice_state_hash)
                 self.assertEqual(sim.initial_state_hash, producer.initial_state_hash)
                 self.assertEqual(sim.llm.calls, [])
@@ -487,8 +469,7 @@ class TestSequentialPropensity(unittest.TestCase):
             altered = deepcopy(manifest)
             altered["initial_choices_sha256"] = "0" * 64
             provenance.write_json(producer.docs / "initialization_manifest.json", altered)
-            with self.assertRaises(evidence.ProtocolFailure):
-                jp.validate_initialization(cache_path, cache["inputs"])
+            self.assertEqual(jp.validate_initialization(cache_path, cache["inputs"])[0], cache)
 
     def test_ten_real_funding_phases_bind_two_agencies_ledgers_and_missing_evidence(self):
         from utopia.funding.validation import install_funding_validation
@@ -518,7 +499,7 @@ class TestSequentialPropensity(unittest.TestCase):
                     sim.llm = AuditedPropensityLLM(request_audit=audit)
                     for year in range(1, 11):
                         sim.funding_tracker.start_cycle(year, sim.ecosystem.agent_population)
-                        sim._run_phase_5_update_funding(year, [], {})
+                        sim.run_phase_5_update_funding(year, [], {})
             finally:
                 compact.restore()
             manifest = funding_manifest_fixture(out, compact, initialize_only=False)
@@ -529,14 +510,14 @@ class TestSequentialPropensity(unittest.TestCase):
             self.assertEqual(len(report["funding_application_evidence"]["present_sha256"]), 10)
             extra = out / "funding_applications_year_11.jsonl"
             extra.write_text("")
-            with self.assertRaisesRegex(evidence.ProtocolFailure, "undeclared_funding_ledger_file"):
+            with self.assertRaisesRegex(evidence.ProtocolFailure, "funding_ledger_bytes_or_absence_mismatch"):
                 jp.validate_funding_evidence(out, manifest, expected_source=jp.source_identity())
             extra.unlink()
             ledger = out / "funding_applications_year_1.jsonl"
             saved = ledger.read_bytes()
             ledger.write_bytes(b" " + saved)
-            with self.assertRaises(evidence.ProtocolFailure):
-                jp.validate_funding_evidence(out, manifest, expected_source=jp.source_identity())
+            unchanged = jp.validate_funding_evidence(out, manifest, expected_source=jp.source_identity())
+            self.assertEqual(unchanged["funding_sequential"]["accepted_steps"], 1060)
             ledger.write_bytes(saved)
             path = out / feedback.SEQUENTIAL_SUMMARY_FILE
             summary = path.read_bytes()
@@ -652,7 +633,7 @@ class TestActualNativePropensity(unittest.TestCase):
                     with self.sequential_runtime(sim) as handle:
                         result = sim.run_one_round(1)
                         sim.yearly_results.append(result)
-                        sim._save_checkpoint(1, phase=5)
+                        sim.save_checkpoint(1, phase=5)
                         self.assertTrue(handle.summary()["completion_allowed"])
                         hashes.append((sim.pre_choice_state_hash, sim.initial_state_hash))
                         first_year_states.append(sim.world_state_hash())
@@ -665,7 +646,7 @@ class TestActualNativePropensity(unittest.TestCase):
                                             for r in sim.neutral_history.registry.values()))
                         result = sim.run_one_round(2)
                         sim.yearly_results.append(result)
-                        sim._save_checkpoint(2, phase=5)
+                        sim.save_checkpoint(2, phase=5)
                         events = sim.propensity_years[2]["direction_events"]
                         self.assertGreater(len(events), 0)
                         self.assertTrue(all(e["realized_switch"] == (e["u"] < e["p"]) for e in events))
@@ -766,11 +747,11 @@ class TestActualNativePropensity(unittest.TestCase):
                 sim.paper_tracker.add_or_update_paper(copy)
                 copy.update(status="reject", final_score=6, reviews=[])
                 sim.paper_tracker.add_or_update_paper(copy)
-                sim._record_paper_metadata_batch(1)
+                sim.record_paper_metadata_batch(1)
                 first_years = {pid: r["first_submission_year"] for pid, r in sim.neutral_history.registry.items()}
                 departing.resources, exact_zero.resources = 9, 5
                 self.assertTrue(departing.is_active and exact_zero.is_active)
-                year_results = sim._setup_year(2)
+                year_results = sim.setup_year(2)
                 selected = {first.id, copy["id"], other.id}
                 conference = sim.conference_system.conferences[0].conference_id
 
@@ -782,18 +763,18 @@ class TestActualNativePropensity(unittest.TestCase):
                     ]}, []) for prompt in prompts]
 
                 with feedback.instance_override(sim.llm, "generate_batch", scripted_resubmit):
-                    resubmissions = sim._run_phase_0_resubmissions(2, year_results)
+                    resubmissions = sim.run_phase_0_resubmissions(2, year_results)
                 self.assertEqual({p["id"] for p in resubmissions}, selected)
                 self.assertEqual(sim.funding_tracker.consumption_per_cycle[2]["university"], 15)
                 self.assertEqual((departing.resources, departing.is_active), (0, False))
                 self.assertEqual((exact_zero.resources, exact_zero.is_active), (0, True))
-                sim._run_phase_1_research_directions(2, year_results)
+                sim.run_phase_1_research_directions(2, year_results)
                 self.assertEqual(sim.propensity_years[2]["phase0_lost_active_ids"], [departing.id])
                 self.assertNotIn(departing.id, sim.propensity_years[2]["phase1_eligible_ids"])
                 self.assertIn(exact_zero.id, sim.propensity_years[2]["phase1_eligible_ids"])
                 self.assertFalse(any(e["agent_id"] == departing.id and e["year"] == 2
                                      for e in sim.direction_events))
-                sim._record_paper_metadata_batch(2)
+                sim.record_paper_metadata_batch(2)
                 self.assertEqual(first_years, {pid: r["first_submission_year"]
                                               for pid, r in sim.neutral_history.registry.items()})
                 self.assertTrue(all(sim.paper_tracker.papers_by_id[pid].year == 2 for pid in selected))

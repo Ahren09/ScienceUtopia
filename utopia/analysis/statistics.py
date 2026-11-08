@@ -1,8 +1,41 @@
 """Shared statistical estimators with explicit sampling units."""
 
 import json
+
 import numpy as np
 import pandas as pd
+
+
+def paired_spearman_ci(human, baseline, history, n_boot=10000, seed=0):
+    """Resample papers jointly for two correlations and their paired difference."""
+    from scipy.stats import spearmanr
+
+    vectors = np.asarray([human, baseline, history], dtype=float)
+    if vectors.ndim != 2 or vectors.shape[1] < 2 or not np.isfinite(vectors).all():
+        raise ValueError("Three finite aligned score vectors are required")
+    rng = np.random.default_rng(seed)
+
+    def estimates(sample):
+        values = vectors[:, sample]
+        first = spearmanr(values[0], values[1]).statistic
+        second = spearmanr(values[0], values[2]).statistic
+        return np.array([first, second, second - first], dtype=float)
+
+    point = estimates(np.arange(vectors.shape[1]))
+    boot = np.array([
+        estimates(rng.integers(0, vectors.shape[1], vectors.shape[1]))
+        for _ in range(n_boot)
+    ])
+    result = {}
+    for index, name in enumerate(('expertise_only', 'history', 'history_minus_expertise')):
+        valid = boot[:, index][np.isfinite(boot[:, index])]
+        result[name] = {
+            'estimate': float(point[index]) if np.isfinite(point[index]) else None,
+            'ci_lo': float(np.quantile(valid, 0.025)) if len(valid) else None,
+            'ci_hi': float(np.quantile(valid, 0.975)) if len(valid) else None,
+            'valid_bootstrap_draws': len(valid), 'n_papers': vectors.shape[1],
+        }
+    return result
 
 
 def hierarchical_bootstrap(contrasts: pd.DataFrame, n_boot=10000, seed=0):
@@ -79,7 +112,7 @@ def bootstrap_mean_ci(values, n_boot=2000, seed=0):
         return (None, None, None)
     if len(v) == 1:
         return (float(v[0]), None, None)
-    means = _bootstrap_means(v, n_boot, seed)
+    means = bootstrap_means(v, n_boot, seed)
     return (
         float(v.mean()),
         float(np.percentile(means, 2.5)),
@@ -88,11 +121,11 @@ def bootstrap_mean_ci(values, n_boot=2000, seed=0):
 
 
 def bootstrap_ci(values, n_boot=10000, seed=0):
-    means = _bootstrap_means(values, n_boot, seed)
+    means = bootstrap_means(values, n_boot, seed)
     return float(np.percentile(means, 2.5)), float(np.percentile(means, 97.5))
 
 
-def _bootstrap_means(values, n_boot, seed):
+def bootstrap_means(values, n_boot, seed):
     rng = np.random.default_rng(seed)
     return rng.choice(values, size=(n_boot, len(values)), replace=True).mean(axis=1)
 
@@ -113,7 +146,7 @@ def paired_boot(values: np.ndarray, n_boot=10000, seed=0, stat=np.mean) -> dict:
     rng = np.random.default_rng(seed)
     boots = np.array([stat(v[rng.integers(0, len(v), len(v))]) for _ in range(n_boot)])
     point = float(stat(v))
-    return _paired_boot_summary(point, boots, len(v), n_boot)
+    return paired_boot_summary(point, boots, len(v), n_boot)
 
 
 def boot_weighted_slope(
@@ -128,10 +161,10 @@ def boot_weighted_slope(
         boots[b] = weighted_slope(
             d[ycol].values[idx], d[xcol].values[idx], d[wcol].values[idx]
         )[0]
-    return _paired_boot_summary(point, boots, len(d), n_boot)
+    return paired_boot_summary(point, boots, len(d), n_boot)
 
 
-def _paired_boot_summary(point, boots, sample_size, n_boot):
+def paired_boot_summary(point, boots, sample_size, n_boot):
     """Summarize paired resamples with the original finite-resolution p-value floor."""
     p = 2 * min((boots <= 0).mean(), (boots >= 0).mean())
     return {

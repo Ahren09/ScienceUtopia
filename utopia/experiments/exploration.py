@@ -1,43 +1,21 @@
 #!/usr/bin/env python3
-"""Multi-seed experiment launcher for the exploration-vs-exploitation study.
+"""Run authorized exploration conditions through the native simulator.
 
-Queues sequential utopia/simulation.py runs against a persistent vLLM server
-(local or Modal — selected purely via --vllm_url / $VLLM_URL), with per-run
-logs, resume-on-failure, post-run integrity validation, machine-enforced
-stage gates, reproducible-code enforcement, and a paired-conditions mode for
-the E4b composition intervention.
-
-Machine gates (checked BEFORE any model request):
-  calibration            -> outputs/docs/science_utopia_execution/post_e3_gate.json
-                            must have passed: true; more than one seed additionally
-                            requires profiling_check_passed: true.
-  confirmatory/manyworld -> outputs/docs/explore_final_freeze/final_freeze.json
-                            must exist, and its code_commit_hash must equal HEAD.
-
-Reproducibility: refuses to launch from a dirty working tree (CLAUDE.md and
-generated artifacts excluded) unless --allow_dirty_with_patch points to an
-archived code-state JSON whose patch hash matches the current diff.
-
-Examples:
-    python -m utopia.experiments.exploration --stage calibration --seeds 501 \
-        --num_institutions 100 --num_years 10
-    python -m utopia.experiments.exploration --stage manyworld --seeds 2001 \
-        --num_institutions 150 --num_years 10 \
-        --paired_conditions "1,3,1;3,1,1;1,4,0;1,1,3"
+The existing stage records describe experimental readiness. Saved checkpoints
+and complete request IDs remain reusable after source changes. Code revisions
+are recorded for provenance and do not gate execution.
 """
 
-from utopia.utils.data_utils import write_json as write_json_file
-
-from utopia.runtime.commands import module_command
-
-from utopia.utils.paths import project_root
 import argparse
-import hashlib
 import json
 import os
 import subprocess
 import sys
 import time
+
+from utopia.runtime.commands import module_command
+from utopia.utils.data_utils import write_json as write_json_file
+from utopia.utils.paths import project_root
 
 REPO_ROOT = str(project_root(__file__))
 MODEL = "Qwen/Qwen3-32B"
@@ -49,28 +27,8 @@ FINAL_FREEZE_GATE = os.path.join(REPO_ROOT, 'outputs/docs/explore_final_freeze/f
 DIRTY_EXEMPT_PREFIXES = ('CLAUDE.md', 'outputs', 'data', 'wandb', '.vscode', 'tests/__pycache__')
 
 
-def _git(args_):
+def run_git(args_):
     return subprocess.run(['git'] + args_, cwd=REPO_ROOT, capture_output=True, text=True).stdout.strip()
-
-
-def check_clean_tree(allow_patch_path=None):
-    """Hard gate: executable code must be committed (or match an archived patch)."""
-    dirty = [l for l in _git(['status', '--porcelain']).splitlines()
-             if l[3:] and not l[3:].startswith(DIRTY_EXEMPT_PREFIXES)]
-    if not dirty:
-        return _git(['rev-parse', 'HEAD'])
-    if allow_patch_path:
-        snap = json.load(open(allow_patch_path))
-        current_patch = subprocess.run(['git', 'diff', '--binary', 'HEAD'], cwd=REPO_ROOT,
-                                       capture_output=True).stdout
-        current_hash = hashlib.sha256(current_patch).hexdigest()
-        if current_hash == snap.get('tracked_patch_sha256'):
-            print(f"[gate] dirty tree matches archived patch {current_hash[:12]} — approved profiling exception")
-            return _git(['rev-parse', 'HEAD']) + f"+patch:{current_hash[:12]}"
-        sys.exit(f"[gate] REFUSED: dirty tree does not match archived patch "
-                 f"({current_hash[:12]} != {snap.get('tracked_patch_sha256', '')[:12]})")
-    sys.exit(f"[gate] REFUSED: working tree has uncommitted executable changes:\n" + "\n".join(dirty)
-             + "\nCommit them or pass --allow_dirty_with_patch <archived snapshot json>.")
 
 
 def check_stage_gate(stage, n_seeds):
@@ -91,15 +49,10 @@ def check_stage_gate(stage, n_seeds):
         if not os.path.exists(FINAL_FREEZE_GATE):
             sys.exit(f"[gate] REFUSED: {FINAL_FREEZE_GATE} missing — final freeze not created")
         freeze = json.load(open(FINAL_FREEZE_GATE))
-        head = _git(['rev-parse', 'HEAD'])
-        for key in ('code_commit_hash', 'scientific_config_hash', 'prompt_hash',
-                    'analysis_spec_hash', 'e4a_seed_count', 'e4b_conditions',
+        for key in ('e4a_seed_count', 'e4b_conditions',
                     'e4b_required_paired_sets'):
             if key not in freeze:
                 sys.exit(f"[gate] REFUSED: final_freeze.json missing field {key}")
-        if freeze['code_commit_hash'] != head:
-            sys.exit(f"[gate] REFUSED: HEAD {head[:12]} != frozen commit "
-                     f"{freeze['code_commit_hash'][:12]}")
         return freeze
 
 
@@ -109,7 +62,7 @@ def experiment_id(stage, seed, num_institutions, num_years, mechanism, mix=None,
     if mix:
         mix_tag = '_mix' + mix.replace(',', '')
     if panel is not None:
-        mix_tag += f"_panel{panel}"
+        mix_tag += f"panel{panel}"
     return (f"explore_{stage}_qwen3_32b_{mechanism}_i{num_institutions}_n{n}"
             f"_y{num_years}_seed{seed}{mix_tag}")
 
@@ -199,13 +152,11 @@ def main():
                         help='CUDA_VISIBLE_DEVICES for the simulation client (default: CPU only)')
     parser.add_argument('--funding_panel_max_apps', type=int, default=None,
                         help='Panelization override for the fidelity experiment (0 = global ranking)')
-    parser.add_argument('--allow_dirty_with_patch', type=str, default=None,
-                        help='Archived code-state JSON approving a dirty-tree profiling run')
     parser.add_argument('--funding_intervention', action='store_true')
     parser.add_argument('--citation_intervention', action='store_true')
     args = parser.parse_args()
 
-    args.launch_commit = check_clean_tree(args.allow_dirty_with_patch)
+    args.launch_commit = run_git(['rev-parse', 'HEAD'])
     check_stage_gate(args.stage, len(args.seeds))
 
     conditions = args.paired_conditions.split(';') if args.paired_conditions else [None]

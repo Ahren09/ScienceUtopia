@@ -1,6 +1,7 @@
 """Construct W&B-native charts without owning run state or logging."""
 
 import numpy as np
+
 from utopia.visual.embeddings import plot_paper_embeddings
 
 
@@ -10,12 +11,12 @@ def build_charts(year: int, year_results: dict, simulation, history) -> dict:
     plots = {}
 
     # Review score distribution (native wandb histogram — appears in Charts)
-    all_scores = _collect_review_scores(year_results)
+    all_scores = collect_review_scores(year_results)
     if all_scores:
         plots["plots/review_score_dist"] = wandb.Histogram(all_scores)
 
     # Funding distribution (native wandb histogram — appears in Charts)
-    funding_levels = _collect_funding_levels(simulation)
+    funding_levels = collect_funding_levels(simulation)
     if funding_levels:
         plots["plots/funding_distribution"] = wandb.Histogram(funding_levels)
 
@@ -56,7 +57,7 @@ def build_charts(year: int, year_results: dict, simulation, history) -> dict:
     return plots
 
 
-def _collect_review_scores(year_results: dict) -> list:
+def collect_review_scores(year_results: dict) -> list:
     """Approximate individual review scores from aggregated stats."""
     score_metrics = year_results.get("peer_review", {}).get("score_metrics", {})
     mean = score_metrics.get("overall_mean", 0)
@@ -69,7 +70,7 @@ def _collect_review_scores(year_results: dict) -> list:
     return []
 
 
-def _collect_funding_levels(simulation) -> list:
+def collect_funding_levels(simulation) -> list:
     """Collect current funding levels from all agents."""
     levels = []
     for agent in simulation.ecosystem.agent_population.values():

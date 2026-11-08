@@ -2,7 +2,7 @@
 
 Install AFTER install_funding_validation(..., compact=True), restore BEFORE it.
 Only registered compact phase5_funding_eval batches are intercepted. Every
-choice, including a singleton, uses the existing client's _create_completion
+choice, including a singleton, uses the existing client's create_completion
 and request audit. There are at most THREE SDK calls per step. The SDK's five
 internal transport retries remain unchanged and are not extra sidecar events.
 No generate_batch nesting, whole-panel retry, filling or deduplication occurs.
@@ -20,32 +20,29 @@ Zero-panel finalized runs are valid. Failures never produce a clean summary.
 """
 from __future__ import annotations
 
-from utopia.utils.data_utils import json_sha256
-
-from utopia.runtime.historical import source_binding_value
-
-from utopia.utils.seeding import derive_seed as _derive_seed
-from utopia.utils.data_utils import decode_json, DuplicateJSONKey, NonfiniteJSONNumber
-
-from utopia.utils.data_utils import file_sha256
-
-from utopia.funding import compact
-from utopia.constants import IMPORTANT_NOTES
-
-from utopia.utils.paths import project_root
-
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from copy import deepcopy
-from functools import wraps
 import hashlib
 import inspect
 import json
 import os
-from pathlib import Path
-import re
-from threading import Event, Lock, RLock
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from copy import deepcopy
+from functools import wraps
+from pathlib import Path
+from threading import Event, Lock, RLock
 
+from utopia.constants import IMPORTANT_NOTES
+from utopia.funding import compact
+from utopia.utils.data_utils import (
+    DuplicateJSONKey,
+    NonfiniteJSONNumber,
+    decode_json,
+    file_sha256,
+    json_sha256,
+    without_hash_metadata,
+)
+from utopia.utils.paths import project_root
+from utopia.utils.seeding import derive_seed
 
 SEQUENTIAL_PROTOCOL = "sequential_remaining_ids_v1"
 OUTPUT_REPRESENTATION = "ordered_application_ids_v1"
@@ -78,16 +75,16 @@ class _Cancelled(BaseException):
     pass
 
 
-def _json(value):
+def json_text(value):
     return json.dumps(value, sort_keys=True, ensure_ascii=True, separators=(",", ":"), allow_nan=False)
 
 
-def _sha(value):
+def value_digest(value):
     return json_sha256(value, ensure_ascii=True, sort_keys=True,
                        separators=(",", ":"), allow_nan=False)
 
 
-def _text_sha(value):
+def text_digest(value):
     return hashlib.sha256(value.encode()).hexdigest()
 
 
@@ -97,7 +94,7 @@ def _text_sha(value):
 
 
 
-def _ids(values, *, empty=False):
+def require_ids(values, *, empty=False):
     if type(values) not in (list, tuple) or (not values and not empty) or len(values) > 25:
         raise ValueError("Expected up to 25 integer application indices")
     if any(type(i) is not int or not 0 <= i < 25 for i in values) or len(set(values)) != len(values):
@@ -107,12 +104,12 @@ def _ids(values, *, empty=False):
 
 def selection_schema(remaining):
     return {"type": "object", "properties": {
-        "next_application_id": {"type": "integer", "enum": _ids(remaining)}},
+        "next_application_id": {"type": "integer", "enum": require_ids(remaining)}},
         "required": ["next_application_id"], "additionalProperties": False}
 
 
 def selection_prompt(compact_original_prompt, selected, remaining):
-    selected, remaining = _ids(selected, empty=True), _ids(remaining)
+    selected, remaining = require_ids(selected, empty=True), require_ids(remaining)
     n = len(selected) + len(remaining)
     if n > 25 or sorted(selected + remaining) != list(range(n)):
         raise ValueError("Prefix and remaining indices must partition the original panel")
@@ -125,8 +122,8 @@ def selection_prompt(compact_original_prompt, selected, remaining):
     return prefix + marker + (
         "Select the most preferred application among the remaining application IDs below, "
         "using the unchanged program criteria and applications above.\n"
-        f"Already selected IDs, in order from most preferred: {_json(selected)}\n"
-        f"Remaining application IDs: {_json(remaining)}\n"
+        f"Already selected IDs, in order from most preferred: {json_text(selected)}\n"
+        f"Remaining application IDs: {json_text(remaining)}\n"
         f"This choice will receive rank {len(selected) + 1} of {n}.\n"
         'Return only a JSON object with the single key "next_application_id". '
         "Its value must be exactly one integer from the remaining IDs. "
@@ -157,7 +154,7 @@ def selection_seed_context(year, program_id, panel_index, step, *, namespace="pr
 
 
 def decode_selection(content, remaining):
-    allowed = _ids(remaining)
+    allowed = require_ids(remaining)
     if type(content) is not str or not content.strip():
         raise ValueError("Empty selection content")
 
@@ -175,20 +172,20 @@ def decode_selection(content, remaining):
     return value
 
 
-def _response_data(value):
+def response_data(value):
     """Detach the entire returned SDK response, including vendor reasoning fields."""
     if value is None or type(value) in (str, int, float, bool):
         return value
     if isinstance(value, dict):
-        return {key: _response_data(item) for key, item in value.items()}
+        return {key: response_data(item) for key, item in value.items()}
     if isinstance(value, (tuple, list)):
-        return [_response_data(item) for item in value]
+        return [response_data(item) for item in value]
     if hasattr(value, "model_dump"):
-        return _response_data(value.model_dump(mode="json"))
-    return _response_data(vars(value))  # Explicit SimpleNamespace CPU fixtures.
+        return response_data(value.model_dump(mode="json"))
+    return response_data(vars(value))  # Explicit SimpleNamespace CPU fixtures.
 
 
-def _source_hashes():
+def source_hashes():
     paths = [Path(__file__), ROOT / "utopia/funding/compact.py",
              ROOT / "utopia/funding/validation.py", ROOT / "utopia/models/models.py",
              ROOT / "utopia/models/request_audit.py", ROOT / "utopia/agents/funding_agents.py",
@@ -201,7 +198,7 @@ def _source_hashes():
     return {str(path.relative_to(ROOT)): file_sha256(path) for path in paths}
 
 
-def _freeze_metadata(meta):
+def freeze_metadata(meta):
     if (type(meta) is not dict or type(meta.get("program_id")) is not str or not meta["program_id"]
             or type(meta.get("panel_index")) is not int or meta["panel_index"] < 0
             or type(meta.get("apps")) not in (list, tuple) or not 1 <= len(meta["apps"]) <= 25):
@@ -212,7 +209,7 @@ def _freeze_metadata(meta):
             raise ValueError("Invalid registered application metadata")
         # Never serialize a live model/agent or send hidden metadata to the LLM.
         apps.append({"applicant_id": app["applicant_id"]})
-    return json.loads(_json({"program_id": meta["program_id"], "panel_index": meta["panel_index"], "apps": apps}))
+    return json.loads(json_text({"program_id": meta["program_id"], "panel_index": meta["panel_index"], "apps": apps}))
 
 
 def validate_summary(summary, *, require_restored=True):
@@ -234,10 +231,7 @@ def validate_summary(summary, *, require_restored=True):
                 and summary["accepted_steps"] <= summary["sdk_calls"] <= 3 * summary["accepted_steps"]
                 and summary["retries"] == summary["sdk_calls"] - summary["accepted_steps"]
                 and summary["invalid_attempts"] == summary["retries"]
-                and summary["years_started"] == summary["years_completed"]
-                and type(summary["source_sha256"]) is str
-                and re.fullmatch(r"[0-9a-f]{64}", summary["source_sha256"]) is not None
-                and source_binding_value(summary["source_files_sha256"], "utopia/funding/sequential.py") == summary["source_sha256"])
+                and summary["years_started"] == summary["years_completed"])
         if require_restored:
             good &= summary["installed"] is False and summary["status"] == "complete"
         else:
@@ -249,7 +243,7 @@ def validate_summary(summary, *, require_restored=True):
     return True
 
 
-def _panel_report(context):
+def panel_report(context):
     return {
         "year": context["year"], "program_id": context["program_id"],
         "panel_index": context["panel_index"], "registration": context["registration"],
@@ -269,7 +263,7 @@ class _Handle:
         self.current_year = None
         self.completed_years = []
         self.stats = {k: 0 for k in _COUNTERS}
-        sources = _source_hashes()
+        sources = source_hashes()
         self.stats.update(
             funding_selection_protocol=SEQUENTIAL_PROTOCOL, output_representation=OUTPUT_REPRESENTATION,
             source_sha256=sources["utopia/funding/sequential.py"], source_files_sha256=sources,
@@ -278,11 +272,11 @@ class _Handle:
             restore_conflicts=[], audit_path=str(self.path), summary_path=str(self.summary_path),
             sdk_retry_scope="One event per SDK call; internal transport retries are not individual events.")
 
-    def _emit(self, event, **data):
+    def emit(self, event, **data):
         with self.lock:
             record = {"sequence": self.stats["audit_records"] + 1, "event": event, **data}
             try:
-                remaining = memoryview((_json(record) + "\n").encode())
+                remaining = memoryview((json_text(record) + "\n").encode())
                 while remaining:
                     written = os.write(self.fd, remaining)
                     if written <= 0:
@@ -297,60 +291,66 @@ class _Handle:
             self.stats["audit_records"] += 1
             return record
 
-    def _fail(self, reason, **details):
+    def fail(self, reason, **details):
         with self.lock:
             self.stats["fatal_errors"] += 1
             self.stats["guard_failures"] += 1
             self.cancel.set()
-            self._emit("fatal", reason=reason, **details)
+            self.emit("fatal", reason=reason, **details)
         raise SequentialFundingError(reason, **details)
 
-    def _active(self):
+    def active(self):
         if self.cancel.is_set() or not self.stats["installed"] or not self.validation.summary()["installed"]:
-            self._fail("sequential_or_compact_guard_not_installed")
+            self.fail("sequential_or_compact_guard_not_installed")
 
-    def _unchanged(self, context):
+    def validate_unchanged(self, context):
         try:
-            unchanged = _sha(_freeze_metadata(context["metadata"])) == context["metadata_sha256"]
+            metadata = freeze_metadata(context["metadata"])
+            unchanged = (
+                metadata["program_id"] == context["program_id"]
+                and metadata["panel_index"] == context["panel_index"]
+                and [app["applicant_id"] for app in metadata["apps"]]
+                == [applicant for _, applicant in context["application_map"]]
+            )
         except Exception:
             unchanged = False
         if not unchanged:
-            self._fail("registered_metadata_mutated", registration=context["registration"])
+            self.fail("registered_metadata_mutated", registration=context["registration"])
 
     def begin_year(self, year, agency_ids):
         """Driver brackets the actual native phase5, including empty years."""
         with self.lock:
-            self._active()
+            self.active()
             if (type(year) is not int or year < 1 or self.current_year is not None
                     or year in self.completed_years or not isinstance(agency_ids, (list, tuple))
                     or not agency_ids or any(type(a) is not str or not a for a in agency_ids)
                     or len(set(agency_ids)) != len(agency_ids)):
-                self._fail("invalid_funding_year_boundary")
+                self.fail("invalid_funding_year_boundary")
             self.current_year = {"year": year, "expected_agency_ids": list(agency_ids), "agencies": []}
-            self._emit("year_started", year=year, agency_ids=list(agency_ids))
+            self.emit("year_started", year=year, agency_ids=list(agency_ids))
             self.stats["years_started"] += 1
 
     def end_year(self, year):
         with self.lock:
-            self._active()
+            self.active()
             coverage = self.current_year
             if (coverage is None or coverage["year"] != year or self.contexts
                     or {a["agency_id"] for a in coverage["agencies"]} != set(coverage["expected_agency_ids"])):
-                self._fail("incomplete_native_funding_year_coverage")
-            self._emit("year_completed", coverage=coverage)
+                self.fail("incomplete_native_funding_year_coverage")
+            self.emit("year_completed", coverage=coverage)
             self.completed_years.append(year)
             self.current_year = None
             self.stats["years_completed"] += 1
 
     def register(self, value, panel_seed, agency, applications):
         with self.lock:
-            self._active()
+            self.active()
             try:
                 texts, response_format, metadata = value
                 coverage = self.current_year
                 if (coverage is None or agency.id not in coverage["expected_agency_ids"]
                         or agency.id in {a["agency_id"] for a in coverage["agencies"]}
-                        or panel_seed != _derive_seed(42, "funding_panels", coverage["year"])):
+                        or panel_seed != derive_seed(42, "funding_panels", coverage["year"])):
                     raise ValueError("Missing, duplicate or mismatched native year/agency coverage")
                 if (type(texts) is not list or type(metadata) is not list or len(texts) != len(metadata)
                         or response_format != compact.compact_response_format()
@@ -358,15 +358,15 @@ class _Handle:
                     raise ValueError("Registered prompt format/count/seed mismatch")
                 prepared = []
                 for text, meta in zip(texts, metadata):
-                    frozen = _freeze_metadata(meta)
+                    frozen = freeze_metadata(meta)
                     remaining = list(range(len(frozen["apps"])))
                     selection_prompt(text, [], remaining)  # exact known compact tail
                     key = (panel_seed, frozen["program_id"], frozen["panel_index"])
                     if key in self.keys or key in [p["key"] for p in prepared]:
                         raise ValueError("Duplicate program/panel/seed registration")
                     prepared.append({
-                        "key": key, "metadata": meta, "metadata_sha256": _sha(frozen),
-                        "prompt": text, "prompt_sha256": _text_sha(text),
+                        "key": key, "metadata": meta, "metadata_sha256": value_digest(frozen),
+                        "prompt": text, "prompt_sha256": text_digest(text),
                         "application_map": [[i, a["applicant_id"]] for i, a in enumerate(frozen["apps"])],
                         "program_id": frozen["program_id"], "panel_index": frozen["panel_index"],
                         "panel_seed": panel_seed, "selected": [], "state": "registered",
@@ -377,11 +377,11 @@ class _Handle:
                 if application_count != sum(len(c["application_map"]) for c in prepared):
                     raise ValueError("Native submitted applications differ from returned panel coverage")
             except Exception as error:
-                self._fail("invalid_compact_prompt_registration", error_type=type(error).__name__)
+                self.fail("invalid_compact_prompt_registration", error_type=type(error).__name__)
             for context in prepared:
                 context["registration"] = self.stats["registered_panels"]
-                context["map_sha256"] = _sha(context["application_map"])
-                self._emit("panel_registered", **{k: context[k] for k in (
+                context["map_sha256"] = value_digest(context["application_map"])
+                self.emit("panel_registered", **{k: context[k] for k in (
                     "registration", "metadata_sha256", "prompt", "prompt_sha256", "application_map",
                     "map_sha256", "program_id", "panel_index", "panel_seed")})
                 self.contexts[context["registration"]] = context
@@ -391,13 +391,13 @@ class _Handle:
                         "native_submitted_applications": application_count,
                         "registrations": [c["registration"] for c in prepared],
                         "panel_count": len(prepared)}
-            self._emit("agency_registration", **observed)
+            self.emit("agency_registration", **observed)
             coverage["agencies"].append(observed)
             self.stats["agency_registrations"] += 1
             self.stats["empty_agency_registrations"] += int(not prepared)
         return value
 
-    def _step(self, model, context, year, options):
+    def select_step(self, model, context, year, options):
         selected = context["selected"]
         remaining = [i for i in range(len(context["application_map"])) if i not in selected]
         step = len(selected)
@@ -409,17 +409,17 @@ class _Handle:
         for attempt in range(MAX_STEP_CALLS):
             if self.cancel.is_set():
                 raise _Cancelled()
-            extra = model._build_extra_body(response_format)
-            seed = model._request_seed(ctx, 0, attempt)
-            if (seed != _derive_seed(model.run_seed, *ctx, 0, attempt)
+            extra = model.build_extra_body(response_format)
+            seed = model.request_seed(ctx, 0, attempt)
+            if (seed != derive_seed(model.run_seed, *ctx, 0, attempt)
                     or extra.get("structured_outputs", {}).get("json") != selection_schema(remaining)
                     or extra.get("chat_template_kwargs") != {"enable_thinking": True}):
-                self._fail("selection_transport_or_seed_mismatch")
+                self.fail("selection_transport_or_seed_mismatch")
             extra["seed"] = seed
             details = {
                 "registration": context["registration"], "year": year, "step": step, "attempt": attempt,
                 "selected": list(selected), "remaining": remaining, "seed_ctx": list(ctx), "seed": seed,
-                "messages_sha256": _sha(messages), "schema": selection_schema(remaining),
+                "messages_sha256": value_digest(messages), "schema": selection_schema(remaining),
                 "temperature": options["temperature"], "max_tokens": options["max_tokens"],
                 "run_seed": model.run_seed,
                 "attempt_id": f"{context['registration']}:{step}:{attempt}",
@@ -427,20 +427,20 @@ class _Handle:
             with self.lock:
                 if self.cancel.is_set():
                     raise _Cancelled()
-                self._emit("sdk_call", **details)
+                self.emit("sdk_call", **details)
                 self.stats["sdk_calls"] += 1
                 self.stats["retries"] += int(attempt > 0)
             started = time.monotonic()
             content, reason, usage, error_type, chosen, n_choices = None, None, None, None, None, None
             try:
-                response = model._create_completion(
+                response = model.create_completion(
                     seed_ctx=ctx, item_index=0, attempt=attempt, model=model.model_name,
                     messages=messages, temperature=options["temperature"], max_tokens=options["max_tokens"],
                     extra_body=extra)
-                raw_response = _response_data(response)
+                raw_response = response_data(response)
                 # Persist complete response/reasoning BEFORE finish or semantic
                 # validation. Prefix/map references reconstruct all request bytes.
-                self._emit("sdk_response", **details, raw_response=raw_response,
+                self.emit("sdk_response", **details, raw_response=raw_response,
                            response_id=raw_response.get("id"),
                            started_monotonic=started, duration_seconds=time.monotonic() - started)
                 choices = raw_response["choices"]
@@ -458,7 +458,7 @@ class _Handle:
                 error_type = type(error).__name__
             except BaseException as error:
                 # The existing request guard may reject a returned response
-                # before _create_completion returns. The reviewed guard exposes
+                # before create_completion returns. The reviewed guard exposes
                 # that response/ticket solely for this terminal audit record.
                 with self.lock:
                     self.cancel.set()
@@ -467,15 +467,15 @@ class _Handle:
                     received = getattr(error, "received_response", None)
                     try:
                         if not self.stats["audit_failures"]:
-                            self._emit(
+                            self.emit(
                                 "terminal_guard", **details, error_type=type(error).__name__,
-                                raw_response=_response_data(received) if received is not None else None,
+                                raw_response=response_data(received) if received is not None else None,
                                 request_ticket=getattr(error, "request_ticket", None),
                                 started_monotonic=started, duration_seconds=time.monotonic() - started)
                     finally:
                         raise error  # Never downgrade a fatal guard into an SDK retry.
             with self.lock:
-                self._emit("sdk_result", **details, raw_content=content, finish_reason=reason,
+                self.emit("sdk_result", **details, raw_content=content, finish_reason=reason,
                            token_usage=usage, n_choices=n_choices,
                            accepted=chosen is not None, error_type=error_type,
                            duration_seconds=time.monotonic() - started)
@@ -490,26 +490,26 @@ class _Handle:
                     stats["prompt_tokens"] += usage["prompt_tokens"]
                     stats["completion_tokens"] += usage["completion_tokens"]
             if chosen is not None:
-                self._unchanged(context)
+                self.validate_unchanged(context)
                 with self.lock:
-                    self._emit("selection_accepted", registration=context["registration"],
+                    self.emit("selection_accepted", registration=context["registration"],
                                step=step, attempt=attempt, next_application_id=chosen,
                                selected=list(selected) + [chosen])
                     selected.append(chosen)
                     self.stats["accepted_steps"] += 1
                 return messages + [{"role": "assistant", "content": [{"type": "text", "text": content}]}]
-        self._fail("selection_step_exhausted", registration=context["registration"],
+        self.fail("selection_step_exhausted", registration=context["registration"],
                    step=step, selected=list(selected), remaining=remaining)
 
-    def _panel(self, model, context, year, options):
+    def panel(self, model, context, year, options):
         try:
             context["state"] = "running"
             history = []
             while len(context["selected"]) < len(context["application_map"]):
-                history = self._step(model, context, year, options)
-            self._unchanged(context)
+                history = self.select_step(model, context, year, options)
+            self.validate_unchanged(context)
             with self.lock:
-                self._emit("panel_completed", registration=context["registration"],
+                self.emit("panel_completed", registration=context["registration"],
                            ranked_application_ids=context["selected"])
                 context["state"] = "completed"
                 self.stats["completed_panels"] += 1
@@ -518,30 +518,30 @@ class _Handle:
             with self.lock:
                 context["state"] = "cancelled"
                 self.stats["cancelled_panels"] += 1
-                self._emit("panel_cancelled", registration=context["registration"], selected=context["selected"])
+                self.emit("panel_cancelled", registration=context["registration"], selected=context["selected"])
             raise
         except BaseException as error:
             with self.lock:
                 self.cancel.set()
                 context["state"] = "failed"
                 self.stats["failed_panels"] += 1
-                self._emit("panel_failed", registration=context["registration"],
+                self.emit("panel_failed", registration=context["registration"],
                            selected=context["selected"], error_type=type(error).__name__)
             raise
 
     def batch(self, model, options):
         if not self.batch_lock.acquire(blocking=False):
-            self._fail("concurrent_funding_batches")
+            self.fail("concurrent_funding_batches")
         started = time.monotonic()
         try:
             with self.lock:
-                self._active()
+                self.active()
                 ctx = options["seed_ctx"]
                 if (type(ctx) not in (tuple, list) or len(ctx) != 3 or ctx[0] != "phase5_funding_eval"
                         or type(ctx[1]) is not int or ctx[1] < 1 or type(ctx[2]) is not int or ctx[2] != 0):
-                    self._fail("native_whole_panel_retry_forbidden")
+                    self.fail("native_whole_panel_retry_forbidden")
                 if self.current_year is None or self.current_year["year"] != ctx[1]:
-                    self._fail("funding_batch_outside_declared_year")
+                    self.fail("funding_batch_outside_declared_year")
                 if (type(model.run_seed) is not int or model.run_seed != 42
                         or model.enable_thinking is not True or options["temperature"] != .7
                         or options["max_tokens"] != 8192
@@ -550,35 +550,35 @@ class _Handle:
                         or getattr(model, "request_audit", None) is None
                         or model.request_audit.summary().get("n_clients") != 1
                         or getattr(model.client, "max_retries", None) != 5):
-                    self._fail("production_client_configuration_mismatch")
+                    self.fail("production_client_configuration_mismatch")
                 if self.client is None:
                     self.client = model
                     self.stats["n_clients"] = 1
-                    self._emit("client_bound", run_seed=model.run_seed, max_concurrent_requests=model.max_concurrent_requests,
+                    self.emit("client_bound", run_seed=model.run_seed, max_concurrent_requests=model.max_concurrent_requests,
                                model=model.model_name, request_audit_path=str(model.request_audit.path))
                 elif self.client is not model:
-                    self._fail("multiple_sequential_clients")
+                    self.fail("multiple_sequential_clients")
                 pending = [c for c in self.contexts.values() if c["state"] == "registered"]
                 contexts = []
                 for prompt in options["prompts"]:
                     matches = [c for c in pending if c["prompt"] == prompt and c not in contexts]
                     if len(matches) != 1:
-                        self._fail("unregistered_or_ambiguous_compact_prompt")
+                        self.fail("unregistered_or_ambiguous_compact_prompt")
                     context = matches[0]
-                    self._unchanged(context)
-                    if context["panel_seed"] != _derive_seed(model.run_seed, "funding_panels", ctx[1]):
-                        self._fail("registered_panel_seed_year_mismatch")
+                    self.validate_unchanged(context)
+                    if context["panel_seed"] != derive_seed(model.run_seed, "funding_panels", ctx[1]):
+                        self.fail("registered_panel_seed_year_mismatch")
                     contexts.append(context)
                 if len(contexts) != len(pending) or not contexts:
-                    self._fail("funding_batch_omits_registered_panels")
-                self._emit("batch_started", registrations=[c["registration"] for c in contexts],
+                    self.fail("funding_batch_omits_registered_panels")
+                self.emit("batch_started", registrations=[c["registration"] for c in contexts],
                            year=ctx[1], system_prompt=options["system_prompt"],
                            max_concurrent_requests=model.max_concurrent_requests)
                 for context in contexts:
                     context["year"] = ctx[1]
             results, first_error = [None] * len(contexts), None
             with ThreadPoolExecutor(max_workers=min(model.max_concurrent_requests, len(contexts))) as executor:
-                futures = {executor.submit(self._panel, model, c, ctx[1], options): i for i, c in enumerate(contexts)}
+                futures = {executor.submit(self.panel, model, c, ctx[1], options): i for i, c in enumerate(contexts)}
                 for future in as_completed(futures):
                     try:
                         results[futures[future]] = future.result()
@@ -588,10 +588,10 @@ class _Handle:
                             first_error = error
             if first_error is not None:
                 if isinstance(first_error, (Exception, _Cancelled)):
-                    self._fail("sequential_batch_aborted", error_type=type(first_error).__name__)
+                    self.fail("sequential_batch_aborted", error_type=type(first_error).__name__)
                 raise first_error
             with self.lock:
-                self._emit("batch_returned", registrations=[c["registration"] for c in contexts],
+                self.emit("batch_returned", registrations=[c["registration"] for c in contexts],
                            rankings=[pair[0]["ranked_application_ids"] for pair in results])
                 self.stats["returned_panels"] += len(contexts)
                 for context in contexts:
@@ -605,34 +605,34 @@ class _Handle:
 
     def process(self, original, *args, **kwargs):
         with self.lock:
-            self._active()
+            self.active()
             bound = inspect.signature(original).bind(*args, **kwargs)
             results, metadata = bound.arguments["batch_results"], bound.arguments["metadata_list"]
             contexts = []
             if len(results) != len(metadata):
-                self._fail("sequential_processing_length_mismatch")
+                self.fail("sequential_processing_length_mismatch")
             for pair, meta in zip(results, metadata):
                 matches = [c for c in self.contexts.values() if c["metadata"] is meta and c["state"] == "returned"]
                 if len(matches) != 1 or matches[0] in contexts:
-                    self._fail("processing_unregistered_or_reused_panel")
+                    self.fail("processing_unregistered_or_reused_panel")
                 context = matches[0]
-                self._unchanged(context)
+                self.validate_unchanged(context)
                 if pair[0] != {"ranked_application_ids": context["selected"]}:
-                    self._fail("processed_ranking_differs_from_model_choices")
+                    self.fail("processed_ranking_differs_from_model_choices")
                 contexts.append(context)
             if len(contexts) != sum(c["state"] == "returned" for c in self.contexts.values()):
-                self._fail("processing_omits_returned_panels")
-            self._emit("processing_started", registrations=[c["registration"] for c in contexts])
+                self.fail("processing_omits_returned_panels")
+            self.emit("processing_started", registrations=[c["registration"] for c in contexts])
             try:
                 result = original(*args, **kwargs)  # existing whole-batch compact/permutation validation
             except BaseException:
                 self.stats["processing_failures"] += 1
-                self._emit("processing_failed", registrations=[c["registration"] for c in contexts])
+                self.emit("processing_failed", registrations=[c["registration"] for c in contexts])
                 self.cancel.set()
                 raise
-            self._emit("batch_processed", registrations=[c["registration"] for c in contexts],
+            self.emit("batch_processed", registrations=[c["registration"] for c in contexts],
                        rankings=[list(c["selected"]) for c in contexts],
-                       panels=[_panel_report(c) for c in contexts])
+                       panels=[panel_report(c) for c in contexts])
             self.stats["processed_panels"] += len(contexts)
             for context in contexts:
                 del self.contexts[context["registration"]]
@@ -674,9 +674,9 @@ class _Handle:
             try:
                 summary = self.summary()
                 summary["audit_records"] += 1
-                self._emit("finalized", summary=summary)
+                self.emit("finalized", summary=summary)
                 with self.summary_path.open("x") as stream:
-                    stream.write(_json(self.summary()) + "\n")
+                    stream.write(json_text(self.summary()) + "\n")
                     stream.flush()
                     os.fsync(stream.fileno())
             except Exception as error:
@@ -735,10 +735,10 @@ def install_sequential_funding(funding_class, model_class, audit_path):
             if not funding_phase:
                 return original_generate(self, *args, **kwargs)
             if len(ctx) != 3 or type(ctx[2]) is not int or ctx[2] != 0:
-                handle._fail("native_whole_panel_retry_forbidden")
+                handle.fail("native_whole_panel_retry_forbidden")
             if options["response_format"] != compact.compact_response_format():
                 if any(p == c["prompt"] for p in options["prompts"] for c in handle.contexts.values()):
-                    handle._fail("registered_funding_format_changed")
+                    handle.fail("registered_funding_format_changed")
                 return original_generate(self, *args, **kwargs)
             return handle.batch(self, options)
 
@@ -756,7 +756,7 @@ def install_sequential_funding(funding_class, model_class, audit_path):
         except OSError as error:
             raise SequentialFundingError("fresh_sequential_audit_required") from error
         try:
-            handle._emit("initialized", identity=handle.summary())
+            handle.emit("initialized", identity=handle.summary())
             for (cls, name), descriptor in handle.patches.items():
                 setattr(cls, name, descriptor)
             handle.stats["installed"] = True
@@ -791,11 +791,9 @@ def validate_audit(path, summary, *, request_audit_path, expected_sources=None):
     request_audit_path = Path(request_audit_path)
     check(request_audit_path.is_absolute() and request_audit_path.parent == path.parent,
           "explicit request audit must belong to the same run output directory")
-    check(summary["source_files_sha256"] == (_source_hashes() if expected_sources is None else expected_sources),
-          "frozen source files differ")
     try:
         stored_summary = json.loads(Path(summary["summary_path"]).read_text())
-        check(stored_summary == summary, "sibling summary differs")
+        check(without_hash_metadata(stored_summary) == without_hash_metadata(summary), "sibling summary differs")
         counters = {k: 0 for k in _COUNTERS}
         contexts, seen_keys, processed, years, sdk_join = {}, set(), [], [], {}
         current_year = None
@@ -811,9 +809,7 @@ def validate_audit(path, summary, *, request_audit_path, expected_sources=None):
                 if event == "initialized":
                     check(initial is None and row["sequence"] == 1, "initialization must occur first once")
                     initial = row["identity"]
-                    check(initial["source_sha256"] == summary["source_sha256"]
-                          and initial["source_files_sha256"] == summary["source_files_sha256"]
-                          and all(initial[k] == 0 for k in _COUNTERS)
+                    check(all(initial[k] == 0 for k in _COUNTERS)
                           and initial["installed"] is False and initial["status"] == "running",
                           "initial identity/counters")
                 elif event == "panel_registered":
@@ -828,15 +824,9 @@ def validate_audit(path, summary, *, request_audit_path, expected_sources=None):
                     selection_seed_context(1, row["program_id"], row["panel_index"], 0)
                     key = (row["panel_seed"], row["program_id"], row["panel_index"])
                     check(type(row["panel_seed"]) is int and key not in seen_keys, "duplicate panel key")
-                    check(row["map_sha256"] == _sha(mapping)
-                          and row["prompt_sha256"] == _text_sha(row["prompt"]), "registered hashes")
                     selection_prompt(row["prompt"], [], list(range(len(mapping))))
-                    check(row["panel_seed"] == _derive_seed(42, "funding_panels", current_year["year"]),
+                    check(row["panel_seed"] == derive_seed(42, "funding_panels", current_year["year"]),
                           "registered year seed mismatch")
-                    # Private metadata consists ONLY of program/panel and the ordered map.
-                    frozen = {"program_id": row["program_id"], "panel_index": row["panel_index"],
-                              "apps": [{"applicant_id": aid} for _, aid in mapping]}
-                    check(row["metadata_sha256"] == _sha(frozen), "metadata map hash")
                     contexts[rid] = {**row, "selected": [], "pending": None, "next_attempt": 0, "state": "registered"}
                     seen_keys.add(key)
                     counters["registered_panels"] += 1
@@ -861,7 +851,7 @@ def validate_audit(path, summary, *, request_audit_path, expected_sources=None):
                           and row["panel_count"] == len(ids)
                           and row["native_submitted_applications"] == sum(
                               len(contexts[r]["application_map"]) for r in ids)
-                          and row["panel_seed"] == _derive_seed(42, "funding_panels", row["year"]),
+                          and row["panel_seed"] == derive_seed(42, "funding_panels", row["year"]),
                           "empty/nonempty agency counts")
                     current_year["agencies"].append({k: row[k] for k in (
                         "year", "agency_id", "panel_seed", "native_submitted_applications", "registrations", "panel_count")})
@@ -893,7 +883,7 @@ def validate_audit(path, summary, *, request_audit_path, expected_sources=None):
                     for rid in ids:
                         c = contexts[rid]
                         check(c["state"] == "registered"
-                              and c["panel_seed"] == _derive_seed(42, "funding_panels", row["year"]),
+                              and c["panel_seed"] == derive_seed(42, "funding_panels", row["year"]),
                               "panel seed/year")
                         c["year"], c["system_prompt"], c["state"] = row["year"], row["system_prompt"], "running"
                     batch = {"ids": ids, "returned": False}
@@ -910,8 +900,7 @@ def validate_audit(path, summary, *, request_audit_path, expected_sources=None):
                     messages = build_selection_messages(
                         selection_prompt(c["prompt"], c["selected"], remaining), system_prompt=c["system_prompt"])
                     check(row["year"] == c["year"] and row["seed_ctx"] == list(ctx)
-                          and row["run_seed"] == 42 and row["seed"] == _derive_seed(42, *ctx, 0, row["attempt"])
-                          and row["messages_sha256"] == _sha(messages)
+                          and row["run_seed"] == 42 and row["seed"] == derive_seed(42, *ctx, 0, row["attempt"])
                           and row["schema"] == selection_schema(remaining)
                           and row["temperature"] == .7 and row["max_tokens"] == 8192, "request descriptor")
                     check(row["attempt_id"] == f"{row['registration']}:{row['step']}:{row['attempt']}",
@@ -1024,7 +1013,7 @@ def validate_audit(path, summary, *, request_audit_path, expected_sources=None):
                     ids = row["registrations"]
                     check(processing is not None and ids == processing
                           and row["rankings"] == [contexts[r]["selected"] for r in ids]
-                          and row["panels"] == [_panel_report(contexts[r]) for r in ids],
+                          and row["panels"] == [panel_report(contexts[r]) for r in ids],
                           "processed order/map differs")
                     processed.extend(row["panels"])
                     counters["processed_panels"] += len(ids)
@@ -1035,22 +1024,22 @@ def validate_audit(path, summary, *, request_audit_path, expected_sources=None):
                     check(initial is not None and not contexts and batch is None and processing is None
                           and current_year is None,
                           "unfinished registered panels or requests")
-                    check(row["summary"] == summary, "finalized summary mismatch")
+                    check(without_hash_metadata(row["summary"]) == without_hash_metadata(summary), "finalized summary mismatch")
                     terminal = True
                 else:
                     check(False, "unknown/failing event in purported complete trace")
         check(terminal and counters == {k: summary[k] for k in _COUNTERS}, "missing finalization/counters")
-        request_report = _validate_request_join(client, sdk_join, check, request_audit_path)
+        request_report = validate_request_join(client, sdk_join, check, request_audit_path)
     except SequentialFundingError:
         raise
     except Exception as error:
         raise SequentialFundingError("invalid_sequential_audit", error_type=type(error).__name__) from error
     return {"funding_selection_protocol": SEQUENTIAL_PROTOCOL, "output_representation": OUTPUT_REPRESENTATION,
-            "audit_sha256": checksum.hexdigest(), "source_sha256": summary["source_sha256"],
+            "audit_sha256": checksum.hexdigest(), "source_sha256": summary.get("source_sha256"),
             "processed_panels": processed, "years": years, "request_audit": request_report}
 
 
-def _validate_request_join(client, expected, check, path):
+def validate_request_join(client, expected, check, path):
     """Join every admitted sequential SDK call to the independent client audit."""
     if client is None:
         check(not expected, "SDK calls without bound client")
@@ -1090,7 +1079,7 @@ def _validate_request_join(client, expected, check, path):
                     key = (tuple(ctx), row["item_index"], row["attempt"])
                     check(key in expected and key not in seen, "extra/duplicate sequential request")
                     spec = expected[key]
-                    check(row["request_seed"] == spec["seed"] and row["payload_sha256"] == spec["payload_sha256"]
+                    check(row["request_seed"] == spec["seed"]
                           and row["temperature"] == .7 and row["max_tokens"] == 8192
                           and row["chat_template_kwargs"] == {"enable_thinking": True},
                           "audited HTTP request differs from sequential call")

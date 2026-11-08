@@ -23,12 +23,6 @@ Examples:
   python -m utopia.experiments.funding_cutoff analyze
 """
 
-from utopia.utils.data_utils import write_json as write_json_file
-
-from utopia.runtime.commands import module_command
-
-from utopia.utils.paths import project_root
-
 import argparse
 import json
 import os
@@ -36,8 +30,21 @@ import subprocess
 import sys
 import time
 
+from utopia.runtime.commands import module_command
+from utopia.utils.data_utils import write_json as write_json_file
+from utopia.utils.paths import project_root
+
 REPO_ROOT = str(project_root(__file__))
-from utopia.analysis.funding_cutoff import build_application_dataset, guard_write_path, guarded_makedirs, load_application_log, load_final_checkpoint, run_full_analysis, sample_size_gate, TREATMENT_MAX_FIRST_APP_YEAR
+from utopia.analysis.funding_cutoff import (
+    TREATMENT_MAX_FIRST_APP_YEAR,
+    build_application_dataset,
+    guard_write_path,
+    guarded_makedirs,
+    load_application_log,
+    load_final_checkpoint,
+    run_full_analysis,
+    sample_size_gate,
+)
 
 MODEL = 'Qwen/Qwen3-32B'
 MAIN_CONFIG = dict(num_institutions=100, researchers_per_institution=5,
@@ -316,17 +323,17 @@ def calibgate(args):
     return result
 
 
-def _data_dir(args) -> str:
+def data_dir(args) -> str:
     return os.path.join(REPO_ROOT, args.data_dir)
 
 
 def extract(args):
-    guarded_makedirs(_data_dir(args))
+    guarded_makedirs(data_dir(args))
     df, excl = build_application_dataset(args.experiment_ids,
                                          outputs_dir=args.outputs_dir,
                                          num_years=args.num_years)
     name = f'{args.dataset_name}.parquet'
-    out_parquet = guard_write_path(os.path.join(_data_dir(args), name))
+    out_parquet = guard_write_path(os.path.join(data_dir(args), name))
     df.to_parquet(out_parquet, index=False)
     meta = {
         'experiment_ids': args.experiment_ids, 'num_years': args.num_years,
@@ -334,7 +341,7 @@ def extract(args):
         'treatment_max_first_app_year': TREATMENT_MAX_FIRST_APP_YEAR,
         'extract_commit': git_commit(),
     }
-    out_meta = guard_write_path(os.path.join(_data_dir(args),
+    out_meta = guard_write_path(os.path.join(data_dir(args),
                                              f'{args.dataset_name}_meta.json'))
     write_json_file(meta, out_meta, indent=1)
     print(json.dumps(meta, indent=1))
@@ -343,7 +350,7 @@ def extract(args):
 
 def gate(args):
     import pandas as pd
-    df = pd.read_parquet(os.path.join(_data_dir(args), f'{args.dataset_name}.parquet'))
+    df = pd.read_parquet(os.path.join(data_dir(args), f'{args.dataset_name}.parquet'))
     g = sample_size_gate(df)
     out_dir = guarded_makedirs(os.path.join(REPO_ROOT, 'outputs', 'docs', args.out_tag))
     out = guard_write_path(os.path.join(out_dir, 'sample_size_gate.json'))
@@ -353,8 +360,8 @@ def gate(args):
 
 def analyze(args):
     import pandas as pd
-    df = pd.read_parquet(os.path.join(_data_dir(args), f'{args.dataset_name}.parquet'))
-    with open(os.path.join(_data_dir(args), f'{args.dataset_name}_meta.json')) as f:
+    df = pd.read_parquet(os.path.join(data_dir(args), f'{args.dataset_name}.parquet'))
+    with open(os.path.join(data_dir(args), f'{args.dataset_name}_meta.json')) as f:
         meta = json.load(f)
     out_docs = os.path.join(REPO_ROOT, 'outputs', 'docs', args.out_tag)
     out_visual = os.path.join(REPO_ROOT, 'outputs', 'visual', args.out_tag)

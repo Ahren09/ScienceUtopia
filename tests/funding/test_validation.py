@@ -1,40 +1,37 @@
 from __future__ import annotations
 
-from utopia.utils.paths import project_root
-
 import ast
-
-from copy import deepcopy
-
 import json
-
 import logging
-
 import os
-
-from pathlib import Path
-
 import random
-
 import stat
-
 import sys
-
 import tempfile
-
-from types import SimpleNamespace
-
 import unittest
-
+from copy import deepcopy
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from utopia.funding.validation import FundingRankingValidationError, inspect_funding_result, install_funding_validation
-
 import utopia.funding.validation as gate
-
-from tests.support.funding_rankings import ROOT, STOCK_PATH, stock_class, apps_for, ranking, result_pairs, metadata, PROGRAMS, GateCase
-
-
+from tests.support.funding_rankings import (
+    PROGRAMS,
+    ROOT,
+    STOCK_PATH,
+    GateCase,
+    apps_for,
+    metadata,
+    ranking,
+    result_pairs,
+    stock_class,
+)
+from utopia.funding.validation import (
+    FundingRankingValidationError,
+    inspect_funding_result,
+    install_funding_validation,
+)
+from utopia.utils.paths import project_root
 
 
 class StrictValidatorTests(GateCase):
@@ -660,7 +657,7 @@ class AuditAndLifecycleTests(GateCase):
         tree = ast.parse((ROOT / "utopia/simulation.py").read_text())
         sim = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Simulation")
         rank = next(n for n in sim.body if isinstance(n, ast.FunctionDef)
-                    and n.name == "_rank_funding_applications")
+                    and n.name == "rank_funding_applications")
         retry_code = compile(ast.fix_missing_locations(ast.Module(
             body=[rank], type_ignores=[])), str(ROOT / "utopia/simulation.py"), "exec")
         for compact, recover in ((False, False), (False, True), (True, False), (True, True)):
@@ -682,7 +679,7 @@ class AuditAndLifecycleTests(GateCase):
                     "logger": logging.getLogger("stock-retry-fixture"),
                 }
                 exec(retry_code, ns)
-                results, result_metadata = ns["_rank_funding_applications"](
+                results, result_metadata = ns["rank_funding_applications"](
                     SimpleNamespace(llm=SimpleNamespace(generate_batch=generate_batch)),
                     1, ["unchanged prompt"], metadata(apps), {},
                 )

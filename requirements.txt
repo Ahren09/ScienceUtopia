@@ -16,6 +16,8 @@ pydantic
 networkx
 sentence-transformers
 langchain-core
+langchain-community
+faiss-cpu
 pyarrow
 torch
 vllm

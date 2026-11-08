@@ -8,41 +8,27 @@ are executed from their actual files. Heavy optional imports alone are bypassed.
 
 from __future__ import annotations
 
-from utopia.utils.paths import project_root
-
 import ast
-
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-from copy import deepcopy
-
 import importlib.util
-
 import json
-
 import logging
-
-from pathlib import Path
-
 import random
-
 import sys
-
 import tempfile
-
-from threading import Event, Lock
-
 import time
-
-from types import ModuleType, SimpleNamespace
-
 import unittest
-
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from copy import deepcopy
+from pathlib import Path
+from threading import Event, Lock
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
-import utopia.funding.sequential as seq
+from openai.types import CompletionUsage
 
+import utopia.funding.sequential as seq
 import utopia.funding.validation as gate
+from utopia.utils.paths import project_root
 
 ROOT = project_root(__file__)
 
@@ -149,7 +135,8 @@ def response(
                 ),
             )
         ],
-        usage=SimpleNamespace(prompt_tokens=0, completion_tokens=completion_tokens),
+        usage=CompletionUsage(prompt_tokens=0, completion_tokens=completion_tokens,
+                              total_tokens=completion_tokens),
     )
 
 
@@ -194,7 +181,7 @@ def funding_class():
         "FundingAgency",
         {
             "get_funding_evaluation_prompts",
-            "_build_program_prompt",
+            "build_program_prompt",
             "validate_funding_result",
             "process_funding_evaluation_results",
             "normalize_ranked_applications",
@@ -205,20 +192,11 @@ def funding_class():
 
 
 def model_class():
-    ns = {
-        "build_vllm_extra_body": body_module.build_vllm_extra_body,
-        "SIMULATION_CONFIG": {"llm": {"max_tokens": 2048}},
-        "logger": logging.getLogger("sequential-model-test"),
-        "IMPORTANT_NOTES": seq.IMPORTANT_NOTES,
-        "parse_json_response": json.loads,
-        "ThreadPoolExecutor": ThreadPoolExecutor,
-        "as_completed": as_completed,
-        "tqdm": lambda values, **kwargs: values,
-        "time": time,
-    }
-    return definitions(
-        ROOT / "utopia/models/models.py",
-        "VLLMServerModel",
-        {"_request_seed", "_build_extra_body", "_create_completion", "generate_batch"},
-        ns,
-    )
+    from tests.support.model_transport import CLIENT_NS, Client
+
+    class ScriptedModel(Client):
+        def __init__(self):
+            CLIENT_NS["APIBatchModel"].__init__(
+                self, "Qwen/Qwen3-32B", "http://fixture/v1", api_key="fixture")
+
+    return ScriptedModel

@@ -1,7 +1,8 @@
 """Metrics calculation utilities for simulation analysis"""
 
+from typing import Any, Dict, List, Set, Union
+
 import numpy as np
-from typing import Dict, List, Set, Any, Union
 
 
 def calculate_gini_coefficient(values: Union[List[float], Dict[str, float]]) -> float:
@@ -92,18 +93,18 @@ def calculate_citation_metrics(citations: Dict[str, Set], papers_by_year: Dict[i
     self_citations = 0
     institutional_citations = 0
 
-    def _get_author_set(author_id):
+    def get_author_set(author_id):
         """Normalize author_id to a set of author IDs."""
         if isinstance(author_id, list):
             return set(author_id)
         return {author_id} if author_id else set()
 
     for cited_paper_id, citing_paper_ids in citations.items():
-        cited_authors = _get_author_set(paper_authors.get(cited_paper_id))
+        cited_authors = get_author_set(paper_authors.get(cited_paper_id))
         cited_institutions = {paper_institutions.get(a) for a in cited_authors} - {None}
 
         for citing_paper_id in citing_paper_ids:
-            citing_authors = _get_author_set(paper_authors.get(citing_paper_id))
+            citing_authors = get_author_set(paper_authors.get(citing_paper_id))
             citing_institutions = {paper_institutions.get(a) for a in citing_authors} - {None}
 
             if cited_authors & citing_authors:

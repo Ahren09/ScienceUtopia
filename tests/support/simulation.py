@@ -13,62 +13,39 @@ execute original code. This is unit/integration evidence, NOT a Qwen run.
 
 from __future__ import annotations
 
-import utopia.funding.feedback as feedback
-import utopia.runtime.provenance as provenance
-
-from utopia.utils.paths import project_root
-from utopia.utils.data_utils import write_json_atomic, write_json_gzip_atomic
-
 import ast
-
-from collections import Counter, defaultdict
-
-from contextlib import contextmanager, redirect_stdout
-
-from copy import deepcopy
-
-import io
-
 import gzip
-
+import io
 import json
-
 import logging
-
 import os
-
-from pathlib import Path
-
 import random
-
 import re
-
 import sys
-
 import tempfile
-
 import time
-
-from types import ModuleType, SimpleNamespace
-
-from typing import Dict, List, Set, Union
-
 import unittest
-
+from collections import Counter, defaultdict
+from contextlib import contextmanager, redirect_stdout
+from copy import deepcopy
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
+from typing import Dict, List, Set, Union
 from unittest.mock import patch
 
 import numpy as np
-
 import pandas as pd
+
+import utopia.funding.feedback as feedback
+import utopia.runtime.provenance as provenance
+from utopia.utils.data_utils import write_json_atomic, write_json_gzip_atomic
+from utopia.utils.paths import project_root
 
 ROOT = project_root(__file__)
 
 import utopia.experiments.funding_feedback as jm
-
 import utopia.funding.sequential as sequential
-
 from utopia.config import SIMULATION_CONFIG
-
 from utopia.metrics.tracker import calculate_gini_coefficient
 
 
@@ -128,7 +105,7 @@ def original_namespace():
         "write_json_atomic": write_json_atomic,
         "write_json_gzip_atomic": write_json_gzip_atomic,
     }
-    original_definitions("utopia/utils/seeding.py", ["derive_seed"], ns)
+    original_definitions("utopia/utils/seeding.py", ["derive_seed", "capture_rng_state", "restore_rng_state"], ns)
     original_definitions(
         "utopia/agents/base_agent.py", ["SimulationAgent", "MultiAgentEcosystem"], ns
     )
@@ -290,7 +267,7 @@ def make_simulation(
 def run_phase(sim):
     result = {}
     with redirect_stdout(io.StringIO()):
-        sim._run_phase_5_update_funding(1, [], result)
+        sim.run_phase_5_update_funding(1, [], result)
     return result
 
 
@@ -303,7 +280,7 @@ def make_panel_simulation(directory, cell="P1F1", *, base=False):
     method = next(
         n
         for n in ast.walk(tree)
-        if isinstance(n, ast.FunctionDef) and n.name == "_add_funding_agencies"
+        if isinstance(n, ast.FunctionDef) and n.name == "add_funding_agencies"
     )
     rates = {}
     for node in ast.walk(method):
@@ -491,16 +468,16 @@ class SequentialScriptedLLM(FullYearScriptedLLM):
                 answer["relevant_projects"] = [0]
         return answers
 
-    def _request_seed(self, seed_ctx, item_index, attempt):
+    def request_seed(self, seed_ctx, item_index, attempt):
         return ORIGINAL["derive_seed"](42, *seed_ctx, item_index, attempt)
 
-    def _build_extra_body(self, response_format):
+    def build_extra_body(self, response_format):
         return {
             "structured_outputs": {"json": response_format["json_object"]["schema"]},
             "chat_template_kwargs": {"enable_thinking": True},
         }
 
-    def _create_completion(self, *, seed_ctx, item_index, attempt, **kwargs):
+    def create_completion(self, *, seed_ctx, item_index, attempt, **kwargs):
         self.selection_requests.append(
             deepcopy(
                 {
@@ -621,9 +598,11 @@ def zero_sequential_fixture(directory, years=feedback.YEARS):
 
 def initialize_actual_simulator(cls):
     import pickle
+
     import torch
-    import utopia.simulation as actual
+
     import utopia.agents.conference as conference_module
+    import utopia.simulation as actual
 
     cls.actual = actual
     cls.conference_module = conference_module

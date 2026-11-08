@@ -4,7 +4,7 @@ import hashlib
 import json
 
 
-def _request_summary(arguments):
+def request_summary(arguments):
     result = dict(arguments)
     for key in ("prompt", "prompts"):
         if key not in result:
@@ -24,7 +24,7 @@ class KeywordTransport:
         self.requests = []
 
     def generate_batch(self, prompts, **options):
-        self.requests.append(_request_summary(dict(prompts=prompts, **options)))
+        self.requests.append(request_summary(dict(prompts=prompts, **options)))
         replies = [
             [
                 {"keywords": ["Neural", "Language", "Theory"]},
@@ -43,7 +43,7 @@ class CorpusKeywordTransport:
         self.requests = []
 
     def generate(self, **options):
-        self.requests.append(_request_summary(options))
+        self.requests.append(request_summary(options))
         return {
             "keywords_in_abstract": ["Graph Search"],
             "keywords_not_in_abstract": ["Optimization"],

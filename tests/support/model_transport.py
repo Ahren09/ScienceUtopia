@@ -1,12 +1,11 @@
-"""CPU transport regressions for the shared vLLM 0.12 schema adapter.
+"""CPU transport regressions for the shared vLLM and Bedrock batch clients.
 
-Run from the scratch repository root:
-  /opt/anaconda3/bin/python3 -B -m unittest discover -s src \
-      -p test_vllm_schema_transport.py -v
+Run from the repository root:
+  python -m pytest tests/models/test_schema_transport.py -q
 
 The real OpenAI SDK serializes requests into an HTTPX MockTransport: no network
 or inference is performed. Because importing the whole models module requires
-Torch and unrelated providers, its exact BaseLLM/VLLMServerModel/parser source
+Torch and unrelated providers, its exact shared/provider client and parser source
 definitions are compiled unchanged. Original Pydantic schema definitions and
 response-format expressions are likewise executed, with fixture conference
 enums for dynamic schemas. This tests outgoing wire payloads, not a running
@@ -15,60 +14,38 @@ vLLM grammar backend or Qwen's ability to finish within its token budget.
 
 from __future__ import annotations
 
-from utopia.utils.paths import project_root
-
 import ast
-
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-from copy import deepcopy
-
-from enum import Enum
-
 import importlib.util
-
 import json
-
 import logging
-
 import os
-
-from pathlib import Path
-
 import random
-
 import re
-
 import subprocess
-
 import sys
-
 import threading
-
 import time
-
-from types import ModuleType
-
-from typing import Dict, List, Optional, Tuple, Union
-
 import unittest
-
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from copy import deepcopy
+from enum import Enum
+from pathlib import Path
+from types import ModuleType
+from typing import Dict, List, Optional, Tuple, Union
 from unittest.mock import patch
 
 import httpx
-
 import jsonschema
-
 from openai import OpenAI
-
 from pydantic import BaseModel
+
+from utopia.utils.paths import project_root
 
 ROOT = project_root(__file__)
 
 
-from utopia.constants import IMPORTANT_NOTES
-
 from utopia.config import SIMULATION_CONFIG
+from utopia.constants import IMPORTANT_NOTES
 
 
 def load_shared_helper():
@@ -95,7 +72,7 @@ def compile_nodes(nodes, namespace, filename):
 def client_definitions():
     path = ROOT / "utopia/models/models.py"
     tree = ast.parse(path.read_text())
-    names = {"BaseLLM", "VLLMServerModel", "parse_json_response"}
+    names = {"BaseLLM", "APIBatchModel", "BedrockModel", "ModelRequestError", "openai_schema", "VLLMServerModel", "parse_json_response", "ExperimentTimeLimit"}
     nodes = [
         n
         for n in tree.body
@@ -112,6 +89,8 @@ def client_definitions():
         "json": json,
         "re": re,
         "time": time,
+        "threading": threading,
+        "Path": Path,
         "logger": logging.getLogger("schema-transport-test"),
         "ThreadPoolExecutor": ThreadPoolExecutor,
         "as_completed": as_completed,
@@ -224,7 +203,7 @@ class WireRecorder:
                     ],
                 },
             )
-        if request.method != "POST" or request.url.path != "/v1/chat/completions":
+        if request.method != "POST" or request.url.path not in ("/v1/chat/completions", "/openai/v1/chat/completions"):
             raise AssertionError(
                 f"Unexpected transport request: {request.method} {request.url}"
             )

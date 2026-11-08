@@ -8,18 +8,22 @@ round-trip.
 Run:  pytest tests/experiments/test_resource_size.py -q
 """
 
-from utopia.utils.paths import project_root
 import os
 import sys
 from collections import Counter
 
 import pytest
 
+from utopia.utils.paths import project_root
+
 REPO_ROOT = str(project_root(__file__))
 import utopia.experiments.resource_size as rf
-from utopia.agents.research_direction import AVAILABLE_DIRECTIONS, get_strategy_filtered_candidate_directions
-from utopia.agents.researcher_agents import UniversityResearcher
 from utopia.agents.base_agent import MultiAgentEcosystem
+from utopia.agents.research_direction import (
+    AVAILABLE_DIRECTIONS,
+    get_strategy_filtered_candidate_directions,
+)
+from utopia.agents.researcher_agents import UniversityResearcher
 from utopia.config import SIMULATION_CONFIG
 
 
@@ -46,17 +50,17 @@ def test_within_institution_half_half_and_totals():
         assert n_low == n_high == len(members) // 2
     assert sum(r["treatment"] == "LOW" for r in bp) == 56
     assert sum(r["treatment"] == "HIGH" for r in bp) == 56
-    rf._assert_design_invariants(bp)  # should not raise
+    rf.assert_design_invariants(bp)  # should not raise
 
 
 def test_determinism_and_stable_hash():
     bp1 = rf.build_factorial_blueprint(8301)
     bp2 = rf.build_factorial_blueprint(8301)
     assert bp1 == bp2
-    assert rf._assignment_hash(bp1) == rf._assignment_hash(bp2)
+    assert rf.assignment_hash(bp1) == rf.assignment_hash(bp2)
     # a different seed changes the assignment
     bp3 = rf.build_factorial_blueprint(9999)
-    assert rf._assignment_hash(bp3) != rf._assignment_hash(bp1)
+    assert rf.assignment_hash(bp3) != rf.assignment_hash(bp1)
 
 
 def test_treatment_mutates_only_resource_field(monkeypatch):
@@ -113,7 +117,7 @@ def test_balanced_strategy_adds_no_exploration_prompt():
     r = UniversityResearcher("r0", "institution_0000", funding_level=100,
                              expertise=list(AVAILABLE_DIRECTIONS[:3]), llm=None,
                              exploration_strategy="balanced")
-    assert r._get_exploration_strategy_prompt().strip() == ""
+    assert r.get_exploration_strategy_prompt().strip() == ""
 
 
 def test_flag_and_panel_neutralization():
@@ -125,7 +129,7 @@ def test_flag_and_panel_neutralization():
     assert prop.fget(object()) is True
     # driver freezes funding_panel_max_apps=0 in resolved config
     import argparse
-    cfg = rf._resolved_config(argparse.Namespace(vllm_url=None))
+    cfg = rf.resolved_config(argparse.Namespace(vllm_url=None))
     assert cfg["funding_panel_max_apps"] == 0
     assert cfg["all_strategies"] == "balanced"
     assert cfg["low_resources"] == 60 and cfg["high_resources"] == 140

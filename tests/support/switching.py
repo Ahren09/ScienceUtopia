@@ -10,59 +10,35 @@ logger/RAG, frozen CPU MiniLM, full rounds and checkpoints in the private env.
 
 from __future__ import annotations
 
-import utopia.runtime.provenance as provenance
-
-import utopia.funding.feedback as feedback
-
-from utopia.utils.paths import project_root
-
 import ast
-
-from collections import Counter, defaultdict
-
-from contextlib import contextmanager, redirect_stdout
-
-from copy import deepcopy
-
-from dataclasses import dataclass
-
 import hashlib
-
 import io
-
 import json
-
 import logging
-
 import os
-
-from pathlib import Path
-
 import random
-
 import re
-
 import sys
-
 import tempfile
-
 import time
-
-from types import ModuleType, SimpleNamespace
-
 import unittest
-
+from collections import Counter, defaultdict
+from contextlib import contextmanager, redirect_stdout
+from copy import deepcopy
+from dataclasses import dataclass
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
 
-import utopia.experiments.switching_propensity as jp
-
-import utopia.agents.switching_policy as policy
-
 import tests.support.simulation as legacy
-
+import utopia.agents.switching_policy as policy
+import utopia.experiments.switching_propensity as jp
+import utopia.funding.feedback as feedback
 import utopia.funding.sequential as sequential
+import utopia.runtime.provenance as provenance
+from utopia.utils.paths import project_root
 
 ROOT = project_root(__file__)
 
@@ -270,7 +246,7 @@ def direction_simulation(
 
 
 def prepare_year(sim, year):
-    rows = sim._resource_rows()
+    rows = sim.resource_rows()
     sim.propensity_years[year] = {
         "year": year,
         "cell": sim.propensity_cell,
@@ -349,7 +325,7 @@ class AuditedPropensityLLM(legacy.SequentialScriptedLLM):
                 temperature=temperature,
                 max_tokens=max_tokens,
                 extra_body={
-                    "seed": self._request_seed(seed_ctx, index, 0),
+                    "seed": self.request_seed(seed_ctx, index, 0),
                     "chat_template_kwargs": {"enable_thinking": True},
                 },
             )
@@ -424,7 +400,7 @@ def funding_manifest_fixture(out, compact, *, initialize_only):
             (out / feedback.SEQUENTIAL_SUMMARY_FILE).read_text()
         ),
         "funding_sequential_audits": {
-            name: provenance.file_hash(out / name)
+            name: provenance.file_sha256(out / name)
             for name in (
                 feedback.SEQUENTIAL_AUDIT_FILE,
                 feedback.SEQUENTIAL_SUMMARY_FILE,

@@ -8,7 +8,6 @@ tests/experiments/test_exploration.py.
 Run: python -m pytest tests/experiments/test_influx_factorial.py -v
 """
 
-from utopia.utils.paths import project_root
 import os
 import random
 import sys
@@ -18,14 +17,22 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from utopia.utils.paths import project_root
+
 os.chdir(str(project_root(__file__)))
 
-from utopia.simulation import NORMAL_COMPANIES, NORMAL_UNIVERSITIES, RICH_COMPANIES, RICH_UNIVERSITIES, Simulation, build_influx_cohort
 from utopia.agents.base_agent import MultiAgentEcosystem
 from utopia.agents.research_direction import AVAILABLE_DIRECTIONS
 from utopia.agents.researcher_agents import UniversityResearcher
 from utopia.arguments import parse_arguments
-
+from utopia.simulation import (
+    NORMAL_COMPANIES,
+    NORMAL_UNIVERSITIES,
+    RICH_COMPANIES,
+    RICH_UNIVERSITIES,
+    Simulation,
+    build_influx_cohort,
+)
 
 # ---------------------------------------------------------------- helpers
 
@@ -128,7 +135,7 @@ def test_apply_influx_off_is_noop():
     random.seed(99)
     py_state = random.getstate()
     before = dict(eco.agent_population)
-    assert Simulation._apply_annual_influx(stub, 1) == []
+    assert Simulation.apply_annual_influx(stub, 1) == []
     assert eco.agent_population == before
     assert random.getstate() == py_state
 
@@ -141,7 +148,7 @@ def test_apply_influx_on_injects_and_wires_coi():
     founders[3].is_active = False  # culled member must still be CoI-wired
     stub = make_stub_sim(rate=0.1, eco=eco)
 
-    entrants = Simulation._apply_annual_influx(stub, 1)
+    entrants = Simulation.apply_annual_influx(stub, 1)
     # MIT is RICH_UNIVERSITIES[0] -> H1 -> hires in year 1
     assert 'MIT_researcher_5' in entrants
     entrant = eco.get_agent_by_id('MIT_researcher_5')
@@ -160,9 +167,9 @@ def test_apply_influx_on_injects_and_wires_coi():
 def test_apply_influx_idempotent():
     eco = MultiAgentEcosystem(agent_configs={})
     stub = make_stub_sim(rate=0.1, eco=eco)
-    first = Simulation._apply_annual_influx(stub, 1)
+    first = Simulation.apply_annual_influx(stub, 1)
     assert len(first) == 30
-    second = Simulation._apply_annual_influx(stub, 1)  # resume replay of year 1
+    second = Simulation.apply_annual_influx(stub, 1)  # resume replay of year 1
     assert second == []
     assert len(eco.agent_population) == 30
 
@@ -179,7 +186,7 @@ def test_disable_resubmission_early_return():
         args=SimpleNamespace(disable_resubmission=True),
         llm=ExplodingLLM(),
     )
-    assert Simulation._run_phase_0_resubmissions(stub, 5, {}) == []
+    assert Simulation.run_phase_0_resubmissions(stub, 5, {}) == []
 
 
 # ------------------------------------------------------ CLI flags

@@ -15,7 +15,7 @@ phase loop, batching, checkpoint/resume, and Parquet metric export. The only
 overrides are (1) `is_exploration_experiment -> True` (deliberately enable the
 exploration metric/tracker exporters AND the enumerated-candidate direction
 mechanism that supplies the horizon menu -- see mechanism audit), and (2)
-`_initialize_university_only_population` (heterogeneous sizes + within-institution
+`initialize_university_only_population` (heterogeneous sizes + within-institution
 LOW/HIGH treatment). Funding panelization -- the only other scientific mechanism
 the exploration path would change -- is neutralized with --funding_panel_max_apps 0
 (global funding ranking = neutral default). All researchers are `balanced`
@@ -37,26 +37,26 @@ Run:
       --vllm_url https://continual-learning--science-utopia-irxs-vllm-serve.modal.run/v1
 """
 
-from utopia.utils.data_utils import write_json as write_json_file
-
-from utopia.utils.paths import project_root
 import argparse
 import hashlib
 import json
 import os
 import sys
 
+from utopia.utils.data_utils import write_json as write_json_file
+from utopia.utils.paths import project_root
+
 REPO_ROOT = str(project_root(__file__))
 import pandas as pd
 
-from utopia.simulation import Simulation
 from utopia.agents.research_direction import AVAILABLE_DIRECTIONS, DIRECTIONS_DICT
 from utopia.agents.researcher_agents import UniversityResearcher
 from utopia.arguments import parse_arguments
 from utopia.models.models import VLLMServerModel
-from utopia.utils.seeding import derive_seed, set_seed
-from utopia.runtime.setup import project_setup
 from utopia.runtime.provenance import write_run_manifest
+from utopia.runtime.setup import project_setup
+from utopia.simulation import Simulation
+from utopia.utils.seeding import derive_seed, set_seed
 
 # ----------------------------------------------------------------------------
 # Frozen experiment constants (prereg). Do NOT tune after seeing any outcome.
@@ -84,7 +84,7 @@ VLLM_VERSION = "0.12.0"
 DEFAULT_VLLM_URL = "https://continual-learning--science-utopia-irxs-vllm-serve.modal.run/v1"
 
 
-def _sha256(text: str) -> str:
+def text_digest(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
@@ -154,19 +154,19 @@ def build_factorial_blueprint(seed: int = SEED) -> list:
     return rows
 
 
-def _assignment_hash(rows: list) -> str:
+def assignment_hash(rows: list) -> str:
     """Stable hash of the (researcher -> treatment,resources) assignment."""
     payload = ";".join(
         f"{r['researcher_name']}:{r['tier']}:{r['treatment']}:{r['funding_level']}"
         for r in sorted(rows, key=lambda r: r["researcher_name"]))
-    return _sha256(payload)
+    return text_digest(payload)
 
 
-def _write_manifests_and_balance(rows: list, docs_dir: str) -> dict:
+def write_manifests_and_balance(rows: list, docs_dir: str) -> dict:
     """Write institution + researcher manifests and the pre-treatment balance
     table; return the assignment hashes / summary."""
     os.makedirs(docs_dir, exist_ok=True)
-    overall_hash = _assignment_hash(rows)
+    overall_hash = assignment_hash(rows)
 
     # --- institution manifest ---
     inst_rows = {}
@@ -188,7 +188,7 @@ def _write_manifests_and_balance(rows: list, docs_dir: str) -> dict:
             "headcount_scaled_quantities": "none",
             "n_low": sum(m["treatment"] == "LOW" for m in members),
             "n_high": sum(m["treatment"] == "HIGH" for m in members),
-            "assignment_hash": _assignment_hash(members),
+            "assignment_hash": assignment_hash(members),
         })
     pd.DataFrame(institution_manifest).to_csv(
         os.path.join(docs_dir, "institution_manifest.csv"), index=False)
@@ -211,12 +211,12 @@ def _write_manifests_and_balance(rows: list, docs_dir: str) -> dict:
     # Covariate: expertise-menu durations (direction.years), a fixed pre-treatment
     # attribute that could in principle bias the horizon endpoint. Reported across
     # LOW/HIGH (balanced by within-institution randomization) and across tiers.
-    def _menu_years(r):
+    def menu_years(r):
         return [DIRECTIONS_DICT[t].years for t in r["expertise_topics"]]
 
-    def _group_stats(group_rows):
+    def group_stats(group_rows):
         import numpy as np
-        menu = [_menu_years(r) for r in group_rows]
+        menu = [menu_years(r) for r in group_rows]
         mean_years = [float(np.mean(m)) for m in menu]
         min_years = [float(np.min(m)) for m in menu]
         max_years = [float(np.max(m)) for m in menu]
@@ -239,7 +239,7 @@ def _write_manifests_and_balance(rows: list, docs_dir: str) -> dict:
                        ("tier:medium", [r for r in rows if r["tier"] == "medium"]),
                        ("tier:large", [r for r in rows if r["tier"] == "large"]),
                        ("ALL", rows)]:
-        stats = _group_stats(sel)
+        stats = group_stats(sel)
         stats["group"] = label
         balance.append(stats)
     pd.DataFrame(balance).set_index("group").to_csv(
@@ -252,7 +252,7 @@ def _write_manifests_and_balance(rows: list, docs_dir: str) -> dict:
             "n_researchers": len(rows)}
 
 
-def _assert_design_invariants(rows: list):
+def assert_design_invariants(rows: list):
     """Assert the frozen design + the CORRECT treatment invariant.
 
     LOW and HIGH are DIFFERENT randomized researchers (different expertise /
@@ -293,11 +293,11 @@ def initialize_factorial_population(sim, blueprint: list):
     reusing the stock construction / conflict-of-interest / blueprint-persist
     path. REUSED verbatim: UniversityResearcher.__init__ (per-row funding_level
     -> self.resources), ecosystem.add_agent, add_conflict_of_interest,
-    _add_funding_agencies, blueprint CSV persist. OVERRIDDEN only: the blueprint
+    add_funding_agencies, blueprint CSV persist. OVERRIDDEN only: the blueprint
     generation (variable sizes + per-row treatment)."""
     from collections import defaultdict
 
-    _assert_design_invariants(blueprint)
+    assert_design_invariants(blueprint)
 
     for row in blueprint:
         researcher = UniversityResearcher(
@@ -325,13 +325,13 @@ def initialize_factorial_population(sim, blueprint: list):
         os.path.join(sim.output_dir, "population_blueprint.csv"), index=False)
 
     # Manifests + balance table + invariant record.
-    summary = _write_manifests_and_balance(blueprint, sim.args.docs_dir)
+    summary = write_manifests_and_balance(blueprint, sim.args.docs_dir)
 
     # Treatment/tier lookup for the decision log.
     sim._treatment_by_agent = {r["researcher_name"]: r["treatment"] for r in blueprint}
     sim._tier_by_agent = {r["researcher_name"]: r["tier"] for r in blueprint}
 
-    sim._add_funding_agencies()
+    sim.add_funding_agencies()
     print(f"[factorial] population: {summary['n_researchers']} researchers @ "
           f"{summary['n_institutions']} institutions "
           f"(LOW={summary['n_low']}, HIGH={summary['n_high']}); "
@@ -353,11 +353,11 @@ class FactorialSimulation(Simulation):
         # resource-independent; funding panelization is neutralized).
         return True
 
-    def _initialize_university_only_population(self):
+    def initialize_university_only_population(self):
         blueprint = build_factorial_blueprint(getattr(self.args, "seed", SEED))
         initialize_factorial_population(self, blueprint)
 
-    def _run_phase_1_research_directions(self, year, year_results):
+    def run_phase_1_research_directions(self, year, year_results):
         # Capture who receives a NEW direction this year BEFORE the stock method
         # updates project_end_year (same filter as the parent, line ~1802). No
         # extra LLM call; the decision log is written from the results the parent
@@ -365,11 +365,11 @@ class FactorialSimulation(Simulation):
         # candidate menu (= the researcher's expertise for `balanced`).
         authors = self.ecosystem.get_available_authors()
         pending_ids = [a.id for a in authors if a.project_end_year < year and a.is_active]
-        result = super()._run_phase_1_research_directions(year, year_results)
-        self._log_project_decisions(year, pending_ids)
+        result = super().run_phase_1_research_directions(year, year_results)
+        self.log_project_decisions(year, pending_ids)
         return result
 
-    def _log_project_decisions(self, year, pending_ids):
+    def log_project_decisions(self, year, pending_ids):
         path = os.path.join(self.args.docs_dir, "project_decisions.jsonl")
         with open(path, "a") as f:
             for aid in pending_ids:
@@ -407,7 +407,7 @@ class FactorialSimulation(Simulation):
 # ----------------------------------------------------------------------------
 # Argument / path wiring (in-process; canonical non-explore_* layout).
 # ----------------------------------------------------------------------------
-def _build_args(vllm_url: str):
+def build_args(vllm_url: str):
     sim_argv = [
         "--experiment_name", "default_irxs",   # neutral, passes the whitelist
         "--seed", str(SEED),
@@ -441,7 +441,7 @@ def _build_args(vllm_url: str):
     return args
 
 
-def _make_sim(args, llm):
+def make_sim(args, llm):
     return FactorialSimulation(
         llm=llm,
         verbose=args.verbose,
@@ -462,7 +462,7 @@ def _make_sim(args, llm):
     )
 
 
-def _resolved_config(args) -> dict:
+def resolved_config(args) -> dict:
     return {
         "experiment_id": EXP_ID,
         "seed": SEED,
@@ -492,10 +492,10 @@ def run_init_only():
     """Preflight: build population via the real init path, write manifests +
     balance table, assert invariants, and round-trip the ecosystem
     serialization. NO scientific LLM decisions; effects NOT inspected."""
-    args = _build_args(vllm_url=None)
+    args = build_args(vllm_url=None)
     project_setup()
     set_seed(SEED)
-    sim = _make_sim(args, llm=None)   # offline: researchers created with llm=None
+    sim = make_sim(args, llm=None)   # offline: researchers created with llm=None
     sim.initialize_agents()
 
     # Ecosystem serialization check: to_dict() must carry the treated resource
@@ -509,7 +509,7 @@ def run_init_only():
         assert got == want, f"serialization resource mismatch {aid}: {got} != {want}"
 
     manifest = {"experiment_id": EXP_ID, "n_researchers": len(sim._treatment_by_agent),
-                "resolved_config": _resolved_config(args)}
+                "resolved_config": resolved_config(args)}
     write_json_file(manifest, os.path.join(args.docs_dir, 'init_only_summary.json'), indent=2)
     print(f"[factorial] init_only OK -> manifests + balance_table in {args.docs_dir}; "
           f"ecosystem round-trip preserved resources.", flush=True)
@@ -531,7 +531,7 @@ def run_connectivity_check(vllm_url: str):
         seed_ctx=("connectivity", 0))
     print("[factorial] connectivity outputs:", outputs, flush=True)
     print("[factorial] call_stats:", getattr(llm, "call_stats", None), flush=True)
-    freeze = _resolved_config(argparse.Namespace(vllm_url=vllm_url))
+    freeze = resolved_config(argparse.Namespace(vllm_url=vllm_url))
     freeze["endpoint"] = vllm_url
     write_json_file(freeze, 'outputs/docs/%s/connectivity_freeze.json' % EXP_ID, indent=2)
     print("[factorial] freeze record written.", flush=True)
@@ -540,7 +540,7 @@ def run_connectivity_check(vllm_url: str):
 def run_full(vllm_url: str):
     """Full seed-8301 simulation (checkpointed, resumable via the same command)."""
     assert vllm_url, "--vllm_url is required for the full run"
-    args = _build_args(vllm_url)
+    args = build_args(vllm_url)
     project_setup()
     set_seed(SEED)
     print(f"[factorial] run seed={SEED} -> {args.checkpoint_dir}", flush=True)
@@ -549,11 +549,11 @@ def run_full(vllm_url: str):
                           max_concurrent_requests=args.batch_size, run_seed=SEED)
     # Record the resolved/frozen config up front (run() then merges status).
     write_run_manifest(args.docs_dir, status="initializing", args=args,
-                       resolved_config=_resolved_config(args))
+                       resolved_config=resolved_config(args))
     with open(os.path.join(args.log_dir, "command.txt"), "w") as f:
         f.write(" ".join([sys.executable] + sys.argv) + "\n")
 
-    sim = _make_sim(args, llm)
+    sim = make_sim(args, llm)
     sim.run()
     print(f"[factorial] run complete -> tables in {args.docs_dir}", flush=True)
 

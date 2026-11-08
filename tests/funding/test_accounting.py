@@ -8,39 +8,47 @@ No simulator logic is copied. This tests bookkeeping, NOT model quality.
 """
 from __future__ import annotations
 
-from utopia.runtime.historical import historical_source_path
-
-from utopia.utils.paths import project_root
-
 import ast
-from contextlib import contextmanager, redirect_stdout, redirect_stderr
-from copy import deepcopy
-from dataclasses import dataclass, field
-from enum import Enum
 import gzip
 import io
 import json
 import os
-from pathlib import Path
 import random
 import re
 import subprocess
 import sys
 import tempfile
 import traceback
-from types import ModuleType, SimpleNamespace
 import unittest
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from copy import deepcopy
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
 
+from utopia.runtime.historical import historical_source_path
+from utopia.utils.paths import project_root
+
 ROOT = project_root(__file__)
 import tests.support.simulation as native
-from utopia.funding.accounting import CATEGORIES, ResourceLedger, apply_resource_change, cost_policy_tag, enter_project_production, project_id, resolve_cost_policy, stable_id
 from utopia.arguments import parse_arguments
 from utopia.config import SIMULATION_CONFIG
 from utopia.constants import IMPORTANT_NOTES
+from utopia.funding.accounting import (
+    CATEGORIES,
+    ResourceLedger,
+    apply_resource_change,
+    cost_policy_tag,
+    enter_project_production,
+    project_id,
+    resolve_cost_policy,
+    stable_id,
+)
 
 
 def policy(**overrides):
@@ -57,6 +65,7 @@ def namespace(ref=None):
     native.original_definitions("utopia/data/paper_tracker.py", ["ArchivedPaper", "PaperTracker"], ns)
     native.original_definitions("utopia/agents/funding_agents.py", ["IndustryFundingSystem"], ns)
     if ref:
+        renamed = {}
         for path, names in (
             ("utopia/agents/base_agent.py", {"SimulationAgent", "MultiAgentEcosystem"}),
             ("utopia/agents/researcher_agents.py", {"UniversityResearcher", "IndustryResearcher"}),
@@ -65,8 +74,21 @@ def namespace(ref=None):
             text = subprocess.check_output(["git", "show", f"{ref}:{historical_source_path(path)}"], cwd=ROOT, text=True)
             nodes = [n for n in ast.parse(text).body
                      if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name in names]
+            renamed.update({
+                node.name: node.name.lstrip("_")
+                for root in nodes for node in ast.walk(root)
+                if isinstance(node, ast.FunctionDef)
+                and node.name.startswith("_") and not node.name.endswith("__")
+            })
             for node in nodes:
                 for item in ast.walk(node):
+                    # Translate names only so the historical algorithm remains the oracle.
+                    if isinstance(item, ast.FunctionDef):
+                        item.name = renamed.get(item.name, item.name)
+                    elif isinstance(item, ast.Attribute):
+                        item.attr = renamed.get(item.attr, item.attr)
+                    elif isinstance(item, ast.Name):
+                        item.id = renamed.get(item.id, item.id)
                     if isinstance(item, ast.ImportFrom) and item.module == "src.project_cost_accounting":
                         item.module = "utopia.funding.accounting"
             future = ast.parse("from __future__ import annotations").body
@@ -212,7 +234,7 @@ def make_sim(ns, directory, *, k=1, mode="per_paper", fee=None, resubmission=0,
 
 def submit(sim, agent):
     with redirect_stderr(io.StringIO()):
-        return sim._run_phase_2_submit_papers(1, {agent.id: agent.newest_direction}, [agent], [], {})
+        return sim.run_phase_2_submit_papers(1, {agent.id: agent.newest_direction}, [agent], [], {})
 
 
 @contextmanager
@@ -247,7 +269,7 @@ class TestPrimaryAndLegacy(unittest.TestCase):
                 papers = submit(sim, agent)
                 self.assertEqual(len(papers), k)
                 self.assertEqual(agent.resources, 100)
-                sim._charge_annual_costs(1)
+                sim.charge_annual_costs(1)
                 row = sim.resource_ledger.close_year(1, sim.ecosystem.agent_population)[0]
                 self.assertEqual((row["opening_balance"], row["closing_balance"]), (100, 90))
                 self.assertEqual(row["production_submission_cost"], 0)
@@ -293,13 +315,13 @@ class TestPrimaryAndLegacy(unittest.TestCase):
                 previous_papers = []
 
                 for year in range(1, 9):
-                    year_results = sim._setup_year(year)
+                    year_results = sim.setup_year(year)
                     # Native resubmission debit boundary, using last year's papers.
                     for agent, paper in previous_papers:
-                        sim._charge_resubmission(agent, paper, year)
+                        sim.charge_resubmission(agent, paper, year)
                     for agent in founders:
                         agent.project_start_year = agent.project_end_year = year
-                    self.assertEqual(sim._prepare_project_production(year, founders), founders)
+                    self.assertEqual(sim.prepare_project_production(year, founders), founders)
                     previous_papers = []
                     for agent in founders:
                         for output in range(k):
@@ -307,13 +329,13 @@ class TestPrimaryAndLegacy(unittest.TestCase):
                                 "id": f"{agent.id}/year{year}/output{output}", "author_id": agent.id,
                                 "project_start_year": year, "project_end_year": year,
                             }
-                            sim._record_output_cost(agent, paper, year)
+                            sim.record_output_cost(agent, paper, year)
                             previous_papers.append((agent, paper))
-                    sim._charge_annual_costs(year)
+                    sim.charge_annual_costs(year)
                     # Executes native zero application cost, no-award processing,
                     # and the actual resource-based researcher removal condition.
                     with redirect_stdout(io.StringIO()):
-                        sim._run_phase_5_update_funding(year, [], year_results)
+                        sim.run_phase_5_update_funding(year, [], year_results)
                     rows = sim.resource_ledger.close_year(year, population)
                     self.assertEqual(len(rows), 300)
                     for row in rows:
@@ -329,7 +351,7 @@ class TestPrimaryAndLegacy(unittest.TestCase):
                     # or permit a second annual charge. No full-year replay assumed.
                     before = sim.resource_ledger.to_dict()
                     sim.resource_ledger.start_year(year, population)
-                    sim._charge_annual_costs(year)
+                    sim.charge_annual_costs(year)
                     self.assertEqual(sim.resource_ledger.to_dict(), before)
                     if year == 4:
                         sim.resource_ledger = ResourceLedger(json.loads(json.dumps(before)))
@@ -363,7 +385,7 @@ class TestPrimaryAndLegacy(unittest.TestCase):
                     random.seed(4242)
                     np.random.seed(4242)
                     papers = submit(sim, agent)
-                    sim._charge_annual_costs(1)
+                    sim.charge_annual_costs(1)
                     outcomes.append((
                         [p["id"] for p in papers], agent.resources, agent.is_active,
                         sim.llm.prompts, random.getstate(), repr(np.random.get_state()),
@@ -395,7 +417,7 @@ class TestPrimaryAndLegacy(unittest.TestCase):
                     if sequential:
                         sim.llm.result = {"resubmitted_papers": [
                             {"arxiv_id": f"p{i}", "conference": "C"} for i in range(2)]}
-                    papers = sim._run_phase_0_resubmissions(2, {})
+                    papers = sim.run_phase_0_resubmissions(2, {})
                     self.assertEqual(len(papers), expected_count)
                     self.assertEqual(agent.resources, closing)
                     effective = 5 if fee is None else fee
@@ -405,7 +427,7 @@ class TestPrimaryAndLegacy(unittest.TestCase):
                     self.assertEqual(row["resubmission_cost"], opening - closing)
                     self.assertEqual(row["uncollected_cost"], 3 if fee is None else 0)
                     self.assertEqual(row["residual"], 0)
-                    self.assertEqual(len(sim._run_phase_0_resubmissions(2, {})), 0)
+                    self.assertEqual(len(sim.run_phase_0_resubmissions(2, {})), 0)
 
 
 class TestOptionalProjectPolicy(unittest.TestCase):
@@ -455,7 +477,7 @@ class TestOptionalProjectPolicy(unittest.TestCase):
                     self.assertEqual(len(submit(sim, agent)), 1)
                     self.assertIn("already been paid", sim.llm.prompts[-1])
                 self.assertEqual(agent.resources, 85)
-                self.assertTrue(sim._prepare_project_production(1, [agent]))
+                self.assertTrue(sim.prepare_project_production(1, [agent]))
                 self.assertEqual(agent.resources, 85)
 
     def test_zero_override_and_repeated_entry_without_ledger(self):
@@ -465,7 +487,7 @@ class TestOptionalProjectPolicy(unittest.TestCase):
                                       fee=fee, audit=False)
                 submit(sim, agent)
                 for _ in range(3):
-                    sim._prepare_project_production(1, [agent])
+                    sim.prepare_project_production(1, [agent])
                 self.assertEqual(agent.resources, 100 - fee)
                 self.assertEqual(len(agent.production_cost_entries), 1)
 
@@ -551,7 +573,7 @@ class TestLedgerReconciliation(unittest.TestCase):
             sim.resource_ledger = ResourceLedger()
             sim.resource_ledger.start_year(1, sim.ecosystem.agent_population)
             with redirect_stdout(io.StringIO()):
-                sim._run_phase_5_update_funding(1, [], {})
+                sim.run_phase_5_update_funding(1, [], {})
             rows = {r["researcher_id"]: r for r in
                     sim.resource_ledger.close_year(1, sim.ecosystem.agent_population)}
             self.assertEqual(rows["founder_0"]["funding_application_cost"], 6)
@@ -577,10 +599,10 @@ class TestLedgerReconciliation(unittest.TestCase):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
                 sim, agent = make_sim(self.ns, directory, k=2, mode=mode)
                 submit(sim, agent)
-                sim._charge_annual_costs(1)
+                sim.charge_annual_costs(1)
                 sim.resource_ledger.close_year(1, sim.ecosystem.agent_population)
                 with serializer_imports(self.ns, agent.expertise[0]):
-                    sim._save_checkpoint(1)
+                    sim.save_checkpoint(1)
                     state = sim.resource_ledger.to_dict()
                     balance = agent.resources
                     # Simulate exports written beyond the last committed checkpoint.
@@ -589,8 +611,8 @@ class TestLedgerReconciliation(unittest.TestCase):
                     restored = sim.ecosystem.get_agent_by_id(agent.id)
                     self.assertEqual(restored.resources, balance)
                     self.assertEqual(sim.resource_ledger.to_dict(), state)
-                    sim._prepare_project_production(1, [restored])
-                    sim._charge_annual_costs(1)
+                    sim.prepare_project_production(1, [restored])
+                    sim.charge_annual_costs(1)
                     self.assertEqual(restored.resources, balance)
                     self.assertEqual(sim.resource_ledger.to_dict(), state)
                     self.assertEqual(len(Path(directory, "resource_ledger.jsonl").read_text().splitlines()),
@@ -636,7 +658,7 @@ class TestActualPrimaryLedger(unittest.TestCase):
             self.assertEqual(len(founders), 12)
             for year in (1, 2):
                 sim.yearly_results.append(sim.run_one_round(year))
-                sim._save_checkpoint(year, phase=5)
+                sim.save_checkpoint(year, phase=5)
                 path = Path(sim.output_dir) / f"checkpoint_year_{year}.json"
                 opener = path.open if path.exists() else lambda mode: gzip.open(str(path) + ".gz", mode)
                 with opener("rt") as stream:
@@ -783,7 +805,7 @@ class TestSubmissionRefactorCompatibility(unittest.TestCase):
             np.random.seed(821)
             with patch.dict(SIMULATION_CONFIG["citation"], expected_citation_per_round=1), \
                     redirect_stderr(io.StringIO()):
-                papers = sim._run_phase_2_submit_papers(
+                papers = sim.run_phase_2_submit_papers(
                     2, {agent.id: agent.newest_direction}, active, [resubmission], year_results)
             return {
                 "papers": papers, "calls": calls, "retrievals": retrievals,
@@ -840,7 +862,7 @@ class TestSubmissionRefactorCompatibility(unittest.TestCase):
 
                 sim.llm.generate_batch = decisions
                 sim.funding_tracker.start_cycle(2, sim.ecosystem.agent_population)
-                result = sim._run_phase_0_resubmissions(2, {})
+                result = sim.run_phase_0_resubmissions(2, {})
                 outcomes.append((result, agent.resources, calls, sim.funding_tracker.to_dict()))
         self.assertEqual(outcomes[0], outcomes[1])
         self.assertEqual([paper["id"] for paper in outcomes[1][0]], ["p0", "p1"])

@@ -17,7 +17,6 @@ No Simulation construction, no LLM calls, no dataset access.
 Run: python -m pytest tests/experiments/test_scale_expansion.py -v
 """
 
-from utopia.utils.paths import project_root
 import hashlib
 import json
 import os
@@ -30,17 +29,23 @@ from types import SimpleNamespace
 import pytest
 from langchain_core.documents import Document
 
+from utopia.utils.paths import project_root
+
 os.chdir(str(project_root(__file__)))
 
-from utopia.constants import STANDARDIZED_REVIEW_POLICY
-from utopia.simulation import Simulation
 from utopia.agents.base_agent import MultiAgentEcosystem
-from utopia.agents.conference import Conference, ConferenceStatus, create_default_conference_system
+from utopia.agents.conference import (
+    Conference,
+    ConferenceStatus,
+    create_default_conference_system,
+)
 from utopia.agents.funding_agents import FundingAgency
 from utopia.agents.research_direction import AVAILABLE_DIRECTIONS
 from utopia.agents.researcher_agents import UniversityResearcher
 from utopia.arguments import parse_arguments
+from utopia.constants import STANDARDIZED_REVIEW_POLICY
 from utopia.data.paper_tracker import PaperTracker
+from utopia.simulation import Simulation
 
 FIXTURES = str(project_root(__file__) / 'tests/support/fixtures')
 
@@ -85,7 +90,7 @@ def stub_sim(**overrides):
                 conference_system=None, ecosystem=None)
     base.update(overrides)
     ns = SimpleNamespace(**base)
-    ns._get_all_author_ids = lambda paper: Simulation._get_all_author_ids(paper)
+    ns.get_all_author_ids = lambda paper: Simulation.get_all_author_ids(paper)
     return ns
 
 
@@ -140,6 +145,123 @@ def test_cli_defaults_are_legacy():
 
 
 # ---------------------------------------------------------------- 2. new mechanisms
+
+def test_resubmission_analysis_separates_reused_reports_and_reads_gzip(tmp_path):
+    import gzip
+
+    from utopia.analysis.resubmission_stats import compute_stats
+
+    def attempt(year, venue, reused=False):
+        return {'year': year, 'conference': venue, 'reviews': [
+            {'reviewer_id': reviewer, 'overall_score': 3, 'reused': reused}
+            for reviewer in ('a0', 'a1')]}
+
+    papers = [
+        {'author_id': 'a0', 'status': 'accept',
+         'review_history': [attempt(1, 'c0'), attempt(2, 'c0', True)]},
+        {'author_id': 'a1', 'status': 'accept', 'review_history': [attempt(1, 'c1')]},
+        {'author_id': 'a0', 'status': 'accept', 'review_history': [attempt(6, 'c0')]},
+        {'author_id': 'a1', 'status': 'accept',
+         'review_history': [attempt(6, 'c1'), attempt(7, 'c1', True)]},
+        {'author_id': 'a0', 'status': 'reject', 'review_history': [attempt(10, 'c0')]},
+    ]
+    for year in range(1, 11):
+        checkpoint = {
+            'paper_tracker': {'papers': papers if year == 10 else []},
+            'ecosystem_data': {'agents': [
+                {'id': 'a0', 'can_author': True, 'can_review': True,
+                 'is_active': True, 'resources': 100},
+                {'id': 'a1', 'can_author': True, 'can_review': True,
+                 'is_active': year < 10, 'resources': 10},
+            ]},
+        }
+        with gzip.open(tmp_path / f'checkpoint_year_{year}.json.gz', 'wt') as stream:
+            json.dump(checkpoint, stream)
+    stats = compute_stats(str(tmp_path), 10)
+    assert stats['total_new_reports'] == 10
+    assert stats['total_reused_reports'] == 4
+    assert stats['new_reports_by_year'][2] == 0
+    assert stats['reused_reports_by_year'][2] == 2
+    assert stats['total_reports_by_year'][2] == 2
+    assert stats['reviews_per_active_reviewer_by_year'][10] == 2
+    assert stats['reviews_per_pool_member_by_year'][10] == 1
+    assert 2 not in stats['mean_reviews_per_reviewer_year']
+    (tmp_path / 'checkpoint_year_9.json.gz').unlink()
+    with pytest.raises(FileNotFoundError):
+        compute_stats(str(tmp_path), 10)
+
+
+def test_venue_rates_are_topic_matched_and_survive_checkpoint_round_trip():
+    from utopia.agents.conference import make_venue_variants
+    base = create_default_conference_system().conferences[:2]
+    uniform = make_venue_variants(base, 'uniform')
+    hidden = make_venue_variants(base, 'heterogeneous_hidden')
+    visible = make_venue_variants(base, 'heterogeneous_visible')
+    assert len(hidden) == 6
+    assert [c.conference_id for c in hidden] == [c.conference_id for c in visible]
+    assert [c.conference_id for c in hidden] == [c.conference_id for c in uniform]
+    for offset in (0, 3):
+        group = hidden[offset:offset + 3]
+        assert len({tuple(c.topics) for c in group}) == 1
+        assert [c.acceptance_rate for c in group] == [0.15, 0.30, 0.45]
+        assert [c.prestige for c in group] == [3, 2, 1]
+    assert all(c.acceptance_rate == 0.30 for c in uniform)
+    assert all(not c.show_attributes for c in hidden)
+    assert all(c.show_attributes for c in visible)
+    for conf in visible:
+        restored = Conference.from_dict(conf.to_dict())
+        assert restored.acceptance_rate == conf.acceptance_rate
+        assert restored.show_attributes and restored.prestige == conf.prestige
+
+
+def test_venue_visibility_enters_both_submission_decisions():
+    from utopia.agents.conference import make_venue_variants
+    agent, confs, tracker, direction, candidates, paper, rejected = golden_inputs()
+    hidden = make_venue_variants(confs, 'heterogeneous_hidden')
+    visible = make_venue_variants(confs, 'heterogeneous_visible')
+    for builder in (
+        lambda venues: agent.get_resubmission_prompt(rejected, venues)[0],
+        lambda venues: agent.get_paper_submission_prompt(
+            candidates, 1, venues, direction, tracker)[0],
+    ):
+        hidden_text, visible_text = builder(hidden), builder(visible)
+        assert 'Acceptance rate:' not in hidden_text and 'prestige:' not in hidden_text
+        assert 'Acceptance rate: 15%' in visible_text and 'prestige: 3' in visible_text
+        without_attributes = '\n'.join(
+            line for line in visible_text.split('\n') if not line.startswith('  Acceptance rate:'))
+        assert without_attributes == hidden_text
+
+
+def test_reused_reviews_reach_decisions_without_new_model_calls():
+    from utopia.agents.conference import ConferenceSystem
+    reports = [{'overall_score': float(i + 2), 'justification': 'Original report.',
+                'reviewer_id': f'reviewer_{i}', 'year': 1} for i in range(3)]
+    paper = {'id': 'p', 'title': 'Unchanged paper', 'abstract': 'Same abstract.',
+             'topics': ['cs.AI'], 'author_id': 'author', 'year': 2, 'conference': 'C',
+             'type': 'resubmission', 'review_history': [{'year': 1, 'reviews': reports}]}
+    conf = Conference(conference_id='C', name='C', topics=['cs.AI'], year=2)
+    conf.submitted_papers = [paper]
+    received = []
+    author = SimpleNamespace(process_received_reviews=lambda *args, **kwargs: received.append(args))
+    def unexpected_call(*args, **kwargs):
+        raise AssertionError('Review reuse must not generate new reports')
+    sim = stub_sim(
+        conference_system=ConferenceSystem([conf]),
+        llm=SimpleNamespace(generate_batch=unexpected_call),
+        ecosystem=SimpleNamespace(get_agent_by_id=lambda aid: author),
+        args=SimpleNamespace(review_reuse=True), _capacity_mode_on=False,
+    )
+    sim.reuse_paper_reviews = lambda item, year: Simulation.reuse_paper_reviews(sim, item, year)
+    results = {}
+    scores = Simulation.run_phase_3_peer_review(sim, 2, results)
+    assert scores == {'C': {'p': 3.0}}
+    assert results['peer_review']['new_reports'] == 0
+    assert results['peer_review']['reused_reports'] == 3
+    assert results['peer_review']['total_reports'] == 3
+    assert len(received) == 1
+    assert all(r['year'] == 1 and 'reused' not in r for r in reports)
+    assert all(r['source_year'] == 1 and r['year'] == 2 for r in conf.reviews['p'])
+
 
 def test_standardized_policy_drops_memory_and_inserts_block():
     agent, confs, tracker, direction, cands, paper, rejected = golden_inputs()
@@ -201,7 +323,7 @@ def test_fixed_budget_slots_helper():
     sim = stub_sim(funding_budget_slots_frac=0.2, initial_university_count=100)
     meta = [{'program_id': 'A', 'apps': [1] * 30}, {'program_id': 'B', 'apps': [1] * 10},
             {'program_id': 'A', 'apps': [1] * 10}]  # A has two panels: 40 apps total
-    override, info = Simulation._fixed_budget_slots(sim, meta)
+    override, info = Simulation.fixed_budget_slots(sim, meta)
     assert info['total_slots'] == 20 and override == {'A': 16, 'B': 4}
     assert info['effective_rate_by_program']['A'] == pytest.approx(0.4)
 
@@ -245,11 +367,11 @@ def test_fixed_slots_freeze_first_year_count_and_roundtrip():
 
 
 def test_cast_review_score_modes():
-    assert Simulation._cast_review_score(stub_sim(review_score_mode='int'), 2.5) == 2
-    assert Simulation._cast_review_score(stub_sim(review_score_mode='float'), 2.5) == 2.5
+    assert Simulation.cast_review_score(stub_sim(review_score_mode='int'), 2.5) == 2
+    assert Simulation.cast_review_score(stub_sim(review_score_mode='float'), 2.5) == 2.5
 
 
-def _capacity_world(n_reviewers=12, n_papers=10, institutions=3):
+def capacity_world(n_reviewers=12, n_papers=10, institutions=3):
     eco = MultiAgentEcosystem(agent_configs={})
     for i in range(n_reviewers):
         inst = f'inst_{i % institutions}'
@@ -271,11 +393,11 @@ def _capacity_world(n_reviewers=12, n_papers=10, institutions=3):
 
 
 def test_capacity_assignment_respects_cap_coi_and_floor():
-    eco, cs = _capacity_world()
+    eco, cs = capacity_world()
     sim = stub_sim(reviewer_capacity=2, ecosystem=eco, conference_system=cs)
     state_before = random.getstate()
     yr = {}
-    assignment = Simulation._assign_reviewers_with_capacity(sim, 1, yr)
+    assignment = Simulation.assign_reviewers_with_capacity(sim, 1, yr)
     assert random.getstate() == state_before  # global RNG untouched
     # 12 reviewers x cap 2 = 24 slots for 10 papers -> r = min(3, 2) = 2
     assert yr['review_assignment']['reviews_per_paper_target'] == 2
@@ -286,30 +408,30 @@ def test_capacity_assignment_respects_cap_coi_and_floor():
         for rev in assignment[paper['id']]:
             assert rev.id != author.id and rev.id not in author.conflict_of_interest
     # deterministic given the seed
-    again = Simulation._assign_reviewers_with_capacity(sim, 1, {})
+    again = Simulation.assign_reviewers_with_capacity(sim, 1, {})
     assert {k: [a.id for a in v] for k, v in again.items()} == \
            {k: [a.id for a in v] for k, v in assignment.items()}
 
 
 def test_capacity_assignment_fails_fast_when_one_review_impossible():
-    eco, cs = _capacity_world(n_reviewers=4, n_papers=10)
+    eco, cs = capacity_world(n_reviewers=4, n_papers=10)
     sim = stub_sim(reviewer_capacity=2, ecosystem=eco, conference_system=cs)  # 8 slots < 10 papers
     with pytest.raises(RuntimeError):
-        Simulation._assign_reviewers_with_capacity(sim, 1, {})
+        Simulation.assign_reviewers_with_capacity(sim, 1, {})
 
 
 def test_capacity_assignment_unlimited_cap_uses_target():
-    eco, cs = _capacity_world()
+    eco, cs = capacity_world()
     sim = stub_sim(reviews_per_paper=2, ecosystem=eco, conference_system=cs)
-    assignment = Simulation._assign_reviewers_with_capacity(sim, 1, {})
+    assignment = Simulation.assign_reviewers_with_capacity(sim, 1, {})
     assert all(len(v) == 2 for v in assignment.values())
 
 
 def test_topic_matching_prefers_overlapping_reviewers():
-    eco, cs = _capacity_world(n_reviewers=12, n_papers=4)
+    eco, cs = capacity_world(n_reviewers=12, n_papers=4)
     sim = stub_sim(reviewer_capacity=3, reviewer_matching='topic', ecosystem=eco, conference_system=cs)
     yr = {}
-    assignment = Simulation._assign_reviewers_with_capacity(sim, 1, yr)
+    assignment = Simulation.assign_reviewers_with_capacity(sim, 1, yr)
     assert yr['review_assignment']['reviewer_matching'] == 'topic'
     assert all(1 <= len(v) <= 3 for v in assignment.values())
 
@@ -342,7 +464,11 @@ def test_cli_scale_stage_and_validation():
 # ---------------------------------------------------------------- 3. analysis on a synthetic world
 
 def test_analysis_endpoints_on_synthetic_checkpoint(tmp_path):
-    from utopia.analysis.scale_expansion import compute_run_endpoints, aggregate, parse_experiment_id
+    from utopia.analysis.scale_expansion import (
+        aggregate,
+        compute_run_endpoints,
+        parse_experiment_id,
+    )
     exp_id = 'scale_qwen3_32b_k2_budgetfixed_cap4_standardized_float_tieseed_i2_n4_y4_seed3_mixbal'
     assert parse_experiment_id(exp_id)['cell'] == 'S1R1_K1E1'
     run = tmp_path / exp_id
@@ -398,12 +524,12 @@ def test_analysis_endpoints_on_synthetic_checkpoint(tmp_path):
 def test_fixed_industry_pool_per_unit():
     sim = stub_sim(funding_budget_slots_frac=0.2, initial_industry_count=150)
     # pool = round(0.2 * 150) * 20 = 600; 40 maturity units accepted -> 15 per unit
-    per_unit, info = Simulation._fixed_industry_pool_per_unit(sim, 40)
+    per_unit, info = Simulation.fixed_industry_pool_per_unit(sim, 40)
     assert per_unit == 15 and info['pool'] == 600 and info['paid'] == 600
     # more accepted output than the pool covers -> per unit floors at 1 (legacy floor)
-    per_unit, info = Simulation._fixed_industry_pool_per_unit(sim, 900)
+    per_unit, info = Simulation.fixed_industry_pool_per_unit(sim, 900)
     assert per_unit == 1 and info['paid'] == 900
-    assert Simulation._fixed_industry_pool_per_unit(sim, 0)[0] == 0
+    assert Simulation.fixed_industry_pool_per_unit(sim, 0)[0] == 0
 
 
 def test_default_population_experiment_id_and_parse():

@@ -1,55 +1,39 @@
 from __future__ import annotations
 
-from utopia.utils.paths import project_root
-
 import ast
-
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-from copy import deepcopy
-
 import importlib.util
-
 import json
-
 import logging
-
-from pathlib import Path
-
 import random
-
 import sys
-
 import tempfile
-
-from threading import Event, Lock
-
 import time
-
-from types import ModuleType, SimpleNamespace
-
 import unittest
-
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from copy import deepcopy
+from pathlib import Path
+from threading import Event, Lock
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import utopia.funding.sequential as seq
-
 import utopia.funding.validation as gate
-
 from tests.support.sequential_funding import (
     ROOT,
-    load_file,
+    SDK,
+    Direction,
+    TinyTokenizer,
     audit_module,
     body_module,
     definitions,
-    native_seed,
-    Direction,
-    TinyTokenizer,
-    response,
-    SDK,
     funding_class,
+    load_file,
     model_class,
+    native_seed,
+    response,
 )
+from utopia.utils.paths import project_root
+
 
 class SequentialCase(unittest.TestCase):
     def setUp(self):
@@ -99,8 +83,8 @@ class SequentialCase(unittest.TestCase):
             name=program, research_directions=[Direction("algorithms")], funding_rate=.4)}
         if masked:
             from utopia.funding.feedback import record_display_prompt
-            original = agency._build_program_prompt
-            agency._build_program_prompt = lambda p, apps, papers: record_display_prompt(original, p, apps, papers)
+            original = agency.build_program_prompt
+            agency.build_program_prompt = lambda p, apps, papers: record_display_prompt(original, p, apps, papers)
         applications = [{program: {
             "submit": True, "research_proposal": f"Proposal {i}.",
             "author": SimpleNamespace(id=f"researcher_{i}", expertise=[Direction("algorithms")],
@@ -348,7 +332,7 @@ class SequentialCase(unittest.TestCase):
         fatal = audit_module.RequestAuditFailure("scripted terminal accounting failure")
         fatal.received_response = response('{"next_application_id":1}', reasoning="terminal reasoning")
         fatal.request_ticket = {"request_id": 123}
-        with patch.object(model, "_create_completion", side_effect=fatal):
+        with patch.object(model, "create_completion", side_effect=fatal):
             with self.assertRaises(audit_module.RequestAuditFailure) as caught:
                 self.generate(model, values)
         self.assertIs(caught.exception, fatal)
@@ -363,7 +347,7 @@ class SequentialCase(unittest.TestCase):
         values, _ = self.register(1)
         model = self.model()
         fatal = audit_module.RequestAuditFailure("scripted input overflow")
-        with patch.object(model, "_create_completion", side_effect=fatal):
+        with patch.object(model, "create_completion", side_effect=fatal):
             with self.assertRaises(audit_module.RequestAuditFailure):
                 self.generate(model, values)
         rows = [json.loads(line) for line in self.handle.path.read_text().splitlines()]
@@ -539,7 +523,7 @@ class PureHelpers(unittest.TestCase):
         probe = seq.selection_seed_context(0, "P", 0, 0, namespace="technical_probe")
         self.assertNotEqual(production, probe)
         for context in (production, probe):
-            self.assertEqual(seq._derive_seed(42, *context, 0, 2), native_seed()(42, *context, 0, 2))
+            self.assertEqual(seq.derive_seed(42, *context, 0, 2), native_seed()(42, *context, 0, 2))
         self.assertEqual(before, random.getstate())
         with self.assertRaises(ValueError):
             seq.selection_seed_context(0, "P", 0, 0)

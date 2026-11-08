@@ -1,7 +1,9 @@
 import json
+from copy import deepcopy
 from unittest.mock import patch
 
 import pytest
+from matplotlib.colors import to_rgba
 
 from tests.support.visualization import (
     capture_figures,
@@ -15,9 +17,8 @@ from utopia.visual import (
     plot_network_bias_forest,
     review_regime,
 )
-from utopia.visual.embeddings import plot_rag_embeddings, plot_paper_embeddings
+from utopia.visual.embeddings import plot_paper_embeddings, plot_rag_embeddings
 from utopia.visual.wandb import build_charts
-
 
 GOLDEN = json.loads(
     (project_root() / "tests/support/fixtures/ownership_golden.json").read_text()
@@ -39,14 +40,15 @@ def test_diagnostic_figures_preserve_data_labels_and_export_options(family, tmp_
         records = capture_figures(
             module.make_figures, diagnostic_inputs()[family], tmp_path
         )
-    expected = GOLDEN["figures"][family]
+    expected = deepcopy(GOLDEN["figures"][family])
     # Pixel hashes are checked separately against the baseline in the same environment.
     # The durable contract checks artist data and options across rendering environments.
-    for record in records:
+    for record in records + expected:
         record.pop("rgba_sha256")
-    assert records == [
-        {k: v for k, v in record.items() if k != "rgba_sha256"} for record in expected
-    ]
+        for axis in record["axes"]:
+            for line in axis["lines"]:
+                line["color"] = to_rgba(line["color"])
+    assert records == expected
 
 
 def test_embedding_projections_and_wandb_charts_preserve_parameters_and_rng():

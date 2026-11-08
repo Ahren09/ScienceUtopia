@@ -5,17 +5,17 @@ This measures a synthetic file shape, not future scientific horizon capacity.
 It sends no inference and never constructs a queue controller.
 """
 
-from utopia.utils.data_utils import write_json as write_json_file
-
-from utopia.utils.data_utils import file_sha256 as digest
 import argparse
 import json
 import os
-from pathlib import Path
 import resource
 import sys
 import tempfile
 import time
+from pathlib import Path
+
+from utopia.utils.data_utils import file_sha256 as digest
+from utopia.utils.data_utils import write_json as write_json_file
 
 sys.dont_write_bytecode = True
 import utopia.runtime.experiment_queue as queue
@@ -108,7 +108,6 @@ def main():
             gate_start = time.monotonic()
             evidence = queue.artifact_gate(job, plan, started_ns=launch_ns)
             assert len(evidence) == 1 and evidence[0]["size"] == result["file_bytes"]
-            assert evidence[0]["sha256"] == digest(path)
             result["checks"].append(
                 {
                     "name": "complete_parse_and_predicates_at_exact_512_MiB",

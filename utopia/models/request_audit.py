@@ -6,20 +6,17 @@ before HTTP. Deterministic context violations, provenance mismatches and failed
 audit writes escape the simulator's broad ``except Exception`` fallbacks.
 """
 
-from utopia.utils.data_utils import json_sha256
-
-from utopia.utils.data_utils import file_sha256
-
-from contextlib import contextmanager
 import hashlib
 import json
 import os
-from pathlib import Path
 import random
 import sys
 import threading
 import time
+from contextlib import contextmanager
+from pathlib import Path
 
+from utopia.utils.data_utils import file_sha256, json_sha256
 
 MODEL = "Qwen/Qwen3-32B"
 REVISION = "9216db5781bf21249d130ec9da846c4624c16137"
@@ -32,18 +29,18 @@ class RequestAuditFailure(BaseException):
     """Abort a new experimental world instead of manufacturing fallback data."""
 
 
-def _json(value):
+def json_text(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True,
                       separators=(",", ":"), allow_nan=False)
 
 
-def _sha(value):
+def value_digest(value):
     return json_sha256(value, ensure_ascii=False, sort_keys=True,
                        separators=(",", ":"), allow_nan=False)
 
 
 @contextmanager
-def _preserve_rng():
+def preserve_rng():
     """Tokenizer setup runs before worker threads; preserve already loaded RNGs."""
     python_state = random.getstate()
     numpy = sys.modules.get("numpy")
@@ -60,8 +57,8 @@ def _preserve_rng():
             torch.set_rng_state(torch_state)
 
 
-def _load_tokenizer():
-    with _preserve_rng():
+def load_tokenizer():
+    with preserve_rng():
         from huggingface_hub import snapshot_download
         from transformers import AutoTokenizer
         # Resolve the pinned commit entirely from the configured local HF
@@ -102,31 +99,31 @@ class RequestAudit:
         }
         self._pending = set()
         try:
-            self.tokenizer = _tokenizer if _tokenizer is not None else _load_tokenizer()
+            self.tokenizer = _tokenizer if _tokenizer is not None else load_tokenizer()
             self._fd = os.open(
                 self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_APPEND
                 | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
             self.identity = {
                 "protocol": "request-audit-v1", "model": MODEL,
                 "model_revision": REVISION, "context_tokens": CONTEXT_TOKENS,
-                "chat_template_sha256": _sha(self.tokenizer.chat_template),
+                "chat_template_sha256": value_digest(self.tokenizer.chat_template),
                 "audit_source_sha256": file_sha256(Path(__file__)),
                 "sdk_retries": 5,
                 "scope": "One event per SDK call; SDK-internal transport retries are not individual events.",
             }
-            self._write({"event": "initialized", **self.identity})
+            self.write({"event": "initialized", **self.identity})
             os.fsync(self._fd)
         except BaseException as error:
             if self._fd is not None:
                 os.close(self._fd)
             raise RequestAuditFailure(f"Cannot initialize exact request audit: {error}") from error
 
-    def _write(self, record):
+    def write(self, record):
         with self._lock:
             if self._closed:
                 raise RequestAuditFailure("Attempt to write a closed request audit")
             try:
-                data = (_json({"time_ns": time.time_ns(), **record}) + "\n").encode()
+                data = (json_text({"time_ns": time.time_ns(), **record}) + "\n").encode()
                 offset = 0
                 while offset < len(data):
                     count = os.write(self._fd, data[offset:])
@@ -139,31 +136,31 @@ class RequestAudit:
     def bind(self, model_name):
         with self._lock:
             if model_name != self.model_name or self._stats["n_clients"]:
-                self._fail("A request audit must bind exactly one pinned model client")
+                self.fail("A request audit must bind exactly one pinned model client")
             self._stats["n_clients"] += 1
-            self._write({"event": "client_bound", "model": model_name})
+            self.write({"event": "client_bound", "model": model_name})
         return self
 
-    def _fail(self, message, **details):
+    def fail(self, message, **details):
         with self._lock:
             self._stats["guard_failures"] += 1
-            self._write({"event": "guard_failure", "message": message, **details})
+            self.write({"event": "guard_failure", "message": message, **details})
         raise RequestAuditFailure(message)
 
     def before(self, payload, *, seed_ctx=None, item_index=0, attempt=0):
         """Count the exact untruncated chat request, including generation prefix."""
         try:
             if payload["model"] != self.model_name:
-                self._fail("Request model differs from pinned audit model")
+                self.fail("Request model differs from pinned audit model")
             output = payload["max_tokens"]
             if type(output) is not int or output <= 0:
-                self._fail("Explicit positive integer max_tokens required")
+                self.fail("Explicit positive integer max_tokens required")
             extra = payload.get("extra_body") or {}
             template_kwargs = extra.get("chat_template_kwargs") or {}
             if set(template_kwargs) - {"enable_thinking"}:
-                self._fail("Unreviewed chat template arguments", keys=sorted(template_kwargs))
+                self.fail("Unreviewed chat template arguments", keys=sorted(template_kwargs))
             if "guided_json" in extra or "truncate_prompt_tokens" in extra:
-                self._fail("Legacy guided_json or prompt truncation is forbidden")
+                self.fail("Legacy guided_json or prompt truncation is forbidden")
             with self._token_lock:
                 # vLLM 0.12 renders text first, then tokenizes without extra
                 # special tokens. Using both steps also audits the rendered text.
@@ -179,7 +176,7 @@ class RequestAudit:
                 "request_seed": extra.get("seed"), "temperature": payload["temperature"],
                 "input_tokens": count, "max_tokens": output,
                 "reserved_total_tokens": count + output,
-                "payload_sha256": _sha(payload),
+                "payload_sha256": value_digest(payload),
                 "rendered_prompt_sha256": hashlib.sha256(text.encode()).hexdigest(),
                 "chat_template_kwargs": template_kwargs,
             }
@@ -188,21 +185,21 @@ class RequestAudit:
                 self._stats["max_reserved_total_tokens"] = max(
                     self._stats["max_reserved_total_tokens"], count + output)
                 if count + output > CONTEXT_TOKENS:
-                    self._fail("Input plus requested output exceeds pinned context", **record)
+                    self.fail("Input plus requested output exceeds pinned context", **record)
                 request_id = self._stats["n_requests"]
                 self._stats["n_requests"] += 1
                 self._pending.add(request_id)
                 record["request_id"] = request_id
-                self._write({"event": "request_started", **record})
+                self.write({"event": "request_started", **record})
             return record
         except Exception as error:
-            self._fail(f"Exact input token accounting failed: {error}")
+            self.fail(f"Exact input token accounting failed: {error}")
 
     def transport_error(self, ticket, error):
         with self._lock:
             self._pending.remove(ticket["request_id"])
             self._stats["n_transport_errors"] += 1
-            self._write({"event": "transport_error", "request_id": ticket["request_id"],
+            self.write({"event": "transport_error", "request_id": ticket["request_id"],
                          "error_type": type(error).__name__, "error": str(error)})
 
     def response(self, ticket, response):
@@ -214,17 +211,17 @@ class RequestAudit:
             completion_tokens = getattr(usage, "completion_tokens", None)
             choices = getattr(response, "choices", [])
             reasons = [getattr(choice, "finish_reason", None) for choice in choices]
-            self._write({"event": "response", "request_id": ticket["request_id"],
+            self.write({"event": "response", "request_id": ticket["request_id"],
                          "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
                          "finish_reasons": reasons})
             if (type(prompt_tokens) is not int or prompt_tokens != ticket["input_tokens"]
                     or type(completion_tokens) is not int or completion_tokens < 0
                     or completion_tokens > ticket["max_tokens"]):
-                self._fail("Server token usage contradicts exact request accounting",
+                self.fail("Server token usage contradicts exact request accounting",
                            request_id=ticket["request_id"], expected_prompt=ticket["input_tokens"],
                            prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
             if len(choices) != 1:
-                self._fail("Expected one completion choice", request_id=ticket["request_id"])
+                self.fail("Expected one completion choice", request_id=ticket["request_id"])
             reason = str(reasons[0])
             counts = self._stats["finish_reasons"]
             counts[reason] = counts.get(reason, 0) + 1
@@ -251,7 +248,7 @@ class RequestAudit:
 
     def summary(self):
         with self._lock:
-            return json.loads(_json({
+            return json.loads(json_text({
                 **self.identity, **self._stats, "pending_requests": len(self._pending),
                 "audit_path": str(self.path), "summary_path": str(self.summary_path),
             }))
@@ -263,9 +260,9 @@ class RequestAudit:
             self._stats["status"] = "complete" if successful and valid else "failed"
             summary = self.summary()
             try:
-                self._write({"event": "finalized", **summary})
+                self.write({"event": "finalized", **summary})
                 os.fsync(self._fd)
-                data = (_json(summary) + "\n").encode()
+                data = (json_text(summary) + "\n").encode()
                 with self.summary_path.open("xb") as stream:
                     stream.write(data)
                     stream.flush()

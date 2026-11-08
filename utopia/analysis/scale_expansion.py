@@ -47,11 +47,6 @@ Run:
   python -m utopia.analysis.scale_expansion --glob "outputs/checkpoints/scale_*" --horizon 3
 """
 
-from utopia.utils.data_utils import write_json as write_json_file
-
-from utopia.analysis.statistics import bootstrap_mean_ci
-
-from utopia.utils.data_utils import read_json
 import argparse
 import glob
 import gzip
@@ -65,8 +60,10 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from utopia.analysis.statistics import benjamini_hochberg
+from utopia.analysis.statistics import benjamini_hochberg, bootstrap_mean_ci
 from utopia.metrics.tracker import calculate_gini_coefficient
+from utopia.utils.data_utils import read_json
+from utopia.utils.data_utils import write_json as write_json_file
 
 PRIMARY = ['P1_survival_h', 'P2_resub_review_share', 'P3_award_gini', 'P4_followup_share']
 SECONDARY = ['P1_survival_final', 'P1_survival_final_university', 'P1_survival_final_industry',
@@ -147,11 +144,11 @@ def parse_experiment_id(exp_id: str) -> dict:
 
 # ---------------------------------------------------------------- per-run endpoints
 
-def _first_year(paper: dict) -> int:
+def first_year(paper: dict) -> int:
     return paper['review_history'][0]['year'] if paper.get('review_history') else paper['year']
 
 
-def _accept_year(paper: dict) -> Optional[int]:
+def accept_year(paper: dict) -> Optional[int]:
     if paper.get('status') != 'accept':
         return None
     for entry in reversed(paper.get('review_history', [])):
@@ -160,7 +157,7 @@ def _accept_year(paper: dict) -> Optional[int]:
     return paper['year']
 
 
-def _authors(paper: dict) -> set:
+def authors(paper: dict) -> set:
     a = paper['author_id']
     return set(a) if isinstance(a, list) else {a}
 
@@ -330,16 +327,16 @@ def compute_run_endpoints(run_dir: str, num_years: int, horizon: int = 3) -> dic
     # ---- P4 continuation & diversity ----
     by_id = {p['id']: p for p in papers}
     accepted = [p for p in papers if p.get('status') == 'accept']
-    observed = [p for p in accepted if _accept_year(p) is not None and _accept_year(p) <= last_year - horizon]
+    observed = [p for p in accepted if accept_year(p) is not None and accept_year(p) <= last_year - horizon]
     followed, nonself_counts = 0, []
     for p in observed:
-        ay = _accept_year(p)
+        ay = accept_year(p)
         n_nonself = 0
         for citing_id in citations.get(p['id'], []):
             citing = by_id.get(citing_id)
             if citing is None:
                 continue
-            if _first_year(citing) <= ay + horizon and not (_authors(citing) & _authors(p)):
+            if first_year(citing) <= ay + horizon and not (authors(citing) & authors(p)):
                 n_nonself += 1
         followed += 1 if n_nonself > 0 else 0
         nonself_counts.append(n_nonself)

@@ -34,15 +34,14 @@ must persist error.diagnostics and terminate that cell. A zero geometric gap
 is out of the declared policy domain, not evidence against the hypothesis.
 """
 
-from utopia.runtime.historical import SWITCH_GATE_SEED_NAMESPACE
-
-from collections.abc import Mapping, Sequence
-from copy import deepcopy
 import math
-from numbers import Real
 import random
 import sys
+from collections.abc import Mapping, Sequence
+from copy import deepcopy
+from numbers import Real
 
+from utopia.runtime.historical import SWITCH_GATE_SEED_NAMESPACE
 
 SEED = 42
 POLICY_VERSION = "switching_propensity_distance_v1"
@@ -98,7 +97,7 @@ class PolicyDomainError(PolicyError):
     status = "out_of_domain"
 
 
-def _identity(agent_id, year, seed):
+def identity(agent_id, year, seed):
     if type(seed) is not int or seed != SEED:
         raise PolicyInputError("only_seed42_is_permitted")
     if type(agent_id) is not str or not agent_id.strip() or agent_id != agent_id.strip():
@@ -107,8 +106,8 @@ def _identity(agent_id, year, seed):
         raise PolicyInputError("repeat_choice_requires_calendar_year_2_through_10")
 
 
-def _gate(agent_id, year, seed, derive_seed_fn):
-    _identity(agent_id, year, seed)
+def gate(agent_id, year, seed, derive_seed_fn):
+    identity(agent_id, year, seed)
     if derive_seed_fn is None:
         from utopia.utils.seeding import derive_seed
         derive_seed_fn = derive_seed
@@ -122,7 +121,7 @@ def _gate(agent_id, year, seed, derive_seed_fn):
 
 def switch_uniform(agent_id, year, seed=SEED, *, derive_seed_fn=None):
     """One calendar-keyed U; cell, menu, retries and mutable RNG state are absent."""
-    return _gate(agent_id, year, seed, derive_seed_fn)[1]
+    return gate(agent_id, year, seed, derive_seed_fn)[1]
 
 
 def requested_switch(u, p):
@@ -143,7 +142,7 @@ def build_decision(cell, agent_id, year, previous_topic, canonical_topics53,
     distance_map52 must contain exactly those labels minus previous_topic.
     No default distances, heuristics, expertise substitutions or input mutation.
     """
-    _identity(agent_id, year, seed)
+    identity(agent_id, year, seed)
     if type(cell) is not str or cell not in CELLS:
         raise PolicyInputError("unknown_cell")
     context = {"cell": cell, "agent_id": agent_id, "year": year, "seed": seed}
@@ -175,7 +174,7 @@ def build_decision(cell, agent_id, year, previous_topic, canonical_topics53,
             raise PolicyInputError("distance_is_outside_cosine_range", topic=topic, **context)
         distances[topic] = value
 
-    gate_seed, u = _gate(agent_id, year, seed, derive_seed_fn)
+    gate_seed, u = gate(agent_id, year, seed, derive_seed_fn)
     p, distance_mode = CELLS[cell]
     switch = requested_switch(u, p)
     ranked = sorted(eligible, key=lambda topic: (distances[topic], topic))

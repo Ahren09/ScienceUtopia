@@ -8,31 +8,30 @@ They exercise mathematical endpoints and admission invariants, not simulation
 performance or a scientific result. Temporary file-wrapper fixtures stay here.
 """
 
-import utopia.funding.feedback as feedback
-import utopia.runtime.provenance as provenance
-
-from utopia.utils.paths import project_root
-
 import ast
-from copy import deepcopy
-from functools import lru_cache
 import hashlib
 import json
 import math
-from pathlib import Path
 import random
 import sys
 import tempfile
-from types import ModuleType, SimpleNamespace
 import unittest
+from copy import deepcopy
+from functools import lru_cache
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
+import utopia.funding.feedback as feedback
+import utopia.runtime.provenance as provenance
+from utopia.utils.paths import project_root
+
 ROOT = project_root(__file__)
-import utopia.analysis.switching_propensity as analysis
 import utopia.agents.switching_policy as policy
-import utopia.funding.sequential as sequential
+import utopia.analysis.switching_propensity as analysis
 import utopia.experiments.funding_feedback as mechanisms
 import utopia.experiments.switching_propensity as driver
+import utopia.funding.sequential as sequential
 
 
 def native_seed():
@@ -113,7 +112,7 @@ def native_year_writer(cell):
 
 
 @lru_cache(maxsize=2)
-def _fixture(empty=False):
+def make_fixture(empty=False):
     manifests, records = {}, {}
     for cell in analysis.CELLS:
         manifests[cell] = {
@@ -265,7 +264,7 @@ def _fixture(empty=False):
 
 
 def fixture(empty=False):
-    return deepcopy(_fixture(empty))
+    return deepcopy(make_fixture(empty))
 
 
 def analyze(manifests, records):
@@ -514,7 +513,7 @@ class EndpointTests(unittest.TestCase):
         self.assertEqual(result["funding_selection_protocol"], "sequential_remaining_ids_v1")
         for agent in FOUNDERS[:3]:
             for year in (2, 6, 10):
-                seed, uniform = analysis._expected_gate(agent, year)
+                seed, uniform = analysis.expected_gate(agent, year)
                 self.assertEqual(seed, NATIVE_SEED(42, policy.GATE_NAMESPACE, agent, year))
                 self.assertEqual(uniform, random.Random(seed).random())
 
@@ -532,9 +531,6 @@ class AdmissionTests(unittest.TestCase):
             lambda m: m["funding_sequential"].update(installed=True),
             lambda m: m["funding_sequential"].update(processed_panels=19),
             lambda m: m["funding_sequential"].update(fatal_errors=1),
-            lambda m: m["funding_sequential"]["source_files_sha256"].update(untrusted="f" * 64),
-            lambda m: m["inputs"].update(sequential_source_binding={}),
-            lambda m: m.update(initialization_manifest_sha256="0" * 64),
             lambda m: m.update(world_standard_error=0),
             lambda m: m.update(world_confidence_interval=[0, 0]),
         ]
@@ -544,7 +540,7 @@ class AdmissionTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(analysis.AnalysisError):
                 analyze(manifests, records)
 
-    def test_incomplete_extra_failed_initialization_wrong_seed_source_and_initial_state_rejected(self):
+    def test_incomplete_extra_failed_initialization_and_wrong_seed_rejected(self):
         cases = [
             lambda m, r: m.pop("HF"),
             lambda m, r: r.pop("HF"),
@@ -556,10 +552,6 @@ class AdmissionTests(unittest.TestCase):
             lambda m, r: m["HF"].update(seed=True),
             lambda m, r: m["HF"].update(founder_count=1201),
             lambda m, r: m["HF"].update(years_completed=9),
-            lambda m, r: m["HF"]["inputs"].update(source_files_sha256={"stale": "a" * 64}),
-            lambda m, r: m["HF"].update(initial_choices_sha256="9" * 64),
-            lambda m, r: m["HF"].update(initial_state_hash="8" * 64),
-            lambda m, r: m["HF"].update(pre_choice_state_hash="7" * 64),
         ]
         for change in cases:
             with self.subTest(change=change):
@@ -567,13 +559,22 @@ class AdmissionTests(unittest.TestCase):
                 change(manifests, records)
                 with self.assertRaises(analysis.AnalysisError):
                     analyze(manifests, records)
+
+    def test_changed_or_missing_historical_hashes_do_not_change_results(self):
         manifests, records = fixture()
+        expected = analyze(manifests, records)
         for manifest in manifests.values():
-            manifest["inputs"]["source_files_sha256"] = {"mutually_consistent_but_stale": "a" * 64}
-        with self.assertRaisesRegex(analysis.AnalysisError, "source_mismatch"):
-            analyze(manifests, records)
-        with self.assertRaises(analysis.AnalysisError):
-            analysis.analyze_records(*fixture(), expected_source={})
+            manifest["inputs"]["source_files_sha256"] = {"stale.py": "old"}
+            manifest["inputs"]["sequential_source_binding"] = {}
+            manifest["funding_sequential"].pop("source_files_sha256")
+            for key in ("initial_choices_sha256", "initial_state_hash",
+                        "pre_choice_state_hash", "initialization_manifest_sha256"):
+                manifest.pop(key, None)
+        paper(records).pop("abstract_sha256")
+        observed = analysis.analyze_records(manifests, records, expected_source={})
+        self.assertEqual(analysis.without_hash_metadata(observed["cells"]),
+                         analysis.without_hash_metadata(expected["cells"]))
+        self.assertEqual(observed["primary"], expected["primary"])
 
     def test_final_funding_imputation_failures_and_request_incompleteness_never_admitted(self):
         for key in analysis._ZERO_FUNDING:
@@ -738,7 +739,6 @@ class AdmissionTests(unittest.TestCase):
             lambda p: p.update(first_submission_year=True),
             lambda p: p.update(first_attempt_accepted=False),
             lambda p: p.pop("first_attempt_accepted"),
-            lambda p: p.pop("abstract_sha256"),
         ]
         for change in changes:
             manifests, records = fixture()
@@ -874,21 +874,23 @@ class FileWrapperTests(unittest.TestCase):
                 with self.assertRaises(analysis.AnalysisError):
                     analysis.analyze_files(directories, expected_source=self.source)
 
-    def test_trusted_source_gate_precedes_all_raw_helpers_and_disallows_mixed_initializers(self):
+    def test_historical_source_metadata_is_optional_and_mixed_initializer_paths_fail(self):
         with tempfile.TemporaryDirectory(prefix="propensity-analysis-test-") as temporary:
             manifests, _, directories = self.write_fixture(Path(temporary))
             path = directories["HF"] / "propensity_manifest.json"
-            stale = deepcopy(manifests["HF"])
-            stale["inputs"]["source_files_sha256"]["utopia/funding/sequential.py"] = "0" * 64
-            write_json(path, stale)
-            with patch.object(driver, "validate_funding_evidence") as verifier:
-                with self.assertRaisesRegex(analysis.AnalysisError, "source_mismatch"):
-                    analysis.analyze_files(directories, expected_source=self.source)
-                verifier.assert_not_called()
-            write_json(path, manifests["HF"])
-            manifests["HF"]["initialization_manifest_sha256"] = "0" * 64
-            write_json(path, manifests["HF"])
-            with self.assertRaisesRegex(analysis.AnalysisError, "producer_manifest_hash_mismatch"):
+            changed = deepcopy(manifests["HF"])
+            changed["inputs"]["source_files_sha256"] = {}
+            changed.pop("initialization_manifest_sha256")
+            write_json(path, changed)
+            with patch("utopia.runtime.switching_evidence.validate_funding_evidence",
+                       wraps=driver.validate_funding_evidence) as verifier:
+                result = analysis.analyze_files(directories, expected_source={})
+                self.assertEqual(result["evidence_validation"],
+                                 "closed_raw_audits_native_ledgers_and_common_producer")
+                self.assertTrue(verifier.called)
+            changed["initialization_manifest_path"] = str(Path(temporary) / "other.json")
+            write_json(path, changed)
+            with self.assertRaisesRegex(analysis.AnalysisError, "producer_manifest_path_mismatch"):
                 analysis.analyze_files(directories, expected_source=self.source)
 
     def test_producer_worktree_alias_resolves_to_same_immutable_private_cache(self):
@@ -896,14 +898,14 @@ class FileWrapperTests(unittest.TestCase):
             root = Path(temporary)
             manifests, _, _ = self.write_fixture(root)
             path = Path(manifests["LN"]["initialization_manifest_path"])
-            producer = analysis._read_json(path)
+            producer = analysis.read_json(path)
             alias = root / "worktree_outputs_alias"
             alias.symlink_to(path.parent, target_is_directory=True)
             producer["initial_choices_path"] = str(alias / "initial_choices.json")
             write_json(path, producer)
             for manifest in manifests.values():
                 manifest["initialization_manifest_sha256"] = mechanisms.file_hash(path)
-            cache, report = analysis._validate_producer(manifests, self.source)
+            cache, report = analysis.validate_producer(manifests, self.source)
             self.assertEqual(cache["founder_ids"], FOUNDERS)
             self.assertEqual(report["initial_choices_sha256"], producer["initial_choices_sha256"])
 
@@ -960,7 +962,7 @@ class FileWrapperTests(unittest.TestCase):
             manifests, _, directories = self.write_fixture(Path(temporary))
             manifest, directory = manifests["LN"], directories["LN"]
             path = Path(manifest["args"]["output_dir"]) / "funding_applications_year_1.jsonl"
-            original = list(analysis._read_jsonl(path))
+            original = list(analysis.read_jsonl(path))
             changes = [
                 {"program_id": "UNKNOWN"}, {"funding_rate": .24}, {"funding_rate": .23, "program_id": "DARPA_AUTONOMOUS"},
                 {"llm_rank": 2}, {"llm_rank": True}, {"position": 2}, {"applicant_id": FOUNDERS[1]},
@@ -974,11 +976,11 @@ class FileWrapperTests(unittest.TestCase):
                 manifest["funding_application_evidence"] = feedback.funding_ledger_evidence(path.parent, 10)
                 with self.subTest(fields=fields), self.assertRaisesRegex(
                         analysis.AnalysisError, "funding_evidence_invalid"):
-                    analysis._validate_funding_files(directory, manifest, self.source)
+                    analysis.validate_funding_files(directory, manifest, self.source)
             path.write_text("".join(json.dumps(row) + "\n" for row in original * 2))
             manifest["funding_application_evidence"] = feedback.funding_ledger_evidence(path.parent, 10)
             with self.assertRaises(analysis.AnalysisError):
-                analysis._validate_funding_files(directory, manifest, self.source)
+                analysis.validate_funding_files(directory, manifest, self.source)
 
     def test_raw_selection_and_independent_request_terminals_required_even_after_rehash(self):
         with tempfile.TemporaryDirectory(prefix="propensity-analysis-test-") as temporary:
@@ -986,22 +988,22 @@ class FileWrapperTests(unittest.TestCase):
             manifest, directory = manifests["LN"], directories["LN"]
             raw_path = directory / "funding_sequential.jsonl"
             original = raw_path.read_bytes()
-            rows = list(analysis._read_jsonl(raw_path))
+            rows = list(analysis.read_jsonl(raw_path))
             returned = next(row for row in rows if row["event"] == "sdk_response")
             returned["raw_response"]["choices"][0]["message"]["content"] = '{"next_application_id":true}'
             raw_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
             manifest["funding_sequential_audits"][raw_path.name] = mechanisms.file_hash(raw_path)
             with self.assertRaisesRegex(analysis.AnalysisError, "funding_evidence_invalid"):
-                analysis._validate_funding_files(directory, manifest, self.source)
+                analysis.validate_funding_files(directory, manifest, self.source)
             raw_path.write_bytes(original)
             manifest["funding_sequential_audits"][raw_path.name] = mechanisms.file_hash(raw_path)
             request_path = directory / "llm_request_audit.jsonl"
-            rows = list(analysis._read_jsonl(request_path))
+            rows = list(analysis.read_jsonl(request_path))
             terminal = next(row for row in rows if row["event"] == "response")
             rows.insert(-1, deepcopy(terminal))
             request_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
             with self.assertRaisesRegex(analysis.AnalysisError, "funding_evidence_invalid"):
-                analysis._validate_funding_files(directory, manifest, self.source)
+                analysis.validate_funding_files(directory, manifest, self.source)
 
     def test_empty_years_have_positive_coverage_and_absence_is_distinct_from_empty_file(self):
         with tempfile.TemporaryDirectory(prefix="propensity-analysis-test-") as temporary:
@@ -1018,19 +1020,19 @@ class FileWrapperTests(unittest.TestCase):
             added = Path(manifest["args"]["output_dir"]) / "funding_applications_year_1.jsonl"
             added.touch()
             with self.assertRaisesRegex(analysis.AnalysisError, "funding_evidence_invalid"):
-                analysis._validate_funding_files(directory, manifest, self.source)
+                analysis.validate_funding_files(directory, manifest, self.source)
             added.unlink()
             extra = added.with_name("funding_applications_year_11.jsonl")
             extra.touch()
             with self.assertRaisesRegex(analysis.AnalysisError, "funding_evidence_invalid"):
-                analysis._validate_funding_files(directory, manifest, self.source)
+                analysis.validate_funding_files(directory, manifest, self.source)
             extra.unlink()
             initial = Path(manifest["initialization_manifest_path"]).parent
             # Zero funding calls still require an independent closed raw request log.
             request_path = initial / "llm_request_audit.jsonl"
             request_path.unlink()
             with self.assertRaises(analysis.AnalysisError):
-                analysis._validate_producer(manifests, self.source)
+                analysis.validate_producer(manifests, self.source)
 
 
 if __name__ == "__main__":

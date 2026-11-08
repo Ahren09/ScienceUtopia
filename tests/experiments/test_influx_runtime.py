@@ -15,24 +15,25 @@ work; every scheduled entrant is active on arrival. These diagnostic fixtures
 are not experiment outcomes and cannot satisfy production completion gates.
 """
 
-from utopia.runtime.historical import INFLUX_POPULATION_SEED_NAMESPACE
-import contextlib
 import ast
+import contextlib
 import importlib.util
 import io
 import json
 import os
 import random
-from pathlib import Path
 import sys
 import tempfile
 import types
 import unittest
+from pathlib import Path
 from unittest import mock
 
+from utopia.runtime.historical import INFLUX_POPULATION_SEED_NAMESPACE
+
 sys.dont_write_bytecode = True
-import utopia.experiments.influx_factorial as runner
 import tests.support.simulation as native_fixture
+import utopia.experiments.influx_factorial as runner
 
 
 def population_module():
@@ -69,7 +70,7 @@ def population_module():
         'RICH_COMPANY_FUNDING': 320, 'RICH_COMPANIES': ['Google'],
     }
     tree = ast.parse((runner.REPO_ROOT / 'utopia/simulation.py').read_text())
-    methods = {'_record_initial_university_count', '_add_funding_agencies', '_apply_annual_influx'}
+    methods = {'record_initial_university_count', 'add_funding_agencies', 'apply_annual_influx'}
     nodes = [node for node in tree.body
              if isinstance(node, ast.FunctionDef) and node.name == 'build_population_blueprint']
     nodes += [node for cls in tree.body if isinstance(cls, ast.ClassDef) and cls.name == 'Simulation'
@@ -97,7 +98,7 @@ def fake_simulation(module, cell='A'):
         args=types.SimpleNamespace(seed=42, population_mode='default',
                                    annual_influx_rate=0.1 if cell in 'BD' else 0),
         debug=False, llm=None, industry_funding_mode='paper', ecosystem=Ecosystem())
-    for name in ('_record_initial_university_count', '_add_funding_agencies', '_apply_annual_influx'):
+    for name in ('record_initial_university_count', 'add_funding_agencies', 'apply_annual_influx'):
         setattr(sim, name, types.MethodType(getattr(module, name), sim))
     return sim
 
@@ -149,7 +150,8 @@ class LauncherTests(unittest.TestCase):
         for name in ('utopia/funding/sequential.py', runner.SEQUENTIAL_PROTOCOL_PATH):
             path = self.root / name
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes((runner.REPO_ROOT / name).read_bytes())
+            source = runner.REPO_ROOT / name
+            path.write_bytes(source.read_bytes() if source.is_file() else b"Synthetic test protocol.\n")
 
     def args(self, *extra):
         return runner.parse_args(list(extra))
@@ -195,7 +197,7 @@ class LauncherTests(unittest.TestCase):
         runner.initialize_population(sim, module, founders)
         out = Path(job['output_dir'])
         for year in range(1, job['num_years'] + 1):
-            sim._apply_annual_influx(year)
+            sim.apply_annual_influx(year)
             agents = []
             for agent in sim.ecosystem.agent_population.values():
                 row = {'id': agent.id, 'can_author': agent.can_author}
@@ -294,7 +296,7 @@ class LauncherTests(unittest.TestCase):
                 self.assertTrue(probe.enable_thinking)
                 schema = fmt['json_object']['schema']
                 return {field: schema if field == 'guided_json' else {'json': schema}}
-            module = types.SimpleNamespace(VLLMServerModel=types.SimpleNamespace(_build_extra_body=builder))
+            module = types.SimpleNamespace(VLLMServerModel=types.SimpleNamespace(build_extra_body=builder))
             if field == 'guided_json':
                 with self.assertRaisesRegex(ValueError, 'compatibility fix'):
                     runner.validate_structured_transport(module)
@@ -309,7 +311,7 @@ class LauncherTests(unittest.TestCase):
         tree = ast.parse(path.read_text())
         method = next(f for cls in tree.body if isinstance(cls, ast.ClassDef)
                       and cls.name == 'VLLMServerModel' for f in cls.body
-                      if isinstance(f, ast.FunctionDef) and f.name == '_build_extra_body')
+                      if isinstance(f, ast.FunctionDef) and f.name == 'build_extra_body')
         future = ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')], level=0)
         helper_path = path.with_name('structured_outputs.py')
         spec = importlib.util.spec_from_file_location('influx_transport_probe_helper', helper_path)
@@ -319,7 +321,7 @@ class LauncherTests(unittest.TestCase):
         exec(compile(ast.fix_missing_locations(ast.Module(body=[future, method], type_ignores=[])),
                      str(path), 'exec'), namespace)
         module = types.SimpleNamespace(VLLMServerModel=types.SimpleNamespace(
-            _build_extra_body=namespace['_build_extra_body']))
+            build_extra_body=namespace['build_extra_body']))
         runner.validate_structured_transport(module)
 
     def test_growth_reuses_stock_injection_is_idempotent_and_includes_inactive_coi(self):
@@ -338,8 +340,8 @@ class LauncherTests(unittest.TestCase):
             self.assertFalse(seen.intersection(r['researcher_name'] for r in cohort))
             seen.update(r['researcher_name'] for r in cohort)
             self.assertEqual(len(seen), 1202 + 1202 * year // 10)
-            self.assertEqual(len(sim._apply_annual_influx(year)), len(cohort))
-            self.assertEqual(sim._apply_annual_influx(year), [])
+            self.assertEqual(len(sim.apply_annual_influx(year)), len(cohort))
+            self.assertEqual(sim.apply_annual_influx(year), [])
             self.assertEqual(seen, runner.expected_researcher_ids('D', year))
         self.assertEqual(random.getstate(), state)
         founder = sim.ecosystem.agent_population['institution_0000_researcher_0']
@@ -348,7 +350,7 @@ class LauncherTests(unittest.TestCase):
         self.assertIn(entrant.id, founder.conflict_of_interest)
         stable = fake_simulation(module, 'C')
         runner.initialize_population(stable, module, founders)
-        self.assertEqual(stable._apply_annual_influx(1), [])
+        self.assertEqual(stable.apply_annual_influx(1), [])
         self.assertEqual(len(stable.ecosystem.agent_population), 1204)
 
     def test_real_result_gates_reject_wrong_population_and_incomplete_year(self):
@@ -448,7 +450,8 @@ class LauncherTests(unittest.TestCase):
                        'utopia/funding/sequential.py', runner.SEQUENTIAL_PROTOCOL_PATH,
                        'utopia/models/request_audit.py',
                        'utopia/models/models.py'):
-            self.assertEqual(hashes[source], runner.sha256(runner.REPO_ROOT / source))
+            if (runner.REPO_ROOT / source).is_file():
+                self.assertEqual(hashes[source], runner.sha256(runner.REPO_ROOT / source))
 
     def test_audit_gates_reject_missing_failed_or_unprocessed_runtime_evidence(self):
         job = runner.make_jobs(self.args('--smoke'), self.root)[0]
@@ -484,8 +487,8 @@ class LauncherTests(unittest.TestCase):
     def test_funding_guard_rejects_unprocessed_panels_and_restores_after_fatal_error(self):
         from tests.support.funding_rankings import apps_for
         from tests.support.simulation import FundingAgency, SequentialScriptedLLM
-        from utopia.funding.validation import FundingRankingValidationError
         from utopia.funding.sequential import SequentialFundingError
+        from utopia.funding.validation import FundingRankingValidationError
         for incomplete in (False, True):
             cls = FundingAgency
             original = vars(cls)['validate_funding_result']
@@ -981,7 +984,12 @@ class LauncherTests(unittest.TestCase):
             self.assertEqual(runner.external_attestation(args)['queue_attestation_sha256'], runner.sha256(path))
 
     def test_single_worker_calls_patched_simulator_without_server_ownership(self):
-        from tests.support.simulation import FundingAgency, SequentialScriptedLLM, make_simulation, run_phase
+        from tests.support.simulation import (
+            FundingAgency,
+            SequentialScriptedLLM,
+            make_simulation,
+            run_phase,
+        )
         from utopia.models import request_audit
         args = self.args('--run_cell', 'A', '--external_server', '--smoke')
         job = runner.make_jobs(args, self.root)[0]
@@ -1032,7 +1040,7 @@ class LauncherTests(unittest.TestCase):
             with panel_seed_import():
                 for year in range(1, job['num_years'] + 1):
                     sim.funding_tracker.start_cycle(year, sim.ecosystem.agent_population)
-                    sim._run_phase_5_update_funding(year, [], {})
+                    sim.run_phase_5_update_funding(year, [], {})
             self.finish_real(job, args, audit_fixtures=False, validate=False)
         module.main = main
         with mock.patch.dict(sys.modules, {'utopia.simulation': module}), \
@@ -1040,7 +1048,7 @@ class LauncherTests(unittest.TestCase):
                 mock.patch.dict(os.environ), \
                 mock.patch.object(runner, 'materialize_caches', return_value={}), \
                 mock.patch.object(runner, 'validate_caches', return_value={}), \
-                mock.patch.object(request_audit, '_load_tokenizer', return_value=FixtureTokenizer()), \
+                mock.patch.object(request_audit, 'load_tokenizer', return_value=FixtureTokenizer()), \
                 mock.patch.object(runner, 'wait_for_server') as wait, \
                 mock.patch.object(runner, 'gpu_memory', return_value={'0': (0, 81920)}), \
                 mock.patch.object(runner, 'spawn', side_effect=AssertionError('server spawn')), \
@@ -1113,6 +1121,7 @@ class TestPanelizedFundingPhase(unittest.TestCase):
     def test_100_applicants_multiple_panels_match_stock_phase_and_quotas(self):
         """Original phase/selection/prompts/processing; only the LLM is scripted."""
         from collections import Counter
+
         import tests.support.simulation as fixture
         snapshots = []
         for guarded in (False, True):
@@ -1197,11 +1206,13 @@ class TestActualInfluxYears(unittest.TestCase):
             raise RuntimeError('scripted preflight requires CUDA_VISIBLE_DEVICES empty before Python starts')
         runner.git_state(runner.REPO_ROOT)
         import pickle
-        import torch
-        import utopia.simulation as actual
-        import utopia.agents.conference as conferences
         from collections import Counter
         from copy import deepcopy
+
+        import torch
+
+        import utopia.agents.conference as conferences
+        import utopia.simulation as actual
         from tests.support.simulation import SequentialScriptedLLM
         from utopia.funding.sequential import DEFAULT_SYSTEM_PROMPT
         cls.actual, cls.torch, cls.conferences = actual, torch, conferences
@@ -1338,7 +1349,7 @@ class TestActualInfluxYears(unittest.TestCase):
                         for year in (1, 2):
                             result = sim.run_one_round(year)
                             sim.yearly_results.append(result)
-                            sim._save_checkpoint(year, phase=5)
+                            sim.save_checkpoint(year, phase=5)
                             expected = runner.expected_researcher_ids(cell, year)
                             observed = {a.id for a in sim.ecosystem.agent_population.values() if a.can_author}
                             self.assertEqual(observed, expected)

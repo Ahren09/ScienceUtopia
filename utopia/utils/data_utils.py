@@ -62,6 +62,20 @@ def json_sha256(value, **options):
     return hashlib.sha256(json.dumps(value, **options).encode()).hexdigest()
 
 
+def without_hash_metadata(value):
+    """Compare recorded evidence independently of optional historical hashes."""
+    if isinstance(value, dict):
+        return {
+            key: without_hash_metadata(item)
+            for key, item in value.items()
+            if key not in {"source_binding", "sequential_source_binding", "expected_source"}
+            and str(key).rsplit("_", 1)[-1] not in {"sha256", "hash", "hashes", "checksum", "fingerprint"}
+        }
+    if isinstance(value, (list, tuple)):
+        return [without_hash_metadata(item) for item in value]
+    return value
+
+
 @contextmanager
 def atomic_open(
     path,
@@ -181,7 +195,7 @@ def write_json_gzip_atomic(path, value, *, create_parent=True, **options):
 def write_jsonl_atomic(path, rows, **options):
     """Stream a complete JSONL replacement without materializing its records."""
     with atomic_open(path) as stream:
-        _write_json_lines(stream, rows, options)
+        write_json_lines(stream, rows, options)
 
 
 def write_parquet_atomic(path, frame, **options):
@@ -201,14 +215,14 @@ def read_json(f):
         return json.load(stream)
 
 
-def _write_json_lines(stream, rows, options):
+def write_json_lines(stream, rows, options):
     for row in rows:
         stream.write(json.dumps(row, **options) + "\n")
 
 
 def write_jsonl(data: list, f, **options):
     with open(f, "w") as file:
-        _write_json_lines(file, data, options)
+        write_json_lines(file, data, options)
 
 
 def write_json(

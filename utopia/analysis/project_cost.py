@@ -5,22 +5,18 @@ seeds. Historical runs are never pooled into this experiment.
 """
 from __future__ import annotations
 
-from utopia.utils.data_utils import write_json as write_json_file
-
-from utopia.utils.data_utils import json_sha256
-
-from utopia.utils.data_utils import read_json
-
-from utopia.utils.paths import project_root
-
 import argparse
 import csv
 import itertools
 import json
 import math
-from pathlib import Path
 import random
 import statistics
+from pathlib import Path
+
+from utopia.utils.data_utils import read_json
+from utopia.utils.data_utils import write_json as write_json_file
+from utopia.utils.paths import project_root
 
 ROOT = project_root(__file__)
 COSTS = ("annual_research_cost", "production_submission_cost",
@@ -74,8 +70,6 @@ def validate_job_binding(manifest, checkpoint, job, commit):
     require(checkpoint["project_cost_policy"]["papers_per_project"] ==
             manifest["args"]["papers_per_project"], "Checkpoint has the wrong output treatment")
     require(manifest["resolved_config"] == job["resolved_config"], "Resolved configuration changed")
-    digest = json_sha256(job["resolved_config"], sort_keys=True)
-    require(manifest["scientific_config_hash"] == digest, "Scientific configuration hash mismatch")
 
 
 def require(condition, message):

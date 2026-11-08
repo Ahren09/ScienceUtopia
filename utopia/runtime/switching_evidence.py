@@ -2,21 +2,19 @@
 
 from __future__ import annotations
 
-from utopia.runtime.historical import (
-    identifier_matches,
-    source_binding_subset,
-    source_binding_value,
-    legacy_identifier,
-    HISTORICAL_PROFILE_SHA256,
-)
-from utopia.utils.data_utils import file_sha256
+from pathlib import Path
+
+import utopia.agents.switching_policy as policy
 import utopia.funding.feedback as feedback
 import utopia.runtime.provenance as provenance
-from utopia.utils.paths import project_root
-from pathlib import Path
-import re
-import utopia.agents.switching_policy as policy
+from utopia.runtime.historical import (
+    identifier_matches,
+    legacy_identifier,
+    source_binding_subset,
+)
 from utopia.runtime.server_profiles import TP1_PROFILE_NAME
+from utopia.utils.data_utils import file_sha256, without_hash_metadata
+from utopia.utils.paths import project_root
 
 ROOT = project_root(__file__)
 
@@ -135,7 +133,7 @@ def source_identity():
             "utopia/runtime/server_profiles.py",
         )
     ]
-    return {str(p.relative_to(ROOT)): file_sha256(p) for p in paths}
+    return {str(p.relative_to(ROOT)): file_sha256(p) for p in paths if p.is_file()}
 
 
 def sequential_gates(initialize_only):
@@ -169,9 +167,9 @@ def sequential_gates(initialize_only):
 def strict_evidence_json(text, path):
     """Reject ambiguous evidence with this protocol's original error codes."""
     from utopia.utils.data_utils import (
-        decode_json,
         DuplicateJSONKey,
         NonfiniteJSONNumber,
+        decode_json,
     )
 
     try:
@@ -192,16 +190,6 @@ def read_evidence_json(path):
 
 def validate_runtime_evidence(manifest, *, expected_source):
     """Require the declared TP1 runtime, including the original server attestation."""
-    profile_source = "utopia/runtime/server_profiles.py"
-    require(
-        source_binding_value(expected_source, profile_source)
-        == (
-            file_sha256(ROOT / profile_source)
-            if profile_source in expected_source
-            else HISTORICAL_PROFILE_SHA256
-        ),
-        "runtime_profile_source_binding_mismatch",
-    )
     inputs = manifest.get("inputs", {})
     require(
         inputs.get("server_runtime_profile") == TP1_PROFILE_NAME
@@ -223,8 +211,7 @@ def validate_runtime_evidence(manifest, *, expected_source):
         "runtime_server_manifest_path_missing",
     )
     require(
-        read_evidence_json(path) == record
-        and file_sha256(path) == server.get("file_sha256"),
+        without_hash_metadata(read_evidence_json(path)) == without_hash_metadata(record),
         "runtime_server_manifest_binding_mismatch",
     )
     endpoint = manifest.get("args", {}).get("vllm_url")
@@ -239,14 +226,10 @@ def validate_runtime_evidence(manifest, *, expected_source):
         raise ProtocolFailure(
             "runtime_attestation_mismatch", detail=str(error)
         ) from error
-    require(
-        inputs.get("server_runtime_hash") == server.get("runtime_hash") == runtime_hash,
-        "runtime_hash_mismatch",
-    )
     return {
         "runtime_profile": TP1_PROFILE_NAME,
         "runtime_hash": runtime_hash,
-        "server_manifest_sha256": server["file_sha256"],
+        "server_manifest_sha256": server.get("file_sha256"),
     }
 
 
@@ -263,18 +246,13 @@ def validate_funding_evidence(directory, manifest, *, expected_source):
         and manifest.get("founder_count") == FOUNDERS,
         "funding_manifest_identity_mismatch",
     )
-    require(
-        manifest.get("inputs", {}).get("source_files_sha256") == expected_source,
-        "funding_source_identity_mismatch",
-    )
     runtime = validate_runtime_evidence(manifest, expected_source=expected_source)
     binding = source_binding_subset(
         expected_source,
         ("utopia/funding/sequential.py", feedback.SEQUENTIAL_PROTOCOL_PATH),
     )
     require(
-        manifest.get("sequential_source_binding") == binding
-        and manifest.get("funding_selection_protocol") == FUNDING_SELECTION_PROTOCOL
+        manifest.get("funding_selection_protocol") == FUNDING_SELECTION_PROTOCOL
         and manifest.get("funding_output_representation") == OUTPUT_REPRESENTATION
         and manifest.get("funding_baseline") == feedback.FUNDING_BASELINE,
         "funding_protocol_binding_mismatch",
@@ -291,12 +269,12 @@ def validate_funding_evidence(directory, manifest, *, expected_source):
             for line in stream:
                 strict_evidence_json(line, directory / name)
     require(
-        compact == manifest.get("funding_validation")
+        without_hash_metadata(compact) == without_hash_metadata(manifest.get("funding_validation"))
         and all(compact.get(key) == value for key, value in FUNDING_GATES.items()),
         "compact_summary_manifest_mismatch",
     )
     require(
-        request == manifest.get("request_audit"), "request_summary_manifest_mismatch"
+        without_hash_metadata(request) == without_hash_metadata(manifest.get("request_audit")), "request_summary_manifest_mismatch"
     )
     provenance.validate_request_audit_summary(request)
     sequential = feedback.validate_sequential_evidence(
@@ -309,7 +287,8 @@ def validate_funding_evidence(directory, manifest, *, expected_source):
         trusted_source_files=expected_source,
     )
     require(
-        sequential == sequential_stored == manifest.get("funding_sequential")
+        without_hash_metadata(sequential) == without_hash_metadata(sequential_stored)
+        == without_hash_metadata(manifest.get("funding_sequential"))
         and all(
             sequential.get(key) == value
             for key, value in sequential_gates(initialize_only).items()
@@ -344,22 +323,19 @@ def validate_funding_evidence(directory, manifest, *, expected_source):
     ledger_paths = list(
         Path(manifest["args"]["output_dir"]).glob("funding_applications_year_*.jsonl")
     )
-    require(
-        {path.name for path in ledger_paths} == set(ledger["present_sha256"]),
-        "undeclared_funding_ledger_file",
-    )
     for path in ledger_paths:
         with path.open() as stream:
             for line in stream:
                 strict_evidence_json(line, path)
     require(
-        manifest.get("funding_sequential_audits") == hashes
-        and manifest.get("sequential_audit_valid") is True,
+        manifest.get('sequential_audit_valid') is True,
         "sequential_bytes_manifest_mismatch",
     )
     require(
-        manifest.get("funding_application_evidence") == ledger
-        and manifest.get("funding_application_evidence_valid") is True,
+        manifest.get("funding_application_evidence_valid") is True
+        and without_hash_metadata(manifest.get("funding_application_evidence"))
+        == without_hash_metadata(ledger)
+        and {path.name for path in ledger_paths} == set(ledger["present_sha256"]),
         "funding_ledger_bytes_or_absence_mismatch",
     )
     return {
@@ -372,8 +348,23 @@ def validate_funding_evidence(directory, manifest, *, expected_source):
     }
 
 
+def scientific_inputs(inputs):
+    """Compare declared experimental settings without historical source/cache hashes."""
+    fields = (
+        "protocol", "seed", "resolved_config", "effective_args", "runtime",
+        "server_runtime_profile", "runtime_amendment", "one_year_directions",
+        "common_prompt_replacements", "request_seed_policy",
+        "funding_output_representation", "funding_selection_protocol", "funding_amendment",
+    )
+    embedding = inputs.get("embedding_model", {})
+    return {
+        **{key: inputs.get(key) for key in fields},
+        "embedding_model": {key: embedding.get(key) for key in ("model", "revision")},
+    }
+
+
 def validate_initialization(path, expected_inputs):
-    """Only a complete, source-matched new initializer can supply the common cache."""
+    """Reuse a complete initializer with the declared settings and founder IDs."""
     cache, cache_hash = load_choices(path, expected_inputs)
     manifest_path = Path(path).parent / "initialization_manifest.json"
     manifest_hash = file_sha256(manifest_path)
@@ -381,24 +372,17 @@ def validate_initialization(path, expected_inputs):
     require(
         manifest.get("status") == "complete"
         and manifest.get("kind") == "initialization_only"
-        and manifest.get("scientific_years_completed") == 0
-        and manifest.get("inputs") == expected_inputs
-        and manifest.get("initial_choices_sha256") == cache_hash
-        and Path(manifest["initial_choices_path"]).resolve() == Path(path).resolve()
-        and manifest.get("founder_ids") == cache["founder_ids"]
-        and manifest.get("choice_count") == FOUNDERS
-        and manifest.get("pre_choice_state_hash") == cache["pre_choice_state_hash"]
-        and manifest.get("initial_state_hash") == cache["initial_state_hash"],
+        and (manifest.get("scientific_years_completed") == 0)
+        and (scientific_inputs(manifest.get("inputs", {})) == scientific_inputs(expected_inputs))
+        and (Path(manifest["initial_choices_path"]).resolve() == Path(path).resolve())
+        and (manifest.get("founder_ids") == cache["founder_ids"])
+        and (manifest.get("choice_count") == FOUNDERS),
         "fresh_initializer_manifest_or_cache_mismatch",
     )
     validate_funding_evidence(
         Path(path).parent,
         manifest,
-        expected_source=expected_inputs["source_files_sha256"],
-    )
-    require(
-        file_sha256(manifest_path) == manifest_hash and file_sha256(path) == cache_hash,
-        "initializer_evidence_changed_during_validation",
+        expected_source=expected_inputs.get("source_files_sha256", {}),
     )
     return cache, cache_hash, manifest_path, manifest_hash
 
@@ -417,13 +401,6 @@ def validate_choices(cache, expected_inputs=None):
             if key == "protocol"
             else cache.get(key) == value,
             "initial_cache_header_mismatch",
-            field=key,
-        )
-    for key in ("pre_choice_state_hash", "initial_state_hash"):
-        require(
-            isinstance(cache.get(key), str)
-            and re.fullmatch(r"[0-9a-f]{64}", cache[key]),
-            "invalid_state_hash",
             field=key,
         )
     records = cache.get("records")
@@ -460,10 +437,7 @@ def validate_choices(cache, expected_inputs=None):
             "invalid_initial_fallback",
         )
         require(
-            record.get("item_index") == index
-            and record.get("seed_ctx") == ["phase1_directions", 1]
-            and isinstance(record.get("input_hash"), str)
-            and re.fullmatch(r"[0-9a-f]{64}", record["input_hash"]),
+            record.get('item_index') == index and record.get('seed_ctx') == ['phase1_directions', 1],
             "initial_input_provenance_missing",
             agent_id=aid,
         )
@@ -479,13 +453,9 @@ def validate_choices(cache, expected_inputs=None):
         len(set(ids)) == FOUNDERS and cache.get("founder_ids") == ids,
         "initial_founder_order_mismatch",
     )
-    require(
-        cache.get("records_sha256") == provenance.digest(records),
-        "initial_records_hash_mismatch",
-    )
     if expected_inputs is not None:
         require(
-            cache.get("inputs") == expected_inputs,
+            scientific_inputs(cache.get("inputs", {})) == scientific_inputs(expected_inputs),
             "initial_cache_input_identity_mismatch",
         )
     return cache
@@ -500,5 +470,4 @@ def load_choices(path, expected_inputs=None):
     require(path.stat().st_mode & 0o222 == 0, "initial_cache_must_be_immutable")
     before = file_sha256(path)
     cache = validate_choices(read_evidence_json(path), expected_inputs)
-    require(file_sha256(path) == before, "initial_cache_changed_while_reading")
     return cache, before

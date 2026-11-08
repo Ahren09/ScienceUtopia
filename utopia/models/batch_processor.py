@@ -7,7 +7,7 @@ to improve efficiency when using vLLM or other batch-capable models.
 
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -123,16 +123,16 @@ class BatchProcessor:
         results = {}
 
         if self.supports_batching():
-            results = self._execute_batch_native()
+            results = self.execute_batch_native()
         else:
-            results = self._execute_sequential()
+            results = self.execute_sequential()
 
         if clear_after:
             self.clear()
 
         return results
 
-    def _execute_batch_native(self) -> Dict[str, Tuple[Dict, List[Dict]]]:
+    def execute_batch_native(self) -> Dict[str, Tuple[Dict, List[Dict]]]:
         """Execute batch using native generate_batch method
 
         Returns:
@@ -168,7 +168,7 @@ class BatchProcessor:
 
         return results
 
-    def _execute_sequential(self) -> Dict[str, Tuple[Dict, List[Dict]]]:
+    def execute_sequential(self) -> Dict[str, Tuple[Dict, List[Dict]]]:
         """Execute requests sequentially (fallback for non-batch LLMs)
 
         Returns:

@@ -48,12 +48,12 @@ be observed; install before prompt generation.
 
 from __future__ import annotations
 
-from collections import Counter
-from copy import deepcopy
-from functools import wraps
 import inspect
 import json
 import os
+from collections import Counter
+from copy import deepcopy
+from functools import wraps
 from threading import RLock
 
 __all__ = [
@@ -180,7 +180,7 @@ def inspect_funding_result(result, apps):
     }
 
 
-def _context_value(value):
+def context_value(value):
     # Never stringify arbitrary inputs: their repr can expose prompts/paths or
     # raise. Nonfinite floats and booleans are not identifiers.
     return value if type(value) in (str, int) else None
@@ -222,7 +222,7 @@ class _FundingValidationHandle:
             "restore_conflicts": [],
         }
 
-    def _audit_failure(self, operation, exc):
+    def audit_failure(self, operation, exc):
         self._audit_broken = True
         self._stats["audit_failures"] += 1
         raise FundingRankingValidationError({
@@ -232,7 +232,7 @@ class _FundingValidationHandle:
             "persisted_records": self._stats["audit_records"],
         }) from exc
 
-    def _emit(self, records):
+    def emit(self, records):
         """Persist the whole preflight before permitting the stock processor."""
         with self._lock:
             start = self._stats["audit_records"]
@@ -256,11 +256,11 @@ class _FundingValidationHandle:
                         remaining = remaining[size:]
                     os.fsync(self._fd)
             except Exception as exc:
-                self._audit_failure("write", exc)
+                self.audit_failure("write", exc)
             self._stats["audit_records"] += len(enriched)
             return enriched
 
-    def _context(self, apps, metadata=None, *, registered=False):
+    def ranking_context(self, apps, metadata=None, *, registered=False):
         key = id(apps)
         context = self._contexts.get(key)
         if context is None or context["apps"] is not apps:
@@ -269,12 +269,12 @@ class _FundingValidationHandle:
                        "registered": False}
             self._contexts[key] = context
         if type(metadata) is dict:
-            context["program_id"] = _context_value(metadata.get("program_id"))
-            context["panel_index"] = _context_value(metadata.get("panel_index"))
+            context["program_id"] = context_value(metadata.get("program_id"))
+            context["panel_index"] = context_value(metadata.get("panel_index"))
         context["registered"] |= registered
         return context
 
-    def _inspect(self, result, apps):
+    def inspect_result(self, result, apps):
         if self._compact_api is None:
             return inspect_funding_result(result, apps)
         try:
@@ -319,11 +319,11 @@ class _FundingValidationHandle:
             return report
         return inspect_funding_result(expanded, apps)
 
-    def _validate(self, result, apps):
+    def validate_result(self, result, apps):
         with self._lock:
-            self._require_active()
-            report = self._inspect(result, apps)
-            context = self._context(apps)
+            self.require_active()
+            report = self.inspect_result(result, apps)
+            context = self.ranking_context(apps)
             context["attempt"] += 1
             record = {
                 "event": "validation_attempt",
@@ -334,10 +334,10 @@ class _FundingValidationHandle:
             }
             self._stats["validation_attempts"] += 1
             self._stats["invalid_attempts"] += int(not report["valid"])
-            self._emit([record])
+            self.emit([record])
             return report["valid"]
 
-    def _preflight(self, batch_results, metadata_list, funding_programs,
+    def preflight(self, batch_results, metadata_list, funding_programs,
                    application_log):
         """No stock calls, normalization, application-log or resource mutation."""
         batch_errors = []
@@ -382,11 +382,11 @@ class _FundingValidationHandle:
             seen_apps.add(id(apps))
             known = self._contexts.get(id(apps))
             if known is not None and known["registered"] and any(
-                known[key] != _context_value(meta.get(key))
+                known[key] != context_value(meta.get(key))
                 for key in ("program_id", "panel_index")
             ):
                 extra_errors.append("panel_metadata_changed")
-            context = self._context(apps, meta)
+            context = self.ranking_context(apps, meta)
             if type(meta.get("program_id")) is not str:
                 extra_errors.append("invalid_program_id")
             elif (type(funding_programs) is dict
@@ -404,7 +404,7 @@ class _FundingValidationHandle:
                 result = None
             else:
                 result = pair[0]  # Message history stays private and untouched.
-            report = self._inspect(result, apps)
+            report = self.inspect_result(result, apps)
             report["errors"] = sorted(set(report["errors"] + extra_errors))
             report["valid"] = report["valid"] and not extra_errors
             records.append({
@@ -418,7 +418,7 @@ class _FundingValidationHandle:
         # lists; prompt registration lets us still fail before any awards.
         for context in self._contexts.values():
             if context["registered"] and id(context["apps"]) not in seen_apps:
-                report = self._inspect(None, context["apps"])
+                report = self.inspect_result(None, context["apps"])
                 report["errors"] = sorted(set(report["errors"] + ["missing_final_panel"]))
                 records.append({
                     "event": "final_panel", "batch_index": None,
@@ -435,7 +435,7 @@ class _FundingValidationHandle:
         self._stats["failed_batches"] += int(failed)
         if batch_errors:
             records.append({"event": "final_batch_error", "errors": batch_errors})
-        persisted = self._emit(records)
+        persisted = self.emit(records)
         if failed:
             raise FundingRankingValidationError({
                 "schema": _SCHEMA, "event": "final_batch_rejected",
@@ -445,7 +445,7 @@ class _FundingValidationHandle:
                            if record["event"] == "final_panel" and not record["valid"]],
             })
 
-    def _require_active(self):
+    def require_active(self):
         if not self._stats["installed"]:
             raise FundingRankingValidationError({
                 "schema": _SCHEMA, "event": "inactive_validation_handle",
@@ -458,7 +458,7 @@ class _FundingValidationHandle:
                 "persisted_records": self._stats["audit_records"],
             })
 
-    def _pending_count(self):
+    def pending_count(self):
         return sum(context["registered"] or context["attempt"] > 0
                    for context in self._contexts.values())
 
@@ -471,7 +471,7 @@ class _FundingValidationHandle:
         """
         with self._lock:
             snapshot = deepcopy(self._stats)
-            snapshot["unprocessed_panels"] += self._pending_count()
+            snapshot["unprocessed_panels"] += self.pending_count()
             snapshot["completion_allowed"] = not any(snapshot[key] for key in (
                 "invalid_final_panels", "failed_batches", "processing_failures",
                 "audit_failures", "imputed_rankings", "fallback_rankings",
@@ -501,14 +501,14 @@ class _FundingValidationHandle:
             self._stats["installed"] = False
             self._stats["restore_conflicts"] = conflicts
             _INSTALLATIONS.pop(self._class, None)
-            self._stats["unprocessed_panels"] += self._pending_count()
+            self._stats["unprocessed_panels"] += self.pending_count()
             self._contexts.clear()
             fd, self._fd = self._fd, None
             try:
                 if fd is not None:
                     os.close(fd)
             except Exception as exc:
-                self._audit_failure("close", exc)
+                self.audit_failure("close", exc)
             if conflicts:
                 raise RuntimeError("Funding validation restore conflict: " + ", ".join(conflicts))
 
@@ -543,16 +543,16 @@ def install_funding_validation(funding_class, audit_path, *, compact=False):
 
         @wraps(original_validate)
         def validate(result, apps):
-            return handle._validate(result, apps)
+            return handle.validate_result(result, apps)
 
         @wraps(original_process)
         def process(batch_results, metadata_list, funding_programs,
                     novelty_penalties=None, lambda_funding=0.0,
                     application_log=None, slot_override=None):
             with handle._lock:
-                handle._require_active()
+                handle.require_active()
                 try:
-                    handle._preflight(batch_results, metadata_list,
+                    handle.preflight(batch_results, metadata_list,
                                       funding_programs, application_log)
                     processing_results = batch_results
                     if compact_api is not None:
@@ -568,7 +568,7 @@ def install_funding_validation(funding_class, audit_path, *, compact=False):
                             handle._stats["failed_batches"] += 1
                             record = {"event": "compact_expansion_error",
                                       "error_type": type(exc).__name__}
-                            handle._emit([record])
+                            handle.emit([record])
                             raise FundingRankingValidationError(record) from exc
                     try:
                         outcome = original_process(
@@ -597,7 +597,7 @@ def install_funding_validation(funding_class, audit_path, *, compact=False):
             @wraps(original_prompts)
             def prompts(self, *args, **kwargs):
                 with handle._lock:
-                    handle._require_active()
+                    handle.require_active()
                     value = original_prompts(self, *args, **kwargs)
                     if compact_api is not None:
                         try:
@@ -621,14 +621,14 @@ def install_funding_validation(funding_class, audit_path, *, compact=False):
                             handle._stats["failed_batches"] += 1
                             record = {"event": "compact_prompt_error",
                                       "error_type": type(exc).__name__}
-                            handle._emit([record])
+                            handle.emit([record])
                             raise FundingRankingValidationError(record) from exc
                     if type(value) in (list, tuple) and len(value) == 3:
                         metadata = value[2]
                         if type(metadata) in (list, tuple):
                             for meta in metadata:
                                 if type(meta) is dict:
-                                    handle._context(meta.get("apps"), meta, registered=True)
+                                    handle.ranking_context(meta.get("apps"), meta, registered=True)
                     return value
 
             patches["get_funding_evaluation_prompts"] = prompts
@@ -637,7 +637,7 @@ def install_funding_validation(funding_class, audit_path, *, compact=False):
         try:
             handle._fd = os.open(handle._path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except Exception as exc:
-            handle._audit_failure("open", exc)
+            handle.audit_failure("open", exc)
         handle._patches = patches
         handle._saved = {name: vars(funding_class).get(name, _MISSING) for name in patches}
         handle._stats["installed"] = True

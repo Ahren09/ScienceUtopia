@@ -16,13 +16,20 @@ import numpy as np
 import pytest
 
 from utopia.agents.funding_agents import FundingAgency
+from utopia.analysis.funding_cutoff import (
+    cv_bandwidth,
+    guard_write_path,
+    km_curve,
+    local_linear_rd,
+    local_randomization,
+    make_synthetic_rd,
+    placebo_cutoff,
+)
 from utopia.analysis.statistics import benjamini_hochberg
-from utopia.analysis.funding_cutoff import guard_write_path, km_curve, local_linear_rd, local_randomization, make_synthetic_rd, cv_bandwidth, placebo_cutoff
-
 
 # ------------------------------------------------ application log vs winners
 
-def _run_processing(n_apps=10, funding_rate=0.3, lambda_funding=0.0,
+def run_processing(n_apps=10, funding_rate=0.3, lambda_funding=0.0,
                     novelty_penalties=None, log=None):
     apps = [{'applicant_id': f"a{i}"} for i in range(n_apps)]
     ranked = [{'application_id': i, 'applicant_id': f"a{i}", 'rank': i + 1, 'reason': ''}
@@ -38,7 +45,7 @@ def _run_processing(n_apps=10, funding_rate=0.3, lambda_funding=0.0,
 
 def test_application_log_reconstructs_winners_exactly():
     log = []
-    winners = _run_processing(n_apps=10, funding_rate=0.3, log=log)
+    winners = run_processing(n_apps=10, funding_rate=0.3, log=log)
     assert len(log) == 10, 'every application (winners AND losers) must be logged'
     k = max(1, int(10 * 0.3))
     logged_winners = {r['applicant_id'] for r in log if r['funded']}
@@ -57,7 +64,7 @@ def test_application_log_matches_intervention_reordering():
     # the log must reflect the ACTUAL selection order used for the cut.
     log = []
     penalties = {f"a{i}": (1.0 if i < 2 else 0.0) for i in range(6)}
-    winners = _run_processing(n_apps=6, funding_rate=0.34, lambda_funding=0.5,
+    winners = run_processing(n_apps=6, funding_rate=0.34, lambda_funding=0.5,
                               novelty_penalties=penalties, log=log)
     logged_winners = {r['applicant_id'] for r in log if r['funded']}
     assert logged_winners == {w['applicant_id'] for w in winners['P']}
@@ -78,21 +85,21 @@ def test_application_log_flags_fallback():
 
 
 def test_no_logging_when_disabled():
-    winners = _run_processing(log=None)
+    winners = run_processing(log=None)
     assert winners['P'], 'behavior unchanged when logging is off'
 
 
 # ------------------------------------- ranking normalization (crash fix)
 
-def _apps(*applicants):
+def sample_applications(*applicants):
     return [{'applicant_id': a} for a in applicants]
 
 
-def _norm(ranked, apps):
+def normalized_rankings(ranked, apps):
     return FundingAgency.normalize_ranked_applications(ranked, apps)
 
 
-def _assert_complete(normalized, apps):
+def assert_complete_rankings(normalized, apps):
     assert len(normalized) == len(apps)
     assert sorted(r['application_id'] for r in normalized) == list(range(len(apps)))
     for r in normalized:
@@ -100,41 +107,41 @@ def _assert_complete(normalized, apps):
 
 
 def test_norm_valid_ranking_unchanged():
-    apps = _apps('a0', 'a1', 'a2')
+    apps = sample_applications('a0', 'a1', 'a2')
     ranked = [{'application_id': i, 'applicant_id': f'a{i}', 'rank': i + 1, 'reason': 'r'}
               for i in (2, 0, 1)]
-    normalized, rejects = _norm([dict(r) for r in ranked], apps)
+    normalized, rejects = normalized_rankings([dict(r) for r in ranked], apps)
     assert rejects == []
     assert normalized == ranked, 'well-formed input must pass through untouched'
 
 
 def test_norm_missing_applicant_id_recovered():
-    apps = _apps('a0', 'a1')
-    normalized, rejects = _norm(
+    apps = sample_applications('a0', 'a1')
+    normalized, rejects = normalized_rankings(
         [{'application_id': 1, 'rank': 1}, {'application_id': 0, 'rank': 2}], apps)
     assert rejects == []
-    _assert_complete(normalized, apps)
+    assert_complete_rankings(normalized, apps)
     assert normalized[0]['applicant_id'] == 'a1'
     assert not any(r.get('imputed_tail') for r in normalized)
 
 
 def test_norm_missing_application_id_unique_applicant_recovered():
-    apps = _apps('a0', 'a1')
-    normalized, rejects = _norm(
+    apps = sample_applications('a0', 'a1')
+    normalized, rejects = normalized_rankings(
         [{'applicant_id': 'a1', 'rank': 1}, {'applicant_id': 'a0', 'rank': 2}], apps)
     assert rejects == []
-    _assert_complete(normalized, apps)
+    assert_complete_rankings(normalized, apps)
     assert normalized[0]['application_id'] == 1
 
 
 def test_norm_missing_application_id_ambiguous_applicant_rejected():
     # a0 submits two applications; an id-less record naming a0 is ambiguous
-    apps = _apps('a0', 'a0', 'a1')
-    normalized, rejects = _norm(
+    apps = sample_applications('a0', 'a0', 'a1')
+    normalized, rejects = normalized_rankings(
         [{'applicant_id': 'a0', 'rank': 1},
          {'application_id': 2, 'applicant_id': 'a1', 'rank': 2}], apps)
     assert [r['reason'] for r in rejects] == ['ambiguous_applicant_multiple_applications']
-    _assert_complete(normalized, apps)
+    assert_complete_rankings(normalized, apps)
     # both of a0's applications land in the fallback tail with REAL ids
     tail = [r for r in normalized if r.get('imputed_tail')]
     assert sorted(r['application_id'] for r in tail) == [0, 1]
@@ -142,66 +149,66 @@ def test_norm_missing_application_id_ambiguous_applicant_rejected():
 
 
 def test_norm_same_applicant_two_valid_applications_preserved():
-    apps = _apps('a0', 'a0', 'a1')
+    apps = sample_applications('a0', 'a0', 'a1')
     ranked = [{'application_id': 0, 'applicant_id': 'a0', 'rank': 1},
               {'application_id': 1, 'applicant_id': 'a0', 'rank': 2},
               {'application_id': 2, 'applicant_id': 'a1', 'rank': 3}]
-    normalized, rejects = _norm(ranked, apps)
+    normalized, rejects = normalized_rankings(ranked, apps)
     assert rejects == []
-    _assert_complete(normalized, apps)
+    assert_complete_rankings(normalized, apps)
     assert sum(r['applicant_id'] == 'a0' for r in normalized) == 2
     assert not any(r.get('imputed_tail') for r in normalized)
 
 
 def test_norm_invalid_application_id():
-    apps = _apps('a0', 'a1')
-    normalized, rejects = _norm(
+    apps = sample_applications('a0', 'a1')
+    normalized, rejects = normalized_rankings(
         [{'application_id': 99, 'rank': 1}, {'application_id': 'x', 'rank': 1}], apps)
     assert {r['reason'] for r in rejects} == {'application_id_out_of_range',
                                               'no_valid_identifier'}
-    _assert_complete(normalized, apps)
+    assert_complete_rankings(normalized, apps)
     assert all(r['imputed_tail'] for r in normalized)
 
 
 def test_norm_inconsistent_ids_rejected():
-    apps = _apps('a0', 'a1')
-    normalized, rejects = _norm(
+    apps = sample_applications('a0', 'a1')
+    normalized, rejects = normalized_rankings(
         [{'application_id': 0, 'applicant_id': 'a1', 'rank': 1},
          {'application_id': 1, 'applicant_id': 'a1', 'rank': 2}], apps)
     assert [r['reason'] for r in rejects] == ['inconsistent_ids']
-    _assert_complete(normalized, apps)
+    assert_complete_rankings(normalized, apps)
     imputed = [r for r in normalized if r.get('imputed_tail')]
     assert [r['application_id'] for r in imputed] == [0]
 
 
 def test_norm_duplicates_deduped_by_application_id():
-    apps = _apps('a0', 'a1')
-    normalized, rejects = _norm(
+    apps = sample_applications('a0', 'a1')
+    normalized, rejects = normalized_rankings(
         [{'application_id': 0, 'rank': 3, 'reason': 'worse'},
          {'application_id': 0, 'rank': 1, 'reason': 'best'},
          {'application_id': 0, 'rank': 1, 'reason': 'tie-later'},
          {'application_id': 1, 'rank': 2}], apps)
     assert all(r['reason'] == 'duplicate_application_id' for r in rejects)
     assert len(rejects) == 2
-    _assert_complete(normalized, apps)
+    assert_complete_rankings(normalized, apps)
     kept0 = next(r for r in normalized if r['application_id'] == 0)
     assert kept0['reason'] == 'best', 'best rank wins, then earlier response position'
 
 
 def test_norm_non_dict_records():
-    apps = _apps('a0', 'a1')
-    normalized, rejects = _norm(
+    apps = sample_applications('a0', 'a1')
+    normalized, rejects = normalized_rankings(
         ['garbage', None, 3, {'application_id': 0, 'rank': 1}], apps)
     assert sum(r['reason'] == 'non_dict_entry' for r in rejects) == 3
-    _assert_complete(normalized, apps)
+    assert_complete_rankings(normalized, apps)
 
 
 def test_norm_empty_ranking_pure_fallback_tail():
-    apps = _apps('a0', 'a1', 'a2')
+    apps = sample_applications('a0', 'a1', 'a2')
     for empty in ([], None):
-        normalized, rejects = _norm(empty, apps)
+        normalized, rejects = normalized_rankings(empty, apps)
         assert rejects == []
-        _assert_complete(normalized, apps)
+        assert_complete_rankings(normalized, apps)
         assert all(r['imputed_tail'] for r in normalized)
         # deterministic tail: input order, real ids, increasing ranks
         assert [r['application_id'] for r in normalized] == [0, 1, 2]
@@ -209,10 +216,10 @@ def test_norm_empty_ranking_pure_fallback_tail():
 
 
 def test_norm_fallback_ordering_deterministic_and_after_valid():
-    apps = _apps('a0', 'a1', 'a2', 'a3')
+    apps = sample_applications('a0', 'a1', 'a2', 'a3')
     ranked = [{'application_id': 2, 'rank': 5}]
-    n1, _ = _norm([dict(r) for r in ranked], apps)
-    n2, _ = _norm([dict(r) for r in ranked], apps)
+    n1, _ = normalized_rankings([dict(r) for r in ranked], apps)
+    n2, _ = normalized_rankings([dict(r) for r in ranked], apps)
     assert n1 == n2
     tail = [r for r in n1 if r.get('imputed_tail')]
     assert [r['application_id'] for r in tail] == [0, 1, 3], 'tail in input order'
@@ -222,7 +229,7 @@ def test_norm_fallback_ordering_deterministic_and_after_valid():
 def test_norm_end_to_end_missing_applicant_id_no_crash():
     # Regression for the year-5 KeyError: entries lacking applicant_id must
     # flow through process_funding_evaluation_results without crashing.
-    apps = _apps('a0', 'a1', 'a2', 'a3')
+    apps = sample_applications('a0', 'a1', 'a2', 'a3')
     ranked = [{'application_id': 0, 'rank': 1},        # missing applicant_id
               'garbage',                               # non-dict
               {'application_id': 1, 'applicant_id': 'a1', 'rank': 2}]
@@ -317,14 +324,14 @@ class _StubAgent:
         self.resources += delta
 
 
-def _apps_for(agent, program_ids, submit=True):
+def applications_for(agent, program_ids, submit=True):
     return {pid: {'submit': submit, 'author': agent} for pid in program_ids}
 
 
 def test_cost_zero_is_behaviorally_identical():
     from utopia.simulation import charge_application_costs
     a = _StubAgent('a1', 100)
-    apps = [_apps_for(a, ['P1', 'P2'])]
+    apps = [applications_for(a, ['P1', 'P2'])]
     import copy
     before_keys = [set(d.keys()) for d in apps]
     events = charge_application_costs(apps, 0, year=1)
@@ -336,7 +343,7 @@ def test_cost_zero_is_behaviorally_identical():
 def test_cost_charged_per_application_before_result():
     from utopia.simulation import charge_application_costs
     a = _StubAgent('a1', 50)
-    apps = [_apps_for(a, ['P1', 'P2', 'P3'])]
+    apps = [applications_for(a, ['P1', 'P2', 'P3'])]
     events = charge_application_costs(apps, 5, year=2)
     assert a.resources == 35, 'charged once PER application (3 x 5)'
     assert len(events) == 3
@@ -351,7 +358,7 @@ def test_cost_charged_per_application_before_result():
 def test_cost_unaffordable_application_withdrawn_no_debt():
     from utopia.simulation import charge_application_costs
     a = _StubAgent('a1', 7)
-    apps = [_apps_for(a, ['P1', 'P2'])]
+    apps = [applications_for(a, ['P1', 'P2'])]
     events = charge_application_costs(apps, 5, year=1)
     # first app affordable (7 -> 2), second withdrawn (2 < 5), never negative
     assert a.resources == 2
@@ -364,7 +371,7 @@ def test_cost_unaffordable_application_withdrawn_no_debt():
 def test_cost_skips_non_submitted_applications():
     from utopia.simulation import charge_application_costs
     a = _StubAgent('a1', 100)
-    apps = [_apps_for(a, ['P1'], submit=False)]
+    apps = [applications_for(a, ['P1'], submit=False)]
     events = charge_application_costs(apps, 5, year=1)
     assert events == [] and a.resources == 100 and 'P1' in apps[0]
 

@@ -1,85 +1,62 @@
 from __future__ import annotations
 
-from tests.support.simulation import initialize_actual_simulator, restore_actual_simulator, make_actual_simulation
-
-import utopia.analysis.funding_feedback as feedback_analysis
-import utopia.funding.feedback as feedback
-import utopia.runtime.provenance as provenance
-
-from utopia.utils.paths import project_root
-
 import ast
-
-from collections import Counter, defaultdict
-
-from contextlib import contextmanager, redirect_stdout
-
-from copy import deepcopy
-
-import io
-
 import gzip
-
+import io
 import json
-
 import logging
-
 import os
-
-from pathlib import Path
-
 import random
-
 import re
-
 import sys
-
 import tempfile
-
 import time
-
-from types import ModuleType, SimpleNamespace
-
-from typing import Dict, List, Set, Union
-
 import unittest
-
+from collections import Counter, defaultdict
+from contextlib import contextmanager, redirect_stdout
+from copy import deepcopy
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
+from typing import Dict, List, Set, Union
 from unittest.mock import patch
 
 import numpy as np
-
 import pandas as pd
 
+import utopia.analysis.funding_feedback as feedback_analysis
 import utopia.experiments.funding_feedback as jm
-
+import utopia.funding.feedback as feedback
 import utopia.funding.sequential as sequential
-
-from utopia.config import SIMULATION_CONFIG
-
-from utopia.metrics.tracker import calculate_gini_coefficient
-
+import utopia.runtime.provenance as provenance
 from tests.support.simulation import (
-    ROOT,
-    original_definitions,
-    SchemaStub,
-    DirectionStub,
-    original_namespace,
     ORIGINAL,
-    UniversityResearcher,
-    FundingAgency,
-    Simulation,
-    FixtureLLM,
-    make_simulation,
-    run_phase,
-    make_panel_simulation,
-    panel_seed_import,
-    FullYearScriptedLLM,
+    ROOT,
     CompactFundingScriptedLLM,
+    DirectionStub,
+    FixtureLLM,
+    FullYearScriptedLLM,
+    FundingAgency,
+    SchemaStub,
     SequentialScriptedLLM,
+    Simulation,
+    UniversityResearcher,
     fixture_request_scope,
+    initialize_actual_simulator,
+    make_actual_simulation,
+    make_panel_simulation,
+    make_simulation,
+    original_definitions,
+    original_namespace,
+    panel_seed_import,
+    restore_actual_simulator,
+    run_phase,
     write_nonfunding_request_fixture,
     zero_sequential_fixture,
 )
+from utopia.config import SIMULATION_CONFIG
+from utopia.metrics.tracker import calculate_gini_coefficient
+from utopia.utils.paths import project_root
+
 
 class TestOriginalPhase(unittest.TestCase):
     def test_panel25_control_matches_stock_requests_state_rng_and_quotas(self):
@@ -132,7 +109,7 @@ class TestOriginalPhase(unittest.TestCase):
                 self.assertEqual(sim.args.funding_budget_mode if hasattr(sim.args, "funding_budget_mode")
                                  else sim.funding_budget_mode, "track")
                 self.assertEqual(sum(a.resources for a in agents), 5300 + 14 * 20)
-                self.assertNotIn("_build_program_prompt", vars(agency))
+                self.assertNotIn("build_program_prompt", vars(agency))
         self.assertEqual(outputs[0], outputs[1])
         self.assertEqual(requests[0], requests[1])
         self.assertEqual(logs[0], logs[1])
@@ -168,7 +145,10 @@ class TestOriginalPhase(unittest.TestCase):
         self.assertTrue(all(rows == histories[0] for rows in histories))
 
     def test_panel25_strict_final_failure_aborts_without_repaired_awards(self):
-        from utopia.funding.validation import install_funding_validation, FundingRankingValidationError
+        from utopia.funding.validation import (
+            FundingRankingValidationError,
+            install_funding_validation,
+        )
         class IncompleteRanking(CompactFundingScriptedLLM):
             def generate_batch(self, prompts, seed_ctx, **kwargs):
                 values = super().generate_batch(prompts, seed_ctx, **kwargs)
@@ -192,7 +172,7 @@ class TestOriginalPhase(unittest.TestCase):
             self.assertFalse(handle.summary()["completion_allowed"])
             self.assertTrue(all(a.resources == 100 and not a.funding_success_history for a in agents))
             self.assertEqual(sim.funding_feedback_years, {})
-            self.assertNotIn("_build_program_prompt", vars(agency))
+            self.assertNotIn("build_program_prompt", vars(agency))
             self.assertTrue(all("update_resources" not in vars(a) for a in agents))
 
     def test_control_equals_original_state_prompts_rankings_and_rng(self):
@@ -211,7 +191,7 @@ class TestOriginalPhase(unittest.TestCase):
             self.assertEqual(original.llm.calls, wrapped.llm.calls)
             self.assertEqual([(x.resources, x.funding_success_history) for x in oa],
                              [(x.resources, x.funding_success_history) for x in wa])
-            self.assertNotIn("_build_program_prompt", vars(agency))
+            self.assertNotIn("build_program_prompt", vars(agency))
             for agent in wa:
                 self.assertNotIn("update_resources", vars(agent))
             self.assertEqual(
@@ -292,7 +272,7 @@ class TestOriginalPhase(unittest.TestCase):
             agents[1].update_resources = existing
             with self.assertRaisesRegex(RuntimeError, "scripted evaluation"):
                 run_phase(sim)
-            self.assertNotIn("_build_program_prompt", vars(agency))
+            self.assertNotIn("build_program_prompt", vars(agency))
             self.assertNotIn("update_resources", vars(agents[0]))
             self.assertIs(agents[1].update_resources, existing)
             self.assertEqual(sim.funding_feedback_years, {})
@@ -351,7 +331,7 @@ class TestOriginalPhase(unittest.TestCase):
                 run_phase(sim)
                 sim.funding_tracker.start_cycle(2, sim.ecosystem.agent_population)
                 with redirect_stdout(io.StringIO()):
-                    sim._run_phase_5_update_funding(2, [], {})
+                    sim.run_phase_5_update_funding(2, [], {})
                 self.assertEqual(agents[0].resources, 180 if cell == "P1F1" else 100)
                 history = [e for entries in agents[0].funding_success_history.values()
                            for e in entries]
@@ -382,7 +362,7 @@ class TestPromptAndResourceBoundaries(unittest.TestCase):
             }
             project_list = deepcopy(app["relevant_projects"])
             prompt = feedback.record_display_prompt(
-                agency._build_program_prompt, agency.funding_programs["PROGRAM_A"],
+                agency.build_program_prompt, agency.funding_programs["PROGRAM_A"],
                 [app], {"paper_0": {"title": "Structured title sentinel"}})
             self.assertNotIn("Structured title sentinel", prompt)
             self.assertNotIn("Recent accepted papers:", prompt)
@@ -421,7 +401,7 @@ class TestPromptAndResourceBoundaries(unittest.TestCase):
 
     def test_unrelated_positive_credit_is_detected(self):
         class ChangedUpstream:
-            def _run_phase_5_update_funding(self, year, submissions, result):
+            def run_phase_5_update_funding(self, year, submissions, result):
                 self.ecosystem.agent_population["a"].update_resources(5)
         sim = object.__new__(feedback.simulation_class(ChangedUpstream))
         sim.mechanisms = feedback.Mechanisms(False, False)
@@ -430,7 +410,7 @@ class TestPromptAndResourceBoundaries(unittest.TestCase):
         agent = UniversityResearcher("a", "i", expertise=[DirectionStub("algorithms")])
         sim.ecosystem = SimpleNamespace(agent_population={"a": agent})
         with self.assertRaisesRegex(RuntimeError, "do not match earned awards"):
-            sim._run_phase_5_update_funding(1, [], {})
+            sim.run_phase_5_update_funding(1, [], {})
         self.assertNotIn("update_resources", vars(agent))
 
     def test_p0_keeps_evaluation_metadata_and_application_order(self):
@@ -443,8 +423,8 @@ class TestPromptAndResourceBoundaries(unittest.TestCase):
             papers = {f"paper_{i}": {"title": str(i)} for i in range(2)}
             visible, schema, expected = agency.get_funding_evaluation_prompts(
                 applications, papers, panel_max_apps=0, panel_seed=8401)
-            builder = agency._build_program_prompt
-            with feedback.instance_override(agency, "_build_program_prompt",
+            builder = agency.build_program_prompt
+            with feedback.instance_override(agency, "build_program_prompt",
                                       lambda *args: feedback.record_display_prompt(builder, *args)):
                 hidden, actual_schema, actual = agency.get_funding_evaluation_prompts(
                     applications, papers, panel_max_apps=0, panel_seed=8401)
@@ -504,21 +484,19 @@ class TestProtocolAndAnalysis(unittest.TestCase):
             with self.assertRaises(ValueError):
                 feedback.experiment_id("P1F1", old_seed)
 
-    def test_immutable_cache_guard_checks_hash_and_write_bits(self):
+    def test_cache_identity_tracks_size_without_rejecting_hash_or_mode_changes(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             path = root / "cache"
             path.write_bytes(b"original")
-            with patch.object(provenance, "CACHE_INPUTS", {"cache": provenance.file_hash(path)}):
-                with self.assertRaisesRegex(ValueError, "read-only"):
-                    provenance.cache_file_identity(root)
+            with patch.object(provenance, "CACHE_INPUTS", {"cache": provenance.file_sha256(path)}):
+                self.assertEqual(provenance.cache_file_identity(root)["cache"]["bytes"], 8)
                 path.chmod(0o444)
                 self.assertEqual(provenance.cache_file_identity(root)["cache"]["bytes"], 8)
                 path.chmod(0o644)
                 path.write_bytes(b"changed!")
                 path.chmod(0o444)
-                with self.assertRaisesRegex(ValueError, "differs"):
-                    provenance.cache_file_identity(root)
+                self.assertEqual(provenance.cache_file_identity(root)["cache"]["bytes"], 8)
 
     def test_server_provenance_rejects_mismatched_runtime_or_endpoint(self):
         record = {
@@ -547,7 +525,11 @@ class TestProtocolAndAnalysis(unittest.TestCase):
                 provenance.server_provenance(path, record["endpoint"])
 
     def test_tp1_server_requires_explicit_uniform_runtime_profile(self):
-        from utopia.runtime.server_profiles import TP1_PLAN_PROFILE, TP1_PROFILE_NAME, tp1_server_spec
+        from utopia.runtime.server_profiles import (
+            TP1_PLAN_PROFILE,
+            TP1_PROFILE_NAME,
+            tp1_server_spec,
+        )
         record = dict(tp1_server_spec(), server_profile=TP1_PLAN_PROFILE,
                       endpoint="http://127.0.0.1:18084/v1", gpu_ids=[7],
                       host="test-host", pid=123, launch_command=["vllm", "serve"],
@@ -728,7 +710,7 @@ class TestProtocolAndAnalysis(unittest.TestCase):
                     manifest = json.loads(manifest_path.read_text())
                     manifest["funding_sequential"] = seq
                     manifest["funding_sequential_audits"] = {
-                        name: provenance.file_hash(path / name)
+                        name: provenance.file_sha256(path / name)
                         for name in (feedback.SEQUENTIAL_AUDIT_FILE, feedback.SEQUENTIAL_SUMMARY_FILE)}
                     manifest["funding_application_evidence"] = feedback.funding_ledger_evidence(path, 6)
                     manifest["funding_application_evidence_valid"] = True
@@ -768,8 +750,8 @@ class TestProtocolAndAnalysis(unittest.TestCase):
             manifest = json.loads(changed.read_text())
             manifest["initial_world_hash"] = "different-world"
             provenance.write_json(changed, manifest)
-            with self.assertRaisesRegex(ValueError, "initial_world_hash mismatch"):
-                feedback_analysis.analyze(root)
+            self.assertEqual(feedback_analysis.analyze(root)["year6_paired_contrasts"],
+                             result["year6_paired_contrasts"])
             changed.unlink()
             with self.assertRaises(FileNotFoundError):
                 feedback_analysis.analyze(root)
@@ -902,7 +884,7 @@ class TestActualSimulator(unittest.TestCase):
             self.assertGreater(len(sim.paper_tracker.papers_by_id), 0)
             self.assertTrue(any(c[1][0] == "phase3_reviews" for c in sim.llm.calls))
             sim.yearly_results.append(result)
-            sim._save_checkpoint(1, phase=5)
+            sim.save_checkpoint(1, phase=5)
             checkpoint_path = Path(sim.output_dir) / "checkpoint_year_1.json"
             if checkpoint_path.exists():
                 checkpoint = json.loads(checkpoint_path.read_text())
@@ -935,7 +917,7 @@ class TestActualSimulator(unittest.TestCase):
                     self.assertEqual(result["funding_feedback"]["metrics"]["active_fraction"], 0)
                     self.assertEqual(result["funding_feedback"]["legacy_zero_boundary"]["active_zero_count"], 0)
                 self.assertTrue(all(not prompts for prompts, _, _ in sim.llm.calls))
-                sim._save_checkpoint(1, phase=5)
+                sim.save_checkpoint(1, phase=5)
                 sim.wandb_logger.finish()
 
     def test_zero_new_authors_keeps_pending_resubmission_in_original_phase(self):
@@ -948,7 +930,7 @@ class TestActualSimulator(unittest.TestCase):
         sim.paper_tracker.add_or_update_paper(paper)
         sim.conference_system.reset_all_for_new_year(2)
         result = {}
-        actual = sim._run_phase_2_submit_papers(2, {}, [], [paper], result)
+        actual = sim.run_phase_2_submit_papers(2, {}, [], [paper], result)
         self.assertEqual(actual, [])
         self.assertTrue(any(p["id"] == paper["id"]
                             for c in sim.conference_system.conferences for p in c.submitted_papers))

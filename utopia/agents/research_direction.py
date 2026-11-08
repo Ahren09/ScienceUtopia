@@ -8,9 +8,9 @@ When selecting research directions, agents randomly sample from their expertise.
 import logging
 import random
 import time
-from dataclasses import dataclass
-from typing import List, Dict, Optional, Tuple
 import traceback
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 from pydantic import BaseModel
 
@@ -120,7 +120,7 @@ def build_direction_prompt(
     past_accepted_papers, past_rejected_papers = paper_tracker.get_papers_by_decision(agent.id)
 
     prompt = f"""
-{agent._get_personality_prompt(include_exploration_strategy=True)}
+{agent.get_personality_prompt(include_exploration_strategy=True)}
 
 Now, you are trying to decide the research direction of your next project.
 """

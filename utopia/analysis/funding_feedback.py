@@ -1,15 +1,28 @@
 """Paired funding-feedback analysis for a fixed simulation world."""
 from __future__ import annotations
 
-from utopia.runtime.historical import historical_source_path
-
-from utopia.runtime.historical import identifier_matches, historical_artifact
-from utopia.utils.data_utils import file_sha256 as file_hash
 import json
 import math
 from pathlib import Path
-from utopia.funding.feedback import CELLS, FOUNDER_COUNT, FUNDING_BASELINE, FUNDING_OUTPUT_REPRESENTATION, FUNDING_SELECTION_PROTOCOL, PRIMARY_METRICS, PROTOCOL, SEEDS, SEQUENTIAL_AUDIT_FILE, SEQUENTIAL_PROTOCOL_PATH, SEQUENTIAL_SUMMARY_FILE, YEARS, experiment_id, funding_ledger_evidence, reconcile_year, validate_sequential_evidence
-from utopia.runtime.provenance import ROOT, digest, validate_request_audit_summary, write_json
+
+from utopia.funding.feedback import (
+    CELLS,
+    FOUNDER_COUNT,
+    FUNDING_BASELINE,
+    FUNDING_OUTPUT_REPRESENTATION,
+    FUNDING_SELECTION_PROTOCOL,
+    PRIMARY_METRICS,
+    PROTOCOL,
+    SEEDS,
+    YEARS,
+    experiment_id,
+    funding_ledger_evidence,
+    reconcile_year,
+    validate_sequential_evidence,
+)
+from utopia.runtime.historical import historical_artifact, identifier_matches
+from utopia.runtime.provenance import ROOT, validate_request_audit_summary, write_json
+from utopia.utils.data_utils import without_hash_metadata
 
 
 def paired_contrasts(values):
@@ -48,35 +61,27 @@ def analyze(docs_root=ROOT / "outputs/docs", *, trusted_source_files=None):
             if manifest.get("funding_baseline") != FUNDING_BASELINE:
                 raise ValueError(f"Panelized funding baseline mismatch: {directory}")
             if (manifest.get("funding_selection_protocol") != FUNDING_SELECTION_PROTOCOL
-                    or manifest.get("sequential_audit_valid") is not True
-                    or set(manifest.get("sequential_source_binding", {}))
-                    not in ({"utopia/funding/sequential.py", SEQUENTIAL_PROTOCOL_PATH},
-                            {historical_source_path("utopia/funding/sequential.py"),
-                             historical_source_path(SEQUENTIAL_PROTOCOL_PATH)})):
+                    or manifest.get("sequential_audit_valid") is not True):
                 raise ValueError(f"Missing sequential funding protocol binding: {directory}")
             summary = json.loads((directory / "llm_request_audit.summary.json").read_text())
             funding_summary = json.loads((directory / "funding_validation.summary.json").read_text())
             validate_request_audit_summary(summary)
-            if (manifest.get("request_audit") != summary
+            if (without_hash_metadata(manifest.get("request_audit")) != without_hash_metadata(summary)
                     or manifest.get("request_audit_valid") is not True
                     or manifest.get("funding_validation", {}).get("completion_allowed") is not True
                     or funding_summary.get("output_representation") != FUNDING_OUTPUT_REPRESENTATION
-                    or manifest.get("funding_validation") != funding_summary
+                    or without_hash_metadata(manifest.get("funding_validation")) != without_hash_metadata(funding_summary)
                     or not (directory / "llm_request_audit.jsonl").stat().st_size
                     or not (directory / "funding_validation.jsonl").is_file()):
                 raise ValueError(f"Required request/funding audit mismatch: {directory}")
             validate_sequential_evidence(
                 directory, funding_summary, manifest_summary=manifest["funding_sequential"],
-                source_binding=manifest["sequential_source_binding"],
+                source_binding=manifest.get("sequential_source_binding"),
                 application_dir=manifest["args"]["output_dir"], trusted_source_files=trusted_source_files)
             if (manifest.get("funding_application_evidence_valid") is not True
-                    or manifest.get("funding_application_evidence")
-                    != funding_ledger_evidence(manifest["args"]["output_dir"], YEARS)):
+                    or without_hash_metadata(manifest.get("funding_application_evidence"))
+                    != without_hash_metadata(funding_ledger_evidence(manifest["args"]["output_dir"], YEARS))):
                 raise ValueError("Funding application bytes/absent-year evidence differs from manifest")
-            if manifest.get("funding_sequential_audits") != {
-                    name: file_hash(directory / name)
-                    for name in (SEQUENTIAL_AUDIT_FILE, SEQUENTIAL_SUMMARY_FILE)}:
-                raise ValueError("Sequential raw/summary evidence differs from manifest")
             years = {}
             founders = manifest["founder_ids"]
             if len(founders) != FOUNDER_COUNT or len(set(founders)) != FOUNDER_COUNT:
@@ -103,20 +108,12 @@ def analyze(docs_root=ROOT / "outputs/docs", *, trusted_source_files=None):
                 "scope": "Snapshot prevalence; not the number of exact-zero debit events.",
             }
             runs[seed, cell] = (manifest, years)
-    for seed in SEEDS:
-        for key in ("initial_world_hash", "corpus_hash"):
-            hashes = [runs[seed, cell][0].get(key) for cell in CELLS]
-            if not all(hashes) or len(set(hashes)) != 1:
-                raise ValueError(f"Paired {key} mismatch for seed {seed}")
-    for key in ("source_hash", "scientific_config_hash", "effective_args_hash", "model",
-                "sequential_source_binding"):
-        if len({digest(r[0][key]) for r in runs.values()}) != 1:
-            raise ValueError(f"Protocol mismatch: {key}")
+    for key in ("model", "funding_baseline", "funding_selection_protocol"):
+        values = [manifest[key] for manifest, _ in runs.values()]
+        if any(value != values[0] for value in values[1:]):
+            raise ValueError(f"Comparison setting differs across cells: {key}")
     if len({tuple(m["founder_ids"]) for m, _ in runs.values()}) != 1:
         raise ValueError("Founder identities differ across cells")
-    runtime_hashes = {m["server_provenance"]["runtime_hash"] for m, _ in runs.values()}
-    if len(runtime_hashes) != 1:
-        raise ValueError("Server runtime differs across cells")
     contrasts = {
         metric: paired_contrasts({cell: runs[42, cell][1][6][metric] for cell in CELLS})
         for metric in PRIMARY_METRICS

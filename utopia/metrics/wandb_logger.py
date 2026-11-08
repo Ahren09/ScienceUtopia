@@ -8,7 +8,6 @@ Controlled via SIMULATION_CONFIG['wandb']['enabled'] — all methods are no-ops 
 import logging
 from collections import defaultdict
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -52,7 +51,7 @@ class WandbLogger:
 
         import wandb
 
-        metrics = self._extract_phase_metrics(year, phase, year_results, simulation, **extra)
+        metrics = self.extract_phase_metrics(year, phase, year_results, simulation, **extra)
 
         # Update history in the phase where each metric is computed
         if phase == 3:
@@ -82,7 +81,7 @@ class WandbLogger:
 
     # ---- Phase-specific metric extraction ----
 
-    def _extract_phase_metrics(self, year: int, phase: int, year_results: dict, simulation, **extra) -> dict:
+    def extract_phase_metrics(self, year: int, phase: int, year_results: dict, simulation, **extra) -> dict:
         metrics = {}
 
         if phase == 0:

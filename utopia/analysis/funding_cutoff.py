@@ -11,14 +11,6 @@ Data: funding_applications_year_<y>.jsonl written by utopia/simulation.py with
 Driver: utopia/experiments/funding_cutoff.py. Unit tests: tests/experiments/test_funding_cutoff.py.
 """
 
-from utopia.utils.data_utils import write_json as write_json_file
-
-from utopia.utils.data_utils import read_json
-
-from utopia.analysis.statistics import benjamini_hochberg
-
-from utopia.utils.paths import project_root
-
 import glob
 import json
 import os
@@ -26,6 +18,11 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+
+from utopia.analysis.statistics import benjamini_hochberg
+from utopia.utils.data_utils import read_json
+from utopia.utils.data_utils import write_json as write_json_file
+from utopia.utils.paths import project_root
 
 REPO_ROOT = str(project_root(__file__))
 
@@ -111,7 +108,7 @@ def load_final_checkpoint(run_dir: str) -> Dict:
     return read_json(path)
 
 
-def _award_years(funding_success_history: Dict) -> List[Tuple[int, float]]:
+def award_years(funding_success_history: Dict) -> List[Tuple[int, float]]:
     out = []
     for _pid, awards in (funding_success_history or {}).items():
         for a in awards:
@@ -153,13 +150,13 @@ def build_application_dataset(experiment_ids: List[str], outputs_dir: str = 'out
         citations = ckpt['citation_tracker']['citations']  # cited_id -> [citer ids]
 
         # awards by (agent, year)
-        awards = {aid: _award_years(a.get('funding_success_history'))
+        awards = {aid: award_years(a.get('funding_success_history'))
                   for aid, a in agents.items()}
 
         # Cutoff reconstruction: for every (program, year), the union of logged
         # funded applicants across panels must EXACTLY equal the winners
         # recorded in checkpoint funding_success_history.
-        def _recorded_winners(pid: str, yr: int) -> set:
+        def recorded_winners(pid: str, yr: int) -> set:
             return {aid for aid, a in agents.items()
                     if any(int(e['year']) == yr
                            for e in (a.get('funding_success_history') or {}).get(pid, []))}
@@ -167,7 +164,7 @@ def build_application_dataset(experiment_ids: List[str], outputs_dir: str = 'out
         program_year_ok = {}
         for (pid, yr), g in apps.groupby(['program_id', 'year']):
             logged = set(g.loc[g['funded'], 'applicant_id'])
-            program_year_ok[(pid, int(yr))] = (logged == _recorded_winners(pid, int(yr)))
+            program_year_ok[(pid, int(yr))] = (logged == recorded_winners(pid, int(yr)))
 
         # panel-level validity
         panel_valid = {}
@@ -323,14 +320,14 @@ def build_application_dataset(experiment_ids: List[str], outputs_dir: str = 'out
 # Estimation core
 # --------------------------------------------------------------------------
 
-def _triangular_weights(x: np.ndarray, h: float) -> np.ndarray:
+def triangular_weights(x: np.ndarray, h: float) -> np.ndarray:
     return np.maximum(0.0, 1.0 - np.abs(x) / h)
 
 
 
 
 
-def _weighted_demean(M: np.ndarray, w: np.ndarray, groups: np.ndarray) -> np.ndarray:
+def weighted_demean(M: np.ndarray, w: np.ndarray, groups: np.ndarray) -> np.ndarray:
     """Weighted within-group demeaning (competition fixed effects)."""
     out = M.astype(float).copy()
     dfm = pd.DataFrame(M)
@@ -343,7 +340,7 @@ def _weighted_demean(M: np.ndarray, w: np.ndarray, groups: np.ndarray) -> np.nda
     return out
 
 
-def _cluster_vcov(Xw: np.ndarray, resid_w: np.ndarray, XtX_inv: np.ndarray,
+def cluster_vcov(Xw: np.ndarray, resid_w: np.ndarray, XtX_inv: np.ndarray,
                   clusters: np.ndarray) -> np.ndarray:
     """CR1 cluster-robust vcov for WLS expressed in weighted form."""
     n, kdim = Xw.shape
@@ -370,14 +367,14 @@ def local_linear_rd(df: pd.DataFrame, y: str, h: float,
     sub, xc = sub[keep], xc[keep]
     if len(sub) < 10 or sub[d_col].nunique() < 2:
         return {'tau': np.nan, 'se': np.nan, 'n': int(len(sub)), 'h': h}
-    w = _triangular_weights(xc, h)
+    w = triangular_weights(xc, h)
     D = sub[d_col].to_numpy(dtype=float)
     M = np.column_stack([D, xc, D * xc])
     Y = sub[y].to_numpy(dtype=float)
 
     if fe:
         comp = sub['competition'].to_numpy()
-        MY = _weighted_demean(np.column_stack([M, Y]), w, comp)
+        MY = weighted_demean(np.column_stack([M, Y]), w, comp)
         Md, Yd = MY[:, :3], MY[:, 3]
     else:
         Md = np.column_stack([np.ones(len(sub)), M])
@@ -394,10 +391,10 @@ def local_linear_rd(df: pd.DataFrame, y: str, h: float,
 
     cl_a = sub['applicant_id'].to_numpy(dtype=str)
     cl_c = sub['competition'].to_numpy(dtype=str)
-    V_a = _cluster_vcov(Xw, resid_w, XtX_inv, cl_a)
-    V_c = _cluster_vcov(Xw, resid_w, XtX_inv, cl_c)
+    V_a = cluster_vcov(Xw, resid_w, XtX_inv, cl_a)
+    V_c = cluster_vcov(Xw, resid_w, XtX_inv, cl_c)
     cl_ac = np.char.add(np.char.add(cl_a, '#'), cl_c)
-    V_ac = _cluster_vcov(Xw, resid_w, XtX_inv, cl_ac)
+    V_ac = cluster_vcov(Xw, resid_w, XtX_inv, cl_ac)
     V_2w = V_a + V_c - V_ac
     se_2w = float(np.sqrt(max(V_2w[j, j], 0)))
     tau = float(beta[j])
@@ -425,18 +422,18 @@ def local_quadratic_rd(df: pd.DataFrame, y: str, h: float) -> Dict:
     sub, xc = sub[keep], xc[keep]
     if len(sub) < 14 or sub['funded'].nunique() < 2:
         return {'tau': np.nan, 'se': np.nan, 'n': int(len(sub)), 'h': h}
-    w = _triangular_weights(xc, h)
+    w = triangular_weights(xc, h)
     D = sub['funded'].to_numpy(dtype=float)
     M = np.column_stack([D, xc, D * xc, xc ** 2, D * xc ** 2])
     Y = sub[y].to_numpy(dtype=float)
-    MY = _weighted_demean(np.column_stack([M, Y]), w, sub['competition'].to_numpy())
+    MY = weighted_demean(np.column_stack([M, Y]), w, sub['competition'].to_numpy())
     Md, Yd = MY[:, :5], MY[:, 5]
     sw = np.sqrt(w)
     Xw, Yw = Md * sw[:, None], Yd * sw
     XtX_inv = np.linalg.pinv(Xw.T @ Xw)
     beta = XtX_inv @ (Xw.T @ Yw)
     resid_w = Yw - Xw @ beta
-    V = _cluster_vcov(Xw, resid_w, XtX_inv, sub['applicant_id'].astype(str).to_numpy())
+    V = cluster_vcov(Xw, resid_w, XtX_inv, sub['applicant_id'].astype(str).to_numpy())
     return {'tau': float(beta[0]), 'se': float(np.sqrt(max(V[0, 0], 0))),
             'n': int(len(sub)), 'h': h, 'spec': 'local_quadratic'}
 
@@ -469,12 +466,12 @@ def local_randomization(df: pd.DataFrame, y: str, window: float,
 
     # FE diff-in-means with uniform weights, applicant-clustered SE
     w = np.ones(len(sub))
-    MY = _weighted_demean(np.column_stack([Dv.astype(float), Yv]), w, sub['competition'].to_numpy())
+    MY = weighted_demean(np.column_stack([Dv.astype(float), Yv]), w, sub['competition'].to_numpy())
     Dd, Yd = MY[:, 0:1], MY[:, 1]
     XtX_inv = np.linalg.pinv(Dd.T @ Dd)
     beta = XtX_inv @ (Dd.T @ Yd)
     resid = Yd - (Dd @ beta)
-    V = _cluster_vcov(Dd, resid, XtX_inv, sub['applicant_id'].astype(str).to_numpy())
+    V = cluster_vcov(Dd, resid, XtX_inv, sub['applicant_id'].astype(str).to_numpy())
     return {'tau': tau, 'tau_fe': float(beta[0]), 'p_fisher': p_fisher,
             'se_fe_dim': float(np.sqrt(max(V[0, 0], 0))),
             'n': int(len(sub)), 'window': window,
@@ -499,7 +496,7 @@ def cv_bandwidth(df: pd.DataFrame, covariate: str = 'prior_papers',
             if len(sub) < 10 or sub['funded'].nunique() < 2:
                 continue
             xc = sub['x'].to_numpy(dtype=float)
-            w = _triangular_weights(xc, h)
+            w = triangular_weights(xc, h)
             D = sub['funded'].to_numpy(dtype=float)
             M = np.column_stack([np.ones(len(sub)), D, xc, D * xc])
             Y = sub[covariate].to_numpy(dtype=float)
@@ -548,7 +545,7 @@ def interaction_rd(df_base: pd.DataFrame, df_cost: pd.DataFrame, y: str,
     sub, xc = sub[keep], xc[keep]
     if len(sub) < 20 or sub['funded'].nunique() < 2 or sub['_env'].nunique() < 2:
         return {'tau_diff': np.nan, 'n': int(len(sub)), 'h': h}
-    w = _triangular_weights(xc, h)
+    w = triangular_weights(xc, h)
     D = sub['funded'].to_numpy(dtype=float)
     E = sub['_env'].to_numpy(dtype=float)
     # competition ids are unique per environment (seed|year|program|panel with
@@ -556,7 +553,7 @@ def interaction_rd(df_base: pd.DataFrame, df_cost: pd.DataFrame, y: str,
     comp = (sub['_env'].astype(int).astype(str) + '~' + sub['competition'].astype(str)).to_numpy()
     M = np.column_stack([D, xc, D * xc, E * D, E * xc, E * D * xc])
     Y = sub[y].to_numpy(dtype=float)
-    MY = _weighted_demean(np.column_stack([M, Y]), w, comp)
+    MY = weighted_demean(np.column_stack([M, Y]), w, comp)
     Md, Yd = MY[:, :6], MY[:, 6]
     sw = np.sqrt(w)
     Xw, Yw = Md * sw[:, None], Yd * sw
@@ -567,10 +564,10 @@ def interaction_rd(df_base: pd.DataFrame, df_cost: pd.DataFrame, y: str,
 
     cl_pair = (sub['seed'].astype(str) + '|' + sub['applicant_id'].astype(str)).to_numpy()
     cl_comp = comp
-    V_p = _cluster_vcov(Xw, resid_w, XtX_inv, cl_pair)
-    V_c = _cluster_vcov(Xw, resid_w, XtX_inv, cl_comp)
+    V_p = cluster_vcov(Xw, resid_w, XtX_inv, cl_pair)
+    V_c = cluster_vcov(Xw, resid_w, XtX_inv, cl_comp)
     cl_int = np.char.add(np.char.add(cl_pair.astype(str), '#'), cl_comp.astype(str))
-    V_i = _cluster_vcov(Xw, resid_w, XtX_inv, cl_int)
+    V_i = cluster_vcov(Xw, resid_w, XtX_inv, cl_int)
     V = V_p + V_c - V_i
     se = float(np.sqrt(max(V[j, j], 0)))
     tau_diff = float(beta[j])
@@ -647,7 +644,7 @@ def make_synthetic_rd(n_competitions: int = 120, panel_n: int = 20, k: int = 5,
 def sample_size_gate(df: pd.DataFrame) -> Dict:
     near = {f'abs_x_le_{h}': int((df['x'].abs() <= h).sum())
             for h in sorted(set(CANDIDATE_BANDWIDTHS + SENSITIVITY_BANDWIDTHS))}
-    w = _triangular_weights(df.loc[df['x'].abs() <= 2, 'x'].to_numpy(dtype=float), 2.0)
+    w = triangular_weights(df.loc[df['x'].abs() <= 2, 'x'].to_numpy(dtype=float), 2.0)
     kish = float(w.sum() ** 2 / (w ** 2).sum()) if len(w) else 0.0
     reps = df.groupby(['seed', 'applicant_id']).size()
     gate = {
@@ -738,11 +735,11 @@ def run_full_analysis(df: pd.DataFrame, out_docs: str, out_visual: str,
     make_figures(df, results, h_main, out_visual)
 
     out_path = guard_write_path(os.path.join(out_docs, 'rd_results.json'))
-    write_json_file(results, out_path, indent=1, default=_json_safe)
+    write_json_file(results, out_path, indent=1, default=json_safe)
     return results
 
 
-def _json_safe(o):
+def json_safe(o):
     if isinstance(o, (np.integer,)):
         return int(o)
     if isinstance(o, (np.floating,)):
@@ -752,7 +749,7 @@ def _json_safe(o):
     return str(o)
 
 
-def _binned_means(df: pd.DataFrame, y: str, max_x: float = 8):
+def binned_means(df: pd.DataFrame, y: str, max_x: float = 8):
     g = df[df[y].notna() & (df['x'].abs() <= max_x)].groupby('x')[y]
     m = g.mean()
     se = g.std() / np.sqrt(g.size().clip(lower=1))
@@ -769,7 +766,7 @@ def local_linear_fit_line(df: pd.DataFrame, y: str, h: float, side: int):
     if len(sub) < 5:
         return None
     xc = sub['x'].to_numpy(dtype=float)
-    w = _triangular_weights(xc, h)
+    w = triangular_weights(xc, h)
     M = np.column_stack([np.ones(len(sub)), xc])
     Y = sub[y].to_numpy(dtype=float)
     sw = np.sqrt(w)
@@ -796,7 +793,7 @@ def local_linear_fit_band(df: pd.DataFrame, y: str, h: float, side: int,
     if len(sub) < 5:
         return None
     xc = sub['x'].to_numpy(dtype=float)
-    sw = np.sqrt(_triangular_weights(xc, h))
+    sw = np.sqrt(triangular_weights(xc, h))
     Xw = np.column_stack([np.ones(len(sub)), xc]) * sw[:, None]
     Yw = sub[y].to_numpy(dtype=float) * sw
     XtX_inv = np.linalg.pinv(Xw.T @ Xw)
@@ -805,9 +802,9 @@ def local_linear_fit_band(df: pd.DataFrame, y: str, h: float, side: int,
     cl_a = sub['applicant_id'].to_numpy(dtype=str)
     cl_c = sub['competition'].to_numpy(dtype=str)
     cl_ac = np.char.add(np.char.add(cl_a, '#'), cl_c)
-    V = (_cluster_vcov(Xw, resid_w, XtX_inv, cl_a)
-         + _cluster_vcov(Xw, resid_w, XtX_inv, cl_c)
-         - _cluster_vcov(Xw, resid_w, XtX_inv, cl_ac))
+    V = (cluster_vcov(Xw, resid_w, XtX_inv, cl_a)
+         + cluster_vcov(Xw, resid_w, XtX_inv, cl_c)
+         - cluster_vcov(Xw, resid_w, XtX_inv, cl_ac))
     from scipy import stats
     G_min = min(len(np.unique(cl_a)), len(np.unique(cl_c)))
     tcrit = stats.t.ppf(0.975, df=max(G_min - 1, 1))

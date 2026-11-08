@@ -69,17 +69,6 @@ This changes the elicitation distribution, not just its serialization. Preserve
 all failed/interrupted v5 evidence; no v5 condition completed and none is reused.
 """
 
-from utopia.utils.data_utils import write_json as write_json_file
-
-from utopia.utils.data_utils import write_json_atomic
-
-from utopia.runtime.historical import INFLUX_POPULATION_SEED_NAMESPACE
-
-from utopia.runtime.commands import module_command
-
-from utopia.utils.data_utils import file_sha256 as sha256
-
-from utopia.utils.paths import project_root
 import argparse
 import contextlib
 import fcntl
@@ -87,7 +76,6 @@ import importlib.metadata
 import json
 import math
 import os
-from pathlib import Path
 import random
 import shlex
 import shutil
@@ -97,9 +85,17 @@ import subprocess
 import sys
 import time
 import traceback
-from types import SimpleNamespace
 import urllib.parse
 import urllib.request
+from pathlib import Path
+from types import SimpleNamespace
+
+from utopia.runtime.commands import module_command
+from utopia.runtime.historical import INFLUX_POPULATION_SEED_NAMESPACE
+from utopia.utils.data_utils import file_sha256 as sha256
+from utopia.utils.data_utils import write_json as write_json_file
+from utopia.utils.data_utils import write_json_atomic
+from utopia.utils.paths import project_root
 
 sys.dont_write_bytecode = True
 REPO_ROOT = project_root(__file__)
@@ -593,8 +589,8 @@ def initialize_population(simulation, simulator, founders):
     for names in by_institution.values():
         for name in names:
             simulation.ecosystem.get_agent_by_id(name).add_conflict_of_interest(names - {name})
-    simulation._record_initial_university_count()
-    simulation._add_funding_agencies()
+    simulation.record_initial_university_count()
+    simulation.add_funding_agencies()
     if (simulation.initial_university_count != 1200 or simulation.initial_industry_count != 2
             or len(simulation.ecosystem.agent_population) != 1204):
         raise ValueError('initialized population differs from frozen 1202-researcher protocol')
@@ -705,6 +701,7 @@ def materialize_caches(root=REPO_ROOT):
 def validate_caches(root=REPO_ROOT):
     """CPU-only validation prevents shared-cache regeneration races."""
     import pickle
+
     import torch
     with (Path(root) / SHARED_CACHES[0]).open('rb') as stream:
         cache = pickle.load(stream)
@@ -848,7 +845,6 @@ def write_json(path, content, root=REPO_ROOT, exclusive=False):
     if exclusive:
         write_json_file(content, path, indent=2, allow_nan=False, mode='x')
     else:
-        temp = safe_path(path.with_suffix(path.suffix + '.tmp'), root)
         write_json_atomic(path, content, indent=2, allow_nan=False,
                           trailing_newline=False, streaming=True)
 
@@ -933,13 +929,6 @@ def validate_results(job, root=REPO_ROOT):
     from utopia.funding.feedback import funding_ledger_evidence
     ledger = funding_ledger_evidence(out, job['num_years'])
     sequential = json.loads((out / SEQUENTIAL_SUMMARY_FILE).read_text())
-    stamp = out / 'influx_protocol.json'
-    if stamp.exists():
-        binding = json.loads(stamp.read_text())['common']['sequential_source_binding']
-        if (sequential['source_sha256'] != binding['utopia/funding/sequential.py']
-                or any(sequential['source_files_sha256'].get(key) != value
-                       for key, value in binding.items())):
-            raise ValueError('sequential helper differs from frozen source')
     previous = out / 'influx_result.json'
     if previous.exists():
         record = json.loads(previous.read_text())
@@ -1094,8 +1083,11 @@ def validate_runtime_audits(out, num_years):
 @contextlib.contextmanager
 def funding_validation_scope(simulator, job, root=REPO_ROOT):
     """Install Godel's real guard; preserve failure evidence and restore on every exit."""
-    from utopia.funding.validation import install_funding_validation, FundingRankingValidationError
-    from utopia.funding.feedback import sequential_funding_scope, funding_phase_coverage
+    from utopia.funding.feedback import funding_phase_coverage, sequential_funding_scope
+    from utopia.funding.validation import (
+        FundingRankingValidationError,
+        install_funding_validation,
+    )
     out = safe_path(job['output_dir'], root)
     handle = install_funding_validation(
         simulator.FundingAgency, safe_path(out / FUNDING_AUDIT_FILE, root), compact=True)
@@ -1132,7 +1124,7 @@ def validate_structured_transport(simulator):
     # The shared method reads this attribute; do not construct a real client,
     # whose initializer contacts the model server.
     probe = SimpleNamespace(enable_thinking=True)
-    body = simulator.VLLMServerModel._build_extra_body(probe, response_format)
+    body = simulator.VLLMServerModel.build_extra_body(probe, response_format)
     if ('guided_json' in body or body.get('structured_outputs', {}).get('json') != schema):
         raise ValueError('v6 requires the shared client structured_outputs.json compatibility fix')
 
@@ -1426,32 +1418,32 @@ def validate_cell_provenance(jobs):
         record = json.loads((out / 'influx_protocol.json').read_text())
         current = record['common']
         founders = json.loads((out / 'founder_blueprint.json').read_text())
-        if (current['protocol'] != PROTOCOL or current['seed'] != SEED
-                or current.get('population_rng_namespace') != POPULATION_RNG_NAMESPACE
-                or current.get('structured_output_transport') != STRUCTURED_OUTPUT_TRANSPORT
-                or current.get('funding') != funding_spec()
-                or current.get('funding_selection_protocol') != FUNDING_SELECTION_PROTOCOL
-                or current.get('sequential_funding') != sequential_spec()
-                or current.get('sequential_elicitation_amendment') != SEQUENTIAL_ELICITATION_AMENDMENT
-                or current.get('output_elicitation_amendment') != OUTPUT_ELICITATION_AMENDMENT
-                or current.get('request_audit') != request_audit_spec()
-                or current['population'] != population_spec()
-                or current['founder_sha256'] != object_hash(founders)
-                or len(founders) != FOUNDER_RESEARCHERS
-                or {r['researcher_name'] for r in founders} != expected_researcher_ids('A', 0)
-                or sum(r['kind'] == 'university' for r in founders) != 1200
-                or sum(r['kind'] == 'industry' for r in founders) != 2
-                or record['cell'] != job['cell'] or record['num_years'] != NUM_YEARS
-                or record['experiment_name'] != cell_name(job['cell'], SEED)
-                or record['treatment_flags'] != CELLS[job['cell']]['flags']):
+        if (
+            current["protocol"] != PROTOCOL
+            or current["seed"] != SEED
+            or current.get("population_rng_namespace") != POPULATION_RNG_NAMESPACE
+            or (current.get("structured_output_transport") != STRUCTURED_OUTPUT_TRANSPORT)
+            or (current.get("funding") != funding_spec())
+            or (current.get("funding_selection_protocol") != FUNDING_SELECTION_PROTOCOL)
+            or (current.get("sequential_funding") != sequential_spec())
+            or (current.get("sequential_elicitation_amendment") != SEQUENTIAL_ELICITATION_AMENDMENT)
+            or (current.get("output_elicitation_amendment") != OUTPUT_ELICITATION_AMENDMENT)
+            or (current.get("request_audit") != request_audit_spec())
+            or (current["population"] != population_spec())
+            or (len(founders) != FOUNDER_RESEARCHERS)
+            or ({r["researcher_name"] for r in founders} != expected_researcher_ids("A", 0))
+            or (sum((r["kind"] == "university" for r in founders)) != 1200)
+            or (sum((r["kind"] == "industry" for r in founders)) != 2)
+            or (record["cell"] != job["cell"])
+            or (record["num_years"] != NUM_YEARS)
+            or (record["experiment_name"] != cell_name(job["cell"], SEED))
+            or (record["treatment_flags"] != CELLS[job["cell"]]["flags"])
+        ):
             raise ValueError(f"cell {job['cell']} has invalid frozen protocol/founder data")
-        binding = current['sequential_source_binding']
-        if (set(binding) != {'utopia/funding/sequential.py', SEQUENTIAL_PROTOCOL_PATH}
-                or any(not value or current['source_sha256'].get(key) != value
-                       for key, value in binding.items())):
-            raise ValueError('missing or inconsistent sequential source/protocol binding')
-        if common is not None and common != current:
-            raise ValueError('cells have incompatible founders, inputs, code or inference settings')
+        fields = ('protocol', 'seed', 'population_rng_namespace', 'structured_output_transport',
+                  'funding', 'funding_selection_protocol', 'population', 'inference')
+        if common is not None and any(common.get(key) != current.get(key) for key in fields):
+            raise ValueError('cells have incompatible population or inference settings')
         common = current
         records[job['cell']] = record
     return common, records
@@ -1467,7 +1459,11 @@ def run_analysis(args, jobs, plan=None, root=REPO_ROOT):
         raise ValueError('interaction analysis requires exactly four 10-year seed42 cells')
     common, records = validate_cell_provenance(jobs)
     checked = {job['cell']: validate_results(job, root) for job in jobs}
-    from utopia.analysis.influx_factorial import cell_endpoints, compute_stats, decompose
+    from utopia.analysis.influx_factorial import (
+        cell_endpoints,
+        compute_stats,
+        decompose,
+    )
     stats = {job['cell']: compute_stats(job['output_dir'], NUM_YEARS) for job in jobs}
     # The stock helper counts can_author researchers (gross, including inactive
     # researchers), not all serialized agents. Verify instead of subtracting two

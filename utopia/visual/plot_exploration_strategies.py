@@ -100,21 +100,28 @@ for the trajectory panels), --out_dir (figure destination),
 --e4a_analysis_dir / --e4a_runs_glob (E4a inputs for panels c/d).
 """
 
-import os
-import numpy as np
-import pandas as pd
-from utopia.visual.common import save_figure
-from utopia.analysis.exploration_cross_seed import STRATEGIES as DIAGNOSTIC_STRATEGIES
 import argparse
 import glob
+import os
 import re
 from pathlib import Path
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 import seaborn as sns
 
-from utopia.visual.common import GRID, INK, MUTED, nature_style, STRATEGY_PALETTE, STRATEGY_NICE
+from utopia.analysis.exploration_cross_seed import STRATEGIES as DIAGNOSTIC_STRATEGIES
+from utopia.visual.common import (
+    GRID,
+    INK,
+    MUTED,
+    STRATEGY_NICE,
+    STRATEGY_PALETTE,
+    nature_style,
+    save_figure,
+)
 
 DEFAULT_ANALYSIS_DIR = 'outputs/docs/explore_calibration_analysis'
 DEFAULT_RUNS_GLOB = ('outputs/docs/'
@@ -600,7 +607,8 @@ def make_figures(researchers, agent_year, ecosystem, paper_age, out_dir):
         if len(cd3):
             fig, ax = plt.subplots(figsize=(6, 4))
             data = [cd3[cd3.strategy == s]['cd'].dropna().values for s in DIAGNOSTIC_STRATEGIES]
-            ax.boxplot(data, labels=DIAGNOSTIC_STRATEGIES)
+            ax.boxplot(data)
+            ax.set_xticks(range(1, len(DIAGNOSTIC_STRATEGIES) + 1), DIAGNOSTIC_STRATEGIES)
             ax.set_ylabel('CD index at age 3')
             save(fig, 'fig9_cd_distribution.png', 'Disruption: age-3 CD index')
 

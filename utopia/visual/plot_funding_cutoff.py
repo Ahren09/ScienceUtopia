@@ -68,22 +68,36 @@ Run:
     preview under outputs/visual/funding_cutoff_final/)
 """
 
-import os
-import numpy as np
-import pandas as pd
-from typing import Dict
-from utopia.visual.common import save_figure
-from utopia.analysis.funding_cutoff import local_linear_fit_line, guard_write_path, km_curve
 import argparse
 import json
+import os
 from pathlib import Path
+from typing import Dict
 
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 import seaborn as sns
 from matplotlib.colors import to_rgba
 
-from utopia.analysis.funding_cutoff import _binned_means, local_linear_fit_band, local_linear_rd
-from utopia.visual.common import GRID, INK, MUTED, VIVID_COOL, VIVID_GOLD, VIVID_WARM, nature_style
+from utopia.analysis.funding_cutoff import (
+    binned_means,
+    guard_write_path,
+    km_curve,
+    local_linear_fit_band,
+    local_linear_fit_line,
+    local_linear_rd,
+)
+from utopia.visual.common import (
+    GRID,
+    INK,
+    MUTED,
+    VIVID_COOL,
+    VIVID_GOLD,
+    VIVID_WARM,
+    nature_style,
+    save_figure,
+)
 
 DEFAULT_APPLICATIONS = ('/workingdir/yjin328/ScienceUtopia/data/funding_cutoff/'
                         'applications.parquet')
@@ -136,7 +150,7 @@ def rd_panel(ax, df: pd.DataFrame, primary: dict):
     fits = {}
     for side, color in ((-1, UNFUNDED), (1, BLUE)):
         sub = df[np.sign(df['x']) == side]
-        xs, ms, ses = _binned_means(sub, Y, max_x=X_MAX)
+        xs, ms, ses = binned_means(sub, Y, max_x=X_MAX)
         ax.errorbar(xs, ms, yerr=1.96 * ses, fmt='o', ms=4.6, color=color,
                     ecolor=to_rgba(color, 0.75), elinewidth=1.2, capsize=2.2,
                     capthick=1.1, markeredgecolor='white',
@@ -337,8 +351,8 @@ if __name__ == '__main__':
     main()
 
 
-def _rd_panel(ax, df, y, h, ylabel):
-    xs, ms, ses = _binned_means(df, y)
+def draw_rd_panel(ax, df, y, h, ylabel):
+    xs, ms, ses = binned_means(df, y)
     ax.errorbar(xs, ms, yerr=1.96 * ses, fmt='o', ms=4, lw=1, capsize=2, color='#345995')
     for side in (-1, 1):
         fit = local_linear_fit_line(df, y, h, side)
@@ -359,13 +373,13 @@ def make_figures(df: pd.DataFrame, results: Dict, h: float, out_visual: str):
 
     # 1. treatment jump
     fig, ax = plt.subplots(figsize=(6, 4))
-    _rd_panel(ax, df, 'funded', h, 'P(funded)')
+    draw_rd_panel(ax, df, 'funded', h, 'P(funded)')
     ax.set_title('Fig 1 — Funding probability vs running variable (sharp design)')
     save_figure(fig, guard_write_path(os.path.join(out_visual, 'fig1_treatment_jump.png')), dpi=160)
 
     # 2. primary
     fig, ax = plt.subplots(figsize=(6, 4))
-    _rd_panel(ax, df, 'cumulative_subsequent_funding_3y', h, 'Cumulative funding, years t+1..t+3')
+    draw_rd_panel(ax, df, 'cumulative_subsequent_funding_3y', h, 'Cumulative funding, years t+1..t+3')
     r = results['primary']
     ax.set_title(f"Fig 2 — Primary: subsequent funding (tau={r['tau']:.2f}, "
                  f"95% CI [{r['ci_lo']:.2f},{r['ci_hi']:.2f}])")
@@ -373,13 +387,13 @@ def make_figures(df: pd.DataFrame, results: Dict, h: float, out_visual: str):
 
     # 3. publications
     fig, ax = plt.subplots(figsize=(6, 4))
-    _rd_panel(ax, df, 'pubs_written_3y', h, 'Papers written, t+1..t+3')
+    draw_rd_panel(ax, df, 'pubs_written_3y', h, 'Papers written, t+1..t+3')
     ax.set_title('Fig 3 — Subsequent publications')
     save_figure(fig, guard_write_path(os.path.join(out_visual, 'fig3_publications.png')), dpi=160)
 
     # 4. reapplication
     fig, ax = plt.subplots(figsize=(6, 4))
-    _rd_panel(ax, df, 'any_application_3y', h, 'P(applies again within 3y)')
+    draw_rd_panel(ax, df, 'any_application_3y', h, 'P(applies again within 3y)')
     ax.set_title('Fig 4 — Reapplication probability')
     save_figure(fig, guard_write_path(os.path.join(out_visual, 'fig4_reapplication.png')), dpi=160)
 

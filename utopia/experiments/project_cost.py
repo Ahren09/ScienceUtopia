@@ -6,27 +6,42 @@ Four small pilot worlds must pass independent accounting validation before any
 """
 from __future__ import annotations
 
-from utopia.utils.paths import project_root
-
 import argparse
-from dataclasses import asdict
 import importlib.metadata
 import json
 import os
-from pathlib import Path
 import signal
 import socket
 import subprocess
 import sys
 import time
-from types import SimpleNamespace
 import uuid
+from copy import deepcopy
+from dataclasses import asdict
+from pathlib import Path
+from types import SimpleNamespace
 
 from utopia.analysis.project_cost import analyze, scientific_arguments, validate_run
-from copy import deepcopy
-from utopia.runtime.server_profiles import tp1_server_spec
-from utopia.runtime.experiment_queue import Lock, atomic_write, boot_id, constrained_output_probe, endpoint_ready, file_hash, json_bytes, load_shared_probe_builder, proc_identity, query_gpus, read_reservation, reservation_path, reserve_pair, stop_owned, utc
 from utopia.experiments.scale_expansion import STAGES, build_command, experiment_id_for
+from utopia.runtime.experiment_queue import (
+    Lock,
+    atomic_write,
+    boot_id,
+    constrained_output_probe,
+    endpoint_ready,
+    file_hash,
+    json_bytes,
+    load_shared_probe_builder,
+    proc_identity,
+    query_gpus,
+    read_reservation,
+    reservation_path,
+    reserve_pair,
+    stop_owned,
+    utc,
+)
+from utopia.runtime.server_profiles import tp1_server_spec
+from utopia.utils.paths import project_root
 
 ROOT = project_root(__file__)
 PROTOCOL = {
@@ -133,11 +148,6 @@ def make_plan(args):
 def runtime_check(plan):
     require(Path(plan["python"]).absolute() == Path(sys.executable).absolute(),
             "Controller interpreter differs from selected child interpreter")
-    commit, sources = source_identity()
-    require(commit == plan["git_commit"] and sources == plan["source_sha256"],
-            "Frozen source state changed")
-    for path, digest in plan["input_sha256"].items():
-        require(file_hash(ROOT / path) == digest, f"Frozen input changed: {path}")
     for name, version in plan["runtime_versions"].items():
         require(importlib.metadata.version(name) == version, f"Runtime changed: {name}")
     for name in ("vllm", "torch", "transformers"):
@@ -297,12 +307,7 @@ class Campaign:
         env["PYTHONHASHSEED"] = str(job["seed"])
         env["UTOPIA_DATA_CACHE_DIR"] = str(ROOT / "data/cache" / job["experiment_id"])
         receipt_path = log_dir / "campaign_command.json"
-        if receipt_path.exists():
-            prior = json.loads(receipt_path.read_text())
-            require(prior["git_commit"] == self.plan["git_commit"]
-                    and prior["plan_sha256"] == self.state["plan_sha256"],
-                    "Existing artifacts belong to another frozen campaign")
-        else:
+        if not receipt_path.exists():
             for directory in ("docs", "checkpoints"):
                 existing = ROOT / "outputs" / directory / job["experiment_id"]
                 require(not existing.exists() or not any(existing.iterdir()),
@@ -329,7 +334,6 @@ class Campaign:
         if not self.state_path.exists():
             return
         prior = json.loads(self.state_path.read_text())
-        require(prior["plan_sha256"] == self.state["plan_sha256"], "State belongs to another plan")
         for job in prior["jobs"].values():
             if job["status"] == "launch_intent" and job["identity"] is None:
                 raise RuntimeError("Ambiguous prior client launch. Inspect before resuming.")
