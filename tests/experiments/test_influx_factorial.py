@@ -9,6 +9,7 @@ Run: python -m pytest tests/experiments/test_influx_factorial.py -v
 """
 
 import os
+import json
 import random
 import sys
 from collections import Counter
@@ -191,16 +192,198 @@ def test_disable_resubmission_early_return():
 
 # ------------------------------------------------------ CLI flags
 
-def test_influx_flag_validation():
-    with pytest.raises(ValueError):
-        parse_arguments(['--experiment_name', 'influx2x2_x_seed42',
-                         '--annual_influx_rate', '0.2'])
-    ok = parse_arguments(['--experiment_name', 'influx2x2_D_influx_resub_seed42',
-                          '--annual_influx_rate', '0.1'])
-    assert ok.annual_influx_rate == 0.1
-    off = parse_arguments(['--experiment_name', 'influx2x2_A_noinflux_noresub_seed42',
-                           '--disable_resubmission'])
-    assert off.annual_influx_rate == 0.0 and off.disable_resubmission
+def test_influx_flag_validation(tmp_path):
+    common = ['--output-dir', str(tmp_path), '--experiment_name', 'influx_compound']
+    for rate in ('-0.1', 'nan', 'inf'):
+        with pytest.raises(ValueError):
+            parse_arguments(common + ['--annual-population-influx', rate])
+    for rate in ('0.1', '0.2', '1.5'):
+        args = parse_arguments(common + ['--annual-population-influx', rate])
+        assert args.annual_population_influx == float(rate)
+        assert '_influx_compound_' in args.experiment_id
+    assert parse_arguments(common).annual_population_influx == 0
+
+
+def test_resume_retains_review_pages_and_allows_api_budget_and_rate_changes(tmp_path):
+    checkpoint = tmp_path / 'checkpoint.json'
+    index = tmp_path / 'index.json'
+    index.write_text(json.dumps({'text_file': 'texts.utf8', 'papers': {}}))
+    checkpoint.write_text(json.dumps({'checkpoint_args': {
+        'model': 'openai.gpt-5.6-luna', 'backend': 'bedrock',
+        'annual_population_influx': 0.2, 'population_influx_mode': 'compound',
+        'review_main_text_pages': 9, 'fulltext_index': str(index),
+        'api_budget_usd': 100, 'input_tokens_per_minute': 1000000,
+        'output_tokens_per_minute': 100000, 'max_model_len': 262144,
+    }}))
+    common = ['--output-dir', str(tmp_path / 'restored'),
+              '--experiment_name', 'influx_resume', '--resume-from', str(checkpoint)]
+    saved = parse_arguments(common)
+    assert saved.review_main_text_pages == 9
+    assert saved.api_budget_usd == 100
+    updated = parse_arguments(common + ['--api_budget_usd', '500',
+                                       '--input_tokens_per_minute', '2000000'])
+    assert updated.api_budget_usd == 500
+    assert updated.input_tokens_per_minute == 2000000
+    assert updated.output_tokens_per_minute == 100000
+    assert updated.annual_population_influx == 0.2
+    with pytest.raises(ValueError, match='scientific setting'):
+        parse_arguments(common + ['--annual-population-influx', '0.1'])
+
+
+@pytest.mark.parametrize('rate,expected', [(0.1, [5500, 6050, 6655, 7321]),
+                                         (0.2, [6000, 7200, 8640, 10368])])
+def test_population_compounds_all_researchers_and_replays_once(rate, expected):
+    eco = MultiAgentEcosystem(agent_configs={})
+    for institution in range(1000):
+        for member in range(5):
+            name = f'institution_{institution:04d}'
+            eco.add_agent(make_university(f'{name}_researcher_{member}', name, funding=100))
+    next(iter(eco.agent_population.values())).is_active = False
+    sim = make_stub_sim(rate, eco)
+    sim.args = SimpleNamespace(annual_population_influx=rate, seed=42, initial_funding=100)
+    before = random.getstate()
+    for year, total in enumerate(expected, 1):
+        new = Simulation.apply_annual_influx(sim, year)
+        assert len(eco.agent_population) == total
+        assert Simulation.apply_annual_influx(sim, year) == []
+        assert len(eco.agent_population) == total
+        assert all(eco.agent_population[a].resources == 100 for a in new)
+        sizes = Counter(a.university_name for a in eco.agent_population.values())
+        assert max(sizes.values()) - min(sizes.values()) <= 1
+    assert random.getstate() == before
+
+
+def test_fulltext_prompt_preserves_body_references_and_appendix(tmp_path, monkeypatch):
+    from utopia.data.rag import FullTextCorpus
+    text = "PAPER START\nMethods\n" + "Complete body. " * 20000 + "\nReferences\nAppendix\nPAPER END"
+    encoded = text.encode()
+    (tmp_path / "texts.utf8").write_bytes(encoded)
+    index = tmp_path / "index.json"
+    index.write_text(json.dumps({"text_file": "texts.utf8", "papers": {
+        "1601.12345": {"offset": 0, "nbytes": len(encoded)}}}))
+    corpus = FullTextCorpus(index, cache_dir=tmp_path / "supplement")
+    sim = SimpleNamespace(fulltext_corpus=corpus)
+    paper = {"id": "1601.12345v2", "title": "Test", "abstract": "Short abstract",
+             "topics": ["cs.LG"]}
+    reviewer = make_university("reviewer", "other")
+    prompt, _ = reviewer.get_review_prompt(Simulation.review_input(sim, paper))
+    assert text in prompt
+    assert "Full paper text:" in prompt
+    assert "Short abstract" not in prompt
+    with pytest.raises(ValueError, match="incomplete full text"):
+        (tmp_path / "texts.utf8").write_bytes(encoded[:-10])
+        Simulation.review_input(sim, paper)
+    def missing(paper_id):
+        raise ValueError("Full text unavailable")
+    monkeypatch.setattr(corpus, "fetch_paper", missing)
+    with pytest.raises(ValueError, match="unavailable"):
+        Simulation.review_input(sim, dict(paper, id="1601.00001"))
+
+@pytest.mark.parametrize("appendix_page", [None, 3])
+def test_review_uses_first_nine_pdf_pages_and_stops_at_appendix(
+        tmp_path, monkeypatch, appendix_page):
+    import pymupdf
+    import shutil
+    from utopia.data.rag import FullTextCorpus
+    index = tmp_path / "index.json"
+    index.write_text(json.dumps({"text_file": "texts.utf8", "papers": {}}))
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    with pymupdf.open() as pdf:
+        for number in range(1, 12):
+            page = pdf.new_page()
+            page.insert_text((50, 60), f"PAGE_{number}_MAIN", fontsize=11)
+            page.insert_text((50, 85), "See Appendix A for an extra example.", fontsize=11)
+            if number == 2:
+                page.insert_text((50, 115), "Contents", fontsize=14)
+                page.insert_text((50, 140), "Appendix A .......... 19", fontsize=11)
+            if number == appendix_page:
+                page.insert_text((50, 160), "Appendix A: Proofs", fontsize=14, fontname="hebo")
+                page.insert_text((50, 190), "APPENDIX_SECRET", fontsize=11)
+        pdf.save(cache / "1601.12345.pdf")
+    corpus = FullTextCorpus(index, cache_dir=cache, main_text_pages=9)
+    text = corpus.text("1601.12345v2")
+    assert "PAGE_1_MAIN" in text
+    assert "Appendix A .......... 19" in text
+    assert "PAGE_10_MAIN" not in text
+    assert "APPENDIX_SECRET" not in text
+    assert ("PAGE_9_MAIN" in text) == (appendix_page is None)
+    if appendix_page:
+        assert "PAGE_3_MAIN" in text
+        assert "PAGE_4_MAIN" not in text
+    entry = corpus.supplement["review_texts"]["1601.12345"]["first_9_pages_no_appendix"]
+    assert entry["pages"] == (appendix_page or 9)
+    assert entry["appendix_start_page"] == appendix_page
+    assert entry["source_pages"] == 11
+    assert entry["exclude_appendices"]
+    relocated = tmp_path / "relocated"
+    shutil.copytree(cache, relocated)
+    resumed = FullTextCorpus(index, cache_dir=relocated, main_text_pages=9)
+    monkeypatch.setattr(resumed, "download_source",
+                        lambda pid: pytest.fail("Saved review text should not download again"))
+    assert resumed.text("1601.12345") == text
+
+
+def test_review_excludes_lettered_appendix_after_references_and_paginates_html(tmp_path):
+    import pymupdf
+    from utopia.data.rag import FullTextCorpus
+    index = tmp_path / "index.json"
+    index.write_text(json.dumps({"text_file": "texts.utf8", "papers": {}}))
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    with pymupdf.open() as pdf:
+        page = pdf.new_page()
+        page.insert_text((50, 60), "Main argument", fontsize=11)
+        page.insert_text((50, 100), "References", fontsize=14, fontname="hebo")
+        page.insert_text((50, 125), "A. Smith, Main reference, 2020.", fontsize=11)
+        page.insert_text((50, 160), "A. Additional Experiments", fontsize=14, fontname="hebo")
+        page.insert_text((50, 190), "APPENDIX_SECRET", fontsize=11)
+        pdf.save(cache / "1601.12345.pdf")
+    corpus = FullTextCorpus(index, cache_dir=cache, main_text_pages=9)
+    text = corpus.text("1601.12345")
+    assert "Main reference" in text
+    assert "Additional Experiments" not in text
+    assert "APPENDIX_SECRET" not in text
+    (cache / "1601.00001.html").write_text(
+        "<h1>Original HTML Paper</h1><p>MAIN ARGUMENT</p>"
+        "<h2>Appendix A</h2><p>APPENDIX_SECRET</p>")
+    html = corpus.text("1601.00001")
+    assert "MAIN ARGUMENT" in html
+    assert "APPENDIX_SECRET" not in html
+    assert corpus.supplement["review_texts"]["1601.00001"][
+        "first_9_pages_no_appendix"]["page_source"] == "html_rendered_a4"
+
+
+def test_review_handles_long_pdf_spacing_without_losing_main_text(tmp_path):
+    from utopia.data.rag import FullTextCorpus
+    index = tmp_path / "index.json"
+    index.write_text(json.dumps({"text_file": "texts.utf8", "papers": {}}))
+    corpus = FullTextCorpus(index, cache_dir=tmp_path / "cache", main_text_pages=9)
+
+    class SparsePage:
+        def get_text(self, kind=None, **kwargs):
+            if kind == "dict":
+                return {"blocks": []}
+            return ("Main argument" + " " * 20000 + "continues here\n"
+                    "Appendix A" + " " * 20000 + "12\n"
+                    "Still main text\nAppendix A\nAPPENDIX_SECRET")
+
+    text, pages, appendix_page = corpus.extract_main_pages([SparsePage()])
+    assert "Main argument continues here" in text
+    assert "Still main text" in text
+    assert "APPENDIX_SECRET" not in text
+    assert pages == appendix_page == 1
+
+
+def test_conference_checkpoint_retains_submissions_reviews_and_decisions():
+    from utopia.agents.conference import Conference, ConferenceSystem
+    conference = Conference(conference_id="C", name="Conference", topics=["cs.LG"])
+    conference.submitted_papers = [{"id": "p", "author_id": "a"}]
+    conference.reviews["p"] = [{"reviewer_id": "r", "overall_score": 4}]
+    system = ConferenceSystem([conference])
+    system.authors_to_accepted_papers["a"] = [{"id": "old"}]
+    restored = ConferenceSystem.from_dict(json.loads(json.dumps(system.to_dict())))
+    assert restored.to_dict() == system.to_dict()
 
 
 def test_experiment_name_whitelist_accepts_influx():

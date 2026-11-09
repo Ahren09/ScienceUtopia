@@ -164,9 +164,9 @@ SMOKE_YEARS = 3
 CELLS = {
     'A': {'tag': 'noinflux_noresub', 'flags': ['--disable_resubmission']},
     'B': {'tag': 'influx_noresub',
-          'flags': ['--annual_influx_rate', '0.1', '--disable_resubmission']},
+          'flags': ['--annual-population-influx', '0.1', '--disable_resubmission']},
     'C': {'tag': 'noinflux_resub', 'flags': []},
-    'D': {'tag': 'influx_resub', 'flags': ['--annual_influx_rate', '0.1']},
+    'D': {'tag': 'influx_resub', 'flags': ['--annual-population-influx', '0.1']},
 }
 SHARED_CACHES = ('outputs/cache_scievo.pkl',
                  'outputs/thenlper_gte-small/cache_embeddings.pt')
@@ -1180,8 +1180,10 @@ def run_single_cell(args, job, git, root=REPO_ROOT):
                 signal.signal(signal.SIGTERM, stop_worker)
                 signal.signal(signal.SIGALRM, stop_worker)
                 signal.setitimer(signal.ITIMER_REAL, args.timeout_hours * 3600)
-                simulator.Simulation.initialize_agents = (
-                    lambda self: initialize_population(self, simulator, founders))
+                def initialize_legacy_population(self):
+                    self.args.population_influx_mode = 'legacy_fixed'
+                    return initialize_population(self, simulator, founders)
+                simulator.Simulation.initialize_agents = initialize_legacy_population
                 simulator.build_influx_cohort = (
                     lambda year, seed: build_fixed_cohort(simulator, year, seed))
                 setup_globals['check_cwd'] = check_worktree_cwd

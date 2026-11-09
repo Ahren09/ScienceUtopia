@@ -1,5 +1,6 @@
 import argparse
 import os
+import math
 
 
 def parse_arguments(argv=None):
@@ -60,6 +61,14 @@ def parse_arguments(argv=None):
                         help='Model backend; auto preserves model-name/vLLM routing.')
     parser.add_argument('--fulltext_index', default=None,
                         help='Existing offset-index JSON for full-paper peer review.')
+    parser.add_argument('--review-main-text-pages', type=int, default=0,
+                        help='Review at most this many initial PDF pages, stopping before '
+                             'appendices; 0 keeps the complete extracted text. HTML-only '
+                             'sources use a reproducible A4 print layout.')
+    parser.add_argument('--resume-from', default=None,
+                        help='Local checkpoint or S3 snapshot prefix to continue.')
+    parser.add_argument('--checkpoint-s3-prefix', default=None,
+                        help='S3 prefix for portable stage checkpoints and saved replies.')
     parser.add_argument('--input_tokens_per_minute', type=int, default=0,
                         help='Per-client input-token rate; 0 disables pacing.')
     parser.add_argument('--output_tokens_per_minute', type=int, default=0,
@@ -288,15 +297,11 @@ def parse_arguments(argv=None):
              'Off = neutral condition.'
     )
     parser.add_argument(
-        '--annual_influx_rate',
+        '--annual-population-influx',
         type=float,
         default=0.0,
-        help='Researcher-influx rate for the influx2x2 experiment. 0.0 (default) = OFF, '
-             'byte-identical code path to existing runs. Only 0.1 is implemented: the '
-             'staggered exact schedule where half of the 60 default-mode institutions '
-             'each add 1 junior researcher per year, halves alternating years '
-             '(+30/year = 10%% of the initial 300, linear growth). Requires '
-             'population_mode=default, non-debug.'
+        help='Annual entrants as a fraction of all existing researchers, including '
+             'inactive researchers (0 by default). Rounded half up; compounds yearly.'
     )
     parser.add_argument(
         '--disable_resubmission',
@@ -418,6 +423,12 @@ def parse_arguments(argv=None):
     )
 
     args = parser.parse_args(argv)
+    if args.resume_from:
+        restore_resume_arguments(args, parser, argv)
+    if args.review_main_text_pages < 0:
+        raise ValueError('--review-main-text-pages must be nonnegative')
+    if args.review_main_text_pages and not args.fulltext_index:
+        raise ValueError('--review-main-text-pages requires --fulltext_index')
 
     # Set default experiment name based on model name
     if args.experiment_name == 'default':
@@ -426,7 +437,9 @@ def parse_arguments(argv=None):
 
     # Parse per-year acceptance-rate schedule into a list of fractions
     if args.acceptance_rate_schedule is not None:
-        rates = [float(r) for r in args.acceptance_rate_schedule.split(',')]
+        values = (args.acceptance_rate_schedule.split(',')
+                  if isinstance(args.acceptance_rate_schedule, str) else args.acceptance_rate_schedule)
+        rates = [float(r) for r in values]
         rates = [r / 100 if r > 1 else r for r in rates]
         if len(rates) != args.num_years:
             raise ValueError(
@@ -436,9 +449,13 @@ def parse_arguments(argv=None):
             raise ValueError(f'Acceptance rates must be in (0, 1] after parsing, got {rates}')
         args.acceptance_rate_schedule = rates
 
-    if args.annual_influx_rate not in (0.0, 0.1):
-        raise ValueError('--annual_influx_rate: only 0.0 (off) and 0.1 (staggered '
-                         '+30/year schedule) are implemented')
+    if not math.isfinite(args.annual_population_influx) or args.annual_population_influx < 0:
+        raise ValueError('--annual-population-influx must be finite and nonnegative')
+    if args.experiment_name.startswith('influx2x2_'):
+        args.population_influx_mode = 'legacy_fixed'
+    influx_mode = 'legacy_fixed' if getattr(args, 'population_influx_mode', None) == 'legacy_fixed' else 'compound'
+    influx_tag = (f'_influx_{influx_mode}_{args.annual_population_influx:g}'
+                  if args.annual_population_influx and influx_mode == 'compound' else '')
 
     if args.papers_per_project < 1:
         raise ValueError('--papers_per_project must be >= 1')
@@ -521,7 +538,7 @@ def parse_arguments(argv=None):
                 f"explore_{args.experiment_stage}_{model_tag}_{mechanism}_"
                 f"i{args.num_institutions}_n{n_researchers}_y{args.num_years}_seed{args.seed}{mix_tag}"
             )
-        args.experiment_id += cost_tag
+        args.experiment_id += cost_tag + influx_tag
         if args.review_prompt_variant != 'original':
             args.experiment_id += '_prompt_' + args.review_prompt_variant
         if args.venue_regime != 'baseline':
@@ -542,9 +559,11 @@ def parse_arguments(argv=None):
         for d in (args.log_dir, args.checkpoint_dir, args.visual_dir, args.docs_dir,
                   args.data_cache_dir):
             os.makedirs(d, exist_ok=True)
+        finish_resume_arguments(args)
         return args
 
     # Default retains the historical layout. Opt-in policies get disjoint paths.
+    cost_tag += influx_tag
     if args.debug:
         args.output_dir = os.path.join(args.output_dir, 'debug', args.experiment_name + cost_tag)
 
@@ -568,4 +587,90 @@ def parse_arguments(argv=None):
     os.makedirs(args.visual_dir, exist_ok=True)
 
 
+    finish_resume_arguments(args)
     return args
+
+
+def restore_resume_arguments(args, parser, argv):
+    """Restore scientific settings before canonical paths or a model are created."""
+    import sys
+    from pathlib import Path
+    from utopia.utils.data_utils import read_json
+    from utopia.runtime.provenance import latest_native_checkpoint, restore_native_snapshot
+    tokens = list(sys.argv[1:] if argv is None else argv)
+    explicit = {action.dest for action in parser._actions
+                if any(token.split('=', 1)[0] in action.option_strings for token in tokens)}
+    source = args.resume_from
+    if source.startswith('s3://'):
+        source = restore_native_snapshot(source, Path(args.output_dir) / 'resume_artifacts')
+        args.resume_artifacts = str(Path(args.output_dir) / 'resume_artifacts')
+    elif Path(source).is_dir():
+        source = latest_native_checkpoint(source)
+    if not source:
+        raise ValueError('No complete checkpoint to resume')
+    source = str(Path(source).resolve())
+    data = read_json(source)
+    saved = data.get('checkpoint_args', data.get('cost_experiment_binding', {}).get('args', {}))
+    if not saved:
+        manifest = Path(source).parent / 'run_manifest.json'
+        if manifest.exists():
+            saved = read_json(manifest).get('args', {})
+    if not saved:
+        raise ValueError('Legacy checkpoint requires its original run_manifest.json with arguments')
+    runtime = {'output_dir', 'log_dir', 'docs_dir', 'visual_dir', 'checkpoint_dir',
+               'data_cache_dir', 'fulltext_index', 'resume_from', 'resume_artifacts',
+               'vllm_url', 'batch_size', 'tensor_parallel_size', 'gpu_memory_utilization',
+               'max_model_len', 'rag_device', 'checkpoint_s3_prefix', 'stop_at_utc',
+               'api_budget_usd', 'input_tokens_per_minute', 'output_tokens_per_minute',
+               'always_rerun', 'verbose', 'wandb', 'wandb_mode', 'resume_reply_source',
+               'save_model_replies'}
+    for name, value in saved.items():
+        if name not in runtime:
+            if name in explicit and getattr(args, name, value) != value:
+                raise ValueError(f'Resume would change scientific setting {name}')
+            setattr(args, name, value)
+    if 'annual_population_influx' not in saved:
+        args.annual_population_influx = saved.get('annual_influx_rate', 0.0)
+        args.population_influx_mode = 'legacy_fixed'
+    args.resume_from = source
+    args.always_rerun = False
+    for name in ('batch_size', 'tensor_parallel_size', 'gpu_memory_utilization',
+                 'max_model_len', 'rag_device', 'stop_at_utc', 'api_budget_usd',
+                 'input_tokens_per_minute', 'output_tokens_per_minute'):
+        if name not in explicit and name in saved:
+            setattr(args, name, saved[name])
+    if 'checkpoint_s3_prefix' not in explicit:
+        args.checkpoint_s3_prefix = saved.get('checkpoint_s3_prefix')
+    args.save_model_replies = True
+    if not args.fulltext_index and saved.get('fulltext_index') and not getattr(args, 'resume_artifacts', None):
+        args.fulltext_index = saved['fulltext_index']
+    if data.get('simulation_config'):
+        from utopia.config import SIMULATION_CONFIG
+        SIMULATION_CONFIG.clear()
+        SIMULATION_CONFIG.update(data['simulation_config'])
+    args.resume_reply_source = (str(Path(args.resume_artifacts) / 'model_replies.jsonl')
+                               if getattr(args, 'resume_artifacts', None)
+                               else str(Path(saved.get('log_dir', Path(source).parent)) / 'model_replies.jsonl'))
+
+
+def finish_resume_arguments(args):
+    import shutil
+    from pathlib import Path
+    from utopia.utils.data_utils import atomic_open
+    artifacts = getattr(args, 'resume_artifacts', None)
+    if artifacts:
+        root = Path(artifacts)
+        if (root / 'fulltext/index.json').exists() and not args.fulltext_index:
+            args.fulltext_index = str(root / 'fulltext/index.json')
+        args.data_cache_dir = str(root / 'cache')
+        os.environ['UTOPIA_DATA_CACHE_DIR'] = args.data_cache_dir
+    if getattr(args, 'resume_from', None):
+        source = Path(args.resume_reply_source)
+        target = Path(args.log_dir) / 'model_replies.jsonl'
+        if source.is_file() and source.resolve() != target.resolve():
+            if target.exists() and target.stat().st_size:
+                raise ValueError('Destination already has replies; resume that existing run directly')
+            with source.open('rb') as saved, atomic_open(target, 'wb') as stream:
+                shutil.copyfileobj(saved, stream)
+        if args.fulltext_index and not Path(args.fulltext_index).is_file():
+            raise ValueError('Restore the full-text index or provide --fulltext_index on this host')

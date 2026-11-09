@@ -39,7 +39,7 @@ from utopia.agents.conference import ALL_CS_TOPICS, ARXIV_CATEGORY_NAMES
 class FullTextCorpus:
     """Read complete UTF-8 papers from the existing papers/offset/nbytes index."""
 
-    def __init__(self, index_path, cache_dir=None):
+    def __init__(self, index_path, cache_dir=None, main_text_pages=0):
         import json
         from pathlib import Path
         index_path = Path(index_path)
@@ -47,6 +47,7 @@ class FullTextCorpus:
         self.papers = index['papers']
         self.text_path = index_path.parent / index['text_file']
         self.cache_dir = Path(cache_dir) if cache_dir else None
+        self.main_text_pages = main_text_pages
         self.supplement = {'text_file': 'texts.utf8', 'papers': {}}
         if self.cache_dir:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -56,6 +57,8 @@ class FullTextCorpus:
 
     def text(self, paper_id):
         paper_id = re.sub(r'v\d+$', '', str(paper_id).split('/abs/')[-1])
+        if self.main_text_pages:
+            return self.review_text(paper_id)
         if paper_id in self.papers or self.cache_dir is None:
             entry, text_path = self.papers[paper_id], self.text_path
         else:
@@ -70,29 +73,167 @@ class FullTextCorpus:
             raise ValueError(f'Missing or incomplete full text: {paper_id}')
         return content.decode('utf-8')
 
+    def download_source(self, paper_id):
+        """Cache an original source; each paper owns its own atomic file."""
+        import requests
+        from utopia.utils.data_utils import atomic_open
+        if self.cache_dir is None:
+            raise ValueError('Page-limited reviews require a full-text cache directory')
+        if not re.fullmatch(r'\d{4}\.\d{4,5}', paper_id):
+            raise ValueError(f'Invalid arXiv paper ID: {paper_id}')
+        for kind in ('pdf', 'html'):
+            path = self.cache_dir / f'{paper_id}.{kind}'
+            if path.exists():
+                return path, f'https://arxiv.org/{kind}/{paper_id}'
+        url = f'https://arxiv.org/pdf/{paper_id}'
+        response = requests.get(url, timeout=60)
+        if response.status_code == 404:
+            url += 'v1'
+            response = requests.get(url, timeout=60)
+        kind = 'pdf'
+        if response.status_code == 404:
+            url = f'https://arxiv.org/html/{paper_id}v1'
+            response = requests.get(url, timeout=60)
+            kind = 'html'
+        response.raise_for_status()
+        path = self.cache_dir / f'{paper_id}.{kind}'
+        with atomic_open(path, 'wb') as stream:
+            stream.write(response.content)
+        return path, url
+
+    def prepare_review_texts(self, paper_ids):
+        """Download independently; publish the shared text index in input order."""
+        if not self.main_text_pages:
+            return
+        from concurrent.futures import ThreadPoolExecutor
+        ids = sorted({re.sub(r'v\d+$', '', str(pid).split('/abs/')[-1]) for pid in paper_ids})
+        policy = f'first_{self.main_text_pages}_pages_no_appendix'
+        pending = [pid for pid in ids
+                   if policy not in self.supplement.get('review_texts', {}).get(pid, {})]
+        executor = ThreadPoolExecutor(max_workers=8)
+        try:
+            sources = executor.map(self.download_source, pending)
+            for pid, source in tqdm(zip(pending, sources), total=len(pending),
+                                    desc='Preparing review pages'):
+                self.review_text(pid, source=source)
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+    def extract_main_pages(self, pdf):
+        """Take physical pages from the start, stopping at an appendix heading."""
+        parts = []
+        seen_references = False
+        appendix_page = None
+        for page_number in range(min(self.main_text_pages, len(pdf))):
+            page = pdf[page_number]
+            lines = page.get_text(sort=True).splitlines()
+            contents_page = any(re.fullmatch(r'(?:table of )?contents', line.strip(), re.I)
+                                for line in lines)
+            styles = {}
+            sizes = Counter()
+            for block in page.get_text('dict')['blocks']:
+                for line in block.get('lines', []):
+                    spans = line.get('spans', [])
+                    label = ''.join(span['text'] for span in spans).strip()
+                    if spans:
+                        styles[label] = (max(span['size'] for span in spans),
+                                         any(span['flags'] & 16 for span in spans))
+                    for span in spans:
+                        sizes[round(span['size'], 1)] += len(span['text'])
+            body_size = sizes.most_common(1)[0][0] if sizes else 0
+            kept = []
+            for line in lines:
+                label = line.strip()
+                size, bold = styles.get(label, (body_size, False))
+                heading_style = bold or size > body_size + 0.5
+                # A fixed whitespace width avoids quadratic backtracking on
+                # very sparse PDF lines produced by layout-preserving extraction.
+                is_contents_entry = bool(re.search(r'\.{3,}|\s{3}\d+$', line.rstrip()))
+                explicit_appendix = bool(re.match(
+                    r'^(?:(?:[A-Z]|\d+(?:\.\d+)*)[.)]?\s+)?'
+                    r'(?:appendix|appendices|supplementary material|supplemental material)'
+                    r'\b', label, re.I))
+                short_heading = (len(label) <= 100 and not label.endswith(('.', ',', ';'))
+                                 and not re.search(
+                                     r'\b(?:provides?|contains?|shows?|describes?|discusses?|'
+                                     r'presents?|includes?|is|are|can)\b', label, re.I))
+                lettered_appendix = (seen_references and heading_style
+                                     and bool(re.match(r'^[A-Z](?:[.]\s+|\s+)\S', label)))
+                if (not contents_page and not is_contents_entry
+                        and ((explicit_appendix and (heading_style or short_heading))
+                             or lettered_appendix)):
+                    appendix_page = page_number + 1
+                    break
+                if not contents_page and re.fullmatch(
+                        r'(?:\d+[.]?\s+)?(?:references|bibliography)', label, re.I):
+                    seen_references = True
+                kept.append(re.sub(r'[^\S\n]+', ' ', line).rstrip())
+            if '\n'.join(kept).strip():
+                parts.append('\n'.join(kept))
+            if appendix_page is not None:
+                break
+        return '\n\n'.join(parts), len(parts), appendix_page
+
+    def review_text(self, paper_id, source=None):
+        import io
+        import pymupdf
+        from utopia.utils.data_utils import atomic_open, write_json_atomic
+        policy = f'first_{self.main_text_pages}_pages_no_appendix'
+        entries = self.supplement.setdefault('review_texts', {}).setdefault(paper_id, {})
+        if policy not in entries:
+            path, url = source or self.download_source(paper_id)
+            page_source = 'original_pdf'
+            if path.suffix == '.html':
+                # HTML-only arXiv proceedings have no original PDF pagination.
+                # Preserve the source and use a reproducible A4 print layout.
+                page_source = 'html_rendered_a4'
+                rendered = path.with_suffix('.rendered.pdf')
+                if not rendered.exists():
+                    buffer = io.BytesIO()
+                    writer = pymupdf.DocumentWriter(buffer)
+                    story = pymupdf.Story(html=path.read_text())
+                    page = pymupdf.paper_rect('a4')
+                    story.write(writer, lambda number, filled: (page, page + (36, 36, -36, -36), None))
+                    writer.close()
+                    with atomic_open(rendered, 'wb') as stream:
+                        stream.write(buffer.getvalue())
+                path = rendered
+            with pymupdf.open(path) as pdf:
+                text, pages, appendix = self.extract_main_pages(pdf)
+                source_pages = len(pdf)
+            content = text.encode('utf-8')
+            if not content.strip():
+                raise ValueError(f'No main text in first {self.main_text_pages} pages: {paper_id}')
+            with (self.cache_dir / self.supplement['text_file']).open('ab') as stream:
+                offset = stream.tell()
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            entries[policy] = dict(offset=offset, nbytes=len(content), pages=pages,
+                                   source_pages=source_pages, appendix_start_page=appendix,
+                                   max_pages=self.main_text_pages, exclude_appendices=True,
+                                   page_source=page_source, source_url=url)
+            write_json_atomic(self.cache_dir / 'index.json', self.supplement, ensure_ascii=True)
+        entry = entries[policy]
+        with (self.cache_dir / self.supplement['text_file']).open('rb') as stream:
+            stream.seek(entry['offset'])
+            content = stream.read(entry['nbytes'])
+        if len(content) != entry['nbytes'] or not content.strip():
+            raise ValueError(f'Missing or incomplete review text: {paper_id}')
+        # Older prepared entries can contain millions of layout-only spaces.
+        # Normalize spacing without dropping words, lines or selected pages.
+        return re.sub(r'[^\S\n]+', ' ', content.decode('utf-8'))
+
     def fetch_paper(self, paper_id):
         """Fill missing SciEvo bodies from arXiv; preserve PDF and offset-indexed text."""
         import json
 
         import pymupdf
-        import requests
-        if not re.fullmatch(r'\d{4}\.\d{4,5}', paper_id):
-            raise ValueError(f'Invalid arXiv paper ID: {paper_id}')
-        url = f'https://arxiv.org/pdf/{paper_id}'
-        response = requests.get(url, timeout=60)
-        if response.status_code == 404:
-            # Withdrawn latest versions can retain the original full paper.
-            url += 'v1'
-            response = requests.get(url, timeout=60)
-        source_format = 'pdf'
-        if response.status_code == 404:
-            url = f'https://arxiv.org/html/{paper_id}v1'
-            response = requests.get(url, timeout=60)
-            source_format = 'html'
-        response.raise_for_status()
+        path, url = self.download_source(paper_id)
+        source_format = path.suffix[1:]
         pages = None
         if source_format == 'pdf':
-            with pymupdf.open(stream=response.content, filetype='pdf') as pdf:
+            with pymupdf.open(path) as pdf:
                 content = '\n'.join(page.get_text(sort=True) for page in pdf).encode('utf-8')
                 pages = len(pdf)
         else:
@@ -116,20 +257,20 @@ class FullTextCorpus:
                         self.parts.append(data.strip())
 
             parser = PaperText()
-            parser.feed(response.text)
+            parser.feed(path.read_text())
             content = '\n'.join(parser.parts).encode('utf-8')
         if not content.strip():
             raise ValueError(f'No extracted full text: {paper_id}')
-        (self.cache_dir / f'{paper_id}.{source_format}').write_bytes(response.content)
         with (self.cache_dir / self.supplement['text_file']).open('ab') as stream:
             offset = stream.tell()
             stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
         self.supplement['papers'][paper_id] = {
             'offset': offset, 'nbytes': len(content), 'source_url': url, 'pages': pages, 'format': source_format,
         }
-        temporary = self.cache_dir / 'index.json.tmp'
-        temporary.write_text(json.dumps(self.supplement, ensure_ascii=True))
-        temporary.replace(self.cache_dir / 'index.json')
+        from utopia.utils.data_utils import write_json_atomic
+        write_json_atomic(self.cache_dir / 'index.json', self.supplement, ensure_ascii=True)
         print(f'[Full text] Saved {paper_id}: {source_format}, {pages} pages, {len(content)} bytes', flush=True)
 
 
@@ -263,7 +404,8 @@ class RAG:
 
         self.id2docs = {}
 
-        cache_path = "outputs/cache_scievo.pkl"
+        cache_path = os.path.join(os.environ.get('UTOPIA_DATA_CACHE_DIR', 'outputs'), 'cache_scievo.pkl')
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
         cache_valid = False
         if os.path.exists(cache_path):
             print(f"[Cache HIT] Loading documents from {cache_path}")
@@ -442,8 +584,9 @@ class RAG:
 
         # --- Single-file embedding caching ---
         model_tag = self.config.embedding_model.replace("/", "_")
-        os.makedirs(f"outputs/{model_tag}", exist_ok=True)
-        cache_file = f"outputs/{model_tag}/cache_embeddings.pt"
+        cache_directory = os.path.join(os.environ.get('UTOPIA_DATA_CACHE_DIR', 'outputs'), model_tag)
+        os.makedirs(cache_directory, exist_ok=True)
+        cache_file = os.path.join(cache_directory, 'cache_embeddings.pt')
 
         if os.path.exists(cache_file):
             print(f"[Cache HIT] Loading embeddings from {cache_file}")

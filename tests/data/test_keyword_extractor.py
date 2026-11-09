@@ -9,8 +9,8 @@ def test_keyword_protocols_match_pre_consolidation_requests_and_cache(tmp_path):
     golden = json.loads(
         (project_root() / "tests/support/fixtures/ownership_golden.json").read_text()
     )
-    assert (
-        keyword_contract(KeywordExtractor, CorpusKeywordExtractor, tmp_path)
-        == golden["keywords"]
-    )
+    actual = keyword_contract(KeywordExtractor, CorpusKeywordExtractor, tmp_path)
+    assert [row.pop("item_ids") for row in actual["batch_requests"]] == [
+        ["ok", "retry", "fail"], ["retry", "fail"], ["fail"]]
+    assert actual == golden["keywords"]
     assert not hasattr(KeywordExtractor, "extract_keywords_llm")

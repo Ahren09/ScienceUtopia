@@ -65,6 +65,7 @@ from utopia.models.models import (
     GPT,
     BaseLLM,
     BedrockModel,
+    ExperimentTimeLimit,
     Gemini,
     VLLMModel,
     VLLMServerModel,
@@ -270,6 +271,44 @@ def build_influx_cohort(year: int, seed: int) -> List[Dict]:
     return cohort
 
 
+def build_population_influx(population, year, seed, rate, initial_funding=None, start_offset=0):
+    """Freeze an annual cohort from all researchers, with deterministic per-ID expertise."""
+    from decimal import Decimal, ROUND_HALF_UP
+    members = defaultdict(list)
+    for agent in population.values():
+        if isinstance(agent, (UniversityResearcher, IndustryResearcher)):
+            institution = getattr(agent, 'university_name', None) or agent.company_name
+            members[institution].append(agent)
+    size = sum(map(len, members.values()))
+    count = int((Decimal(size) * Decimal(str(rate))).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
+    institutions = sorted(members)
+    cohort = []
+    if not institutions:
+        return size, cohort
+    next_index = {
+        name: max(int(a.id.rsplit('_', 1)[-1]) for a in agents) + 1
+        for name, agents in members.items()
+    }
+    for number in range(count):
+        institution = institutions[(number + start_offset) % len(institutions)]
+        founder = members[institution][0]
+        kind = 'university' if isinstance(founder, UniversityResearcher) else 'industry'
+        index = next_index[institution]
+        next_index[institution] += 1
+        name = f'{institution}_researcher_{index}'
+        rng = random.Random(derive_seed(seed, 'population_influx', name))
+        if initial_funding is not None:
+            funding = initial_funding
+        elif kind == 'university':
+            funding = RICH_UNIVERSITY_FUNDING if institution in RICH_UNIVERSITIES else NORMAL_UNIVERSITY_FUNDING
+        else:
+            funding = RICH_COMPANY_FUNDING if institution in RICH_COMPANIES else NORMAL_COMPANY_FUNDING
+        cohort.append(dict(institution=institution, researcher_name=name, kind=kind,
+                           funding_level=funding, expertise_indices=rng.sample(
+                               range(len(AVAILABLE_DIRECTIONS)), min(3, len(AVAILABLE_DIRECTIONS)))))
+    return size, cohort
+
+
 def charge_application_costs(university_applications: List[Dict], app_cost: int,
                              year: int) -> List[Dict]:
     """Matthew-RD cost intervention: charge the frozen GRANT-APPLICATION cost
@@ -358,7 +397,8 @@ class Simulation:
         self.llm: BaseLLM = llm
         fulltext_index = getattr(args, 'fulltext_index', None)
         self.fulltext_corpus = (FullTextCorpus(
-            fulltext_index, cache_dir=os.path.join(args.data_cache_dir, 'fulltext'))
+            fulltext_index, cache_dir=os.path.join(args.data_cache_dir, 'fulltext'),
+            main_text_pages=getattr(args, 'review_main_text_pages', 0))
             if fulltext_index else None)
         self.num_years = num_years
         self.output_dir = output_dir
@@ -457,6 +497,16 @@ class Simulation:
         self.collaboration_tracker = None
         self.network_metrics = None
         self._collaboration_pairs = {}  # {year: {lead_id: co_author_id}}
+        self.influx_history = {}
+        self.phase_context = {}
+        self.resume_cursor = None
+        self.latest_checkpoint_path = None
+        self.last_sync_time = time.monotonic()
+        self.replies_since_sync = 0
+        self.s3_inventory = {}
+        self.reply_segments = []
+        self.reply_offset = 0
+        self.llm.progress_callback = self.sync_checkpoint_replies
 
     @property
     def is_exploration_experiment(self) -> bool:
@@ -1313,7 +1363,7 @@ class Simulation:
                 batch_results = self.llm.generate_batch(
                     batch_prompts, response_format=collab_response_format,
                     desc=f"{len(batch_prompts)} collaboration decisions",
-                    seed_ctx=('phase15_collab', year),
+                    seed_ctx=('phase15_collab', year), item_ids=[m['agent'].id for m in batch_metadata],
                 )
                 for i, (result, _) in enumerate(batch_results):
                     meta = batch_metadata[i]
@@ -1730,27 +1780,33 @@ class Simulation:
                         f"Spearman r={all_metrics['spearman_r']:.3f}")
 
     def apply_annual_influx(self, year: int) -> List[str]:
-        """Influx2x2: inject this year's junior cohort at the top of setup_year.
-
-        OFF (annual_influx_rate <= 0, the default): returns [] immediately —
-        no RNG use, no side effects, byte-identical to the pre-influx code path.
-        ON: constructs entrants via the stock researcher constructors
-        (reputation defaults 5/6, zero publications via empty papers_by_author,
-        no collaboration edges), wires conflict-of-interest bidirectionally with
-        ALL current same-institution members (active or culled — culled agents
-        still review), and adds them to the ecosystem. Idempotent under
-        checkpoint resume: an id already in agent_population is skipped.
-        """
-        rate = getattr(self.args, 'annual_influx_rate', 0.0) or 0.0
+        """Add the frozen annual cohort once, including inactive peers in COI rules."""
+        legacy = getattr(self.args, 'population_influx_mode', None) == 'legacy_fixed' or (
+            not hasattr(self.args, 'annual_population_influx') and hasattr(self.args, 'annual_influx_rate'))
+        rate = getattr(self.args, 'annual_population_influx',
+                       getattr(self.args, 'annual_influx_rate', 0.0)) or 0.0
         if rate <= 0:
             return []
-        assert abs(rate - 0.1) < 1e-12, \
-            "only the staggered 10%/yr influx schedule is implemented"
-        assert getattr(self.args, 'population_mode', 'default') == 'default' and not self.debug, \
-            "annual influx is defined only for the non-debug default population"
-
+        if not hasattr(self, 'influx_history'):
+            self.influx_history = {}
+        key = str(year)
+        if key not in self.influx_history:
+            if legacy:
+                cohort = build_influx_cohort(year, getattr(self.args, 'seed', 42))
+                count = sum(isinstance(a, (UniversityResearcher, IndustryResearcher))
+                            for a in self.ecosystem.agent_population.values())
+            else:
+                count, cohort = build_population_influx(
+                    self.ecosystem.agent_population, year, getattr(self.args, 'seed', 42), rate,
+                    getattr(self.args, 'initial_funding', None),
+                    start_offset=sum(len(entry['cohort']) for entry in self.influx_history.values()))
+            self.influx_history[key] = dict(population_before=count, cohort=cohort, rate=rate)
         entrant_ids = []
-        for spec in build_influx_cohort(year, getattr(self.args, 'seed', 42)):
+        by_institution = defaultdict(list)
+        for peer in self.ecosystem.agent_population.values():
+            institution = getattr(peer, 'university_name', None) or getattr(peer, 'company_name', None)
+            by_institution[institution].append(peer)
+        for spec in self.influx_history[key]['cohort']:
             name = spec['researcher_name']
             if name in self.ecosystem.agent_population:  # resume idempotence guard
                 continue
@@ -1775,13 +1831,12 @@ class Simulation:
                     funding_mode=self.industry_funding_mode,
                     exploration_strategy="balanced",
                 )
-            peers = [a for a in self.ecosystem.agent_population.values()
-                     if getattr(a, 'university_name', None) == spec['institution']
-                     or getattr(a, 'company_name', None) == spec['institution']]
+            peers = by_institution[spec['institution']]
             agent.add_conflict_of_interest({p.id for p in peers})
             for p in peers:
                 p.add_conflict_of_interest(agent.id)
             self.ecosystem.add_agent(agent)
+            peers.append(agent)
             entrant_ids.append(name)
             logger.info(f"Added {agent.id} from {spec['institution']} (influx junior, year {year})")
 
@@ -1868,6 +1923,11 @@ class Simulation:
         year_results = {'year': year}
         if influx_entrants:
             year_results['influx_entrants'] = influx_entrants
+        researchers = [a for a in self.ecosystem.agent_population.values()
+                       if isinstance(a, (UniversityResearcher, IndustryResearcher))]
+        year_results['population'] = dict(
+            total=len(researchers), active=sum(a.is_active for a in researchers),
+            entrants=len(influx_entrants))
         return year_results
 
     def run_phase_0_resubmissions(self, year: int, year_results: Dict) -> List[Dict]:
@@ -1957,7 +2017,7 @@ class Simulation:
             if not batch_prompts:
                 break
 
-            batch_results = self.llm.generate_batch(batch_prompts, response_format=resubmission_response_format, desc=f"{len(batch_prompts)} resubmission decisions (attempt {attempt+1}/{MAX_RESUBMISSION_RETRIES})", seed_ctx=('phase0_resubmit', year, attempt))
+            batch_results = self.llm.generate_batch(batch_prompts, response_format=resubmission_response_format, desc=f"{len(batch_prompts)} resubmission decisions (attempt {attempt+1}/{MAX_RESUBMISSION_RETRIES})", seed_ctx=('phase0_resubmit', year, attempt), item_ids=[m['agent'].id for m in batch_metadata])
 
             agents_needing_retry = []
 
@@ -2213,16 +2273,18 @@ class Simulation:
 
     def prepare_paper_index(self, year: int):
         """Load the paper index and preserve submission statuses when resuming."""
-        if year == 1:
-            self.rag.load_documents(num_years=self.num_years)
-            self.rag.build_knowledge_index()
-        elif self.rag.documents == []:
+        if self.rag.documents == []:
             # Loading documents resets statuses, so restore the checkpoint state.
             saved_document_status = self.rag.document_status.copy()
-            self.rag.load_documents(num_years=self.num_years)
-            self.rag.build_knowledge_index()
-            self.rag.document_status = saved_document_status
-            logger.info(f"Resumed from checkpoint with {len(saved_document_status)} document statuses preserved")
+            rng_state = capture_rng_state()
+            try:
+                self.rag.load_documents(num_years=self.num_years)
+                self.rag.build_knowledge_index()
+            finally:
+                restore_rng_state(rng_state)
+            if len(saved_document_status):
+                self.rag.document_status = saved_document_status
+                logger.info(f"Resumed from checkpoint with {len(saved_document_status)} document statuses preserved")
 
         # Set the current simulation year for year-based data partitioning
         self.rag.set_current_year(year)
@@ -2245,7 +2307,7 @@ class Simulation:
                 intention_prompts, max_tokens=SIMULATION_CONFIG['llm']['max_tokens'],
                 response_format=intention_response_format,
                 desc=f"Generating {len(intention_prompts)} intentions",
-                seed_ctx=('phase2_intentions', year),
+                seed_ctx=('phase2_intentions', year), item_ids=[a.id for a in active_authors],
             )
             for agent, (result_json, _) in zip(active_authors, intention_results):
                 intention = self.parse_intention(result_json, directions[agent.id])
@@ -2391,7 +2453,7 @@ class Simulation:
                 batch_prompts, max_tokens=SIMULATION_CONFIG['llm']['max_tokens'],
                 temperature=0.7, response_format=response_format,
                 desc=f"{len(batch_prompts)} paper submissions (attempt {attempt+1}/{max_attempts})",
-                seed_ctx=('phase2_submissions', year, attempt),
+                seed_ctx=('phase2_submissions', year, attempt), item_ids=[m['agent'].id for m in batch_metadata],
             )
             unresolved = []
             for index, (response, _) in enumerate(results):
@@ -2581,7 +2643,7 @@ class Simulation:
             batch_results = self.llm.generate_batch(
                 batch_prompts, response_format=citation_response_format,
                 desc=f"{len(batch_prompts)} {citation_kind} citations (attempt {attempt+1}/{max_attempts})",
-                seed_ctx=(f'phase2_citations_{citation_kind}', year, attempt),
+                seed_ctx=(f'phase2_citations_{citation_kind}', year, attempt), item_ids=[m['paper']['id'] for m in batch_metadata],
             )
 
             items_needing_retry = []
@@ -2655,7 +2717,7 @@ class Simulation:
             batch_results = self.llm.generate_batch(
                 batch_prompts, response_format=self_citation_response_format,
                 desc=f"{len(batch_prompts)} self-citations (attempt {attempt+1}/{max_attempts})",
-                seed_ctx=('phase2_citations_self', year, attempt),
+                seed_ctx=('phase2_citations_self', year, attempt), item_ids=[m['paper']['id'] for m in batch_metadata],
             )
 
             items_needing_retry = []
@@ -2802,9 +2864,17 @@ class Simulation:
 
     def review_input(self, paper):
         """Attach the indexed body only to the review input, not to checkpoints."""
+        cutoff = getattr(getattr(self, 'llm', None), 'stop_at_timestamp', None)
+        if cutoff is not None and time.time() >= cutoff:
+            raise ExperimentTimeLimit('Campaign cutoff reached during full-text preparation')
         if getattr(self, 'fulltext_corpus', None) is None:
             return paper
-        return dict(paper, full_text=self.fulltext_corpus.text(paper['id']))
+        reviewed = dict(paper, full_text=self.fulltext_corpus.text(paper['id']))
+        pages = self.fulltext_corpus.main_text_pages
+        if pages:
+            reviewed['review_text_label'] = (
+                f'Paper text (first {pages} pages at most; appendices excluded)')
+        return reviewed
 
     def run_phase_3_peer_review(self, year: int, year_results: Dict) -> Dict[str, Dict[str, float]]:
         """Phase 3: Conduct peer reviews
@@ -2818,6 +2888,10 @@ class Simulation:
         """
         logger.info(f"Year {year} Phase 3: Conducting peer reviews...")
 
+        if getattr(self, 'fulltext_corpus', None) is not None:
+            self.fulltext_corpus.prepare_review_texts([
+                paper['id'] for conference in self.conference_system.conferences
+                for paper in conference.submitted_papers])
         self.conference_system.start_all_review_processes()
 
         # Map conference ids to dict of papers
@@ -2887,7 +2961,11 @@ class Simulation:
 
             # Step 2: Single batch call for ALL prompts
             if batch_prompts:
-                batch_results = self.llm.generate_batch(batch_prompts, temperature=0.7, response_format=peer_review_response_format, desc=f"{len(batch_prompts)} peer reviews", seed_ctx=('phase3_reviews', year))
+                review_context = ('phase3_reviews', year)
+                pages = getattr(self.args, 'review_main_text_pages', 0)
+                if pages:
+                    review_context += (f'first_{pages}_pages_no_appendix',)
+                batch_results = self.llm.generate_batch(batch_prompts, temperature=0.7, response_format=peer_review_response_format, desc=f"{len(batch_prompts)} peer reviews", seed_ctx=review_context, item_ids=[f"{m['paper']['id']}:{m['reviewer'].id}" for m in batch_metadata])
 
                 # Step 3: Process results
                 for i, (review_json, message_history) in enumerate(batch_results):
@@ -2898,13 +2976,16 @@ class Simulation:
 
                     # Handle failed JSON parse from batch
                     if review_json is None:
-                        logger.warning(f"Failed to parse review response for paper {paper['id']} by {reviewer.id}, skipping")
-                        continue
+                        raise ValueError(f"Missing valid review for paper {paper['id']} by {reviewer.id}")
 
                     # Validate response
                     try:
                         assert all(field in review_json for field in ['overall_score', "justification"])
                         review_json['overall_score'] = self.cast_review_score(review_json['overall_score'])
+                        if (not np.isfinite(review_json['overall_score'])
+                                or not isinstance(review_json['justification'], str)
+                                or not review_json['justification'].strip()):
+                            raise ValueError('Review requires a finite score and nonempty justification')
                         review = {
                             'overall_score': review_json['overall_score'],
                             'justification': review_json['justification'],
@@ -2936,6 +3017,11 @@ class Simulation:
             for conference in self.conference_system.conferences:
                 for paper in conference.submitted_papers:
                     paper_reviews = conference.reviews.get(paper['id'], [])
+                    required = (len(capacity_assignment[paper['id']])
+                                if capacity_assignment is not None else self.reviews_per_paper)
+                    if (len(paper_reviews) != required
+                            or len({r['reviewer_id'] for r in paper_reviews}) != required):
+                        raise ValueError(f"Paper {paper['id']} requires {required} distinct valid reviews; got {len(paper_reviews)}")
                     if paper_reviews:
                         reviews_by_conference[conference.conference_id][paper['id']] = paper_reviews
                         average_scores[conference.conference_id][paper['id']] = sum(
@@ -3396,9 +3482,11 @@ class Simulation:
                     batch_prompts, temperature=0.7,
                     response_format=funding_response_format,
                     desc=f"{len(batch_prompts)} funding applications (attempt {attempt+1}/{MAX_FUNDING_RETRIES})",
-                    seed_ctx=('phase5_funding_apps', year, attempt),
+                    seed_ctx=('phase5_funding_apps', year, attempt), item_ids=[f"{m['agent'].id}:{m['program_id']}" for m in batch_metadata],
                 )
             except Exception as e:
+                if getattr(self.llm, 'fail_on_error', False):
+                    raise
                 logger.warning(f"Batch funding generation failed on attempt {attempt+1}: {e}")
                 if attempt < MAX_FUNDING_RETRIES - 1:
                     time.sleep(1)
@@ -3501,7 +3589,7 @@ class Simulation:
                     all_funding_proposal_eval_prompts, response_format=eval_response_format,
                     max_tokens=8192,
                     desc=f"{len(all_funding_proposal_eval_prompts)} funding evaluations (attempt {attempt+1}/{MAX_FUNDING_EVAL_RETRIES})",
-                    seed_ctx=('phase5_funding_eval', year, attempt),
+                    seed_ctx=('phase5_funding_eval', year, attempt), item_ids=[f"{m['program_id']}:{m.get('panel_index', 0)}" for m in all_eval_metadata],
                     **panel_formats,
                 )
             else:
@@ -3828,74 +3916,66 @@ class Simulation:
         return [idx for _, idx in scored[:k]]
 
     def run_one_round(self, year: int) -> Dict:
-        """Run simulation for one year - orchestrates all phases
-
-        Args:
-            year: Current year number
-
-        Returns:
-            Dictionary with year results
-        """
-        # Year setup
-        year_results = self.setup_year(year)
-
-        # Phase 0: Resubmissions (year 2+)
-        resubmissions_list = self.run_phase_0_resubmissions(year, year_results)
-        self.wandb_logger.log_phase(year, 0, year_results, self, num_resubmissions=len(resubmissions_list))
-
-        # Phase 1: Assign research directions
-        directions, active_authors, avg_funding = self.run_phase_1_research_directions(year, year_results)
-        self.wandb_logger.log_phase(year, 1, year_results, self, num_active_authors=len(active_authors), avg_funding=avg_funding)
-
-        # Phase 1.5: Collaboration formation (preferential_attachment experiment only)
-        self.run_phase_1_5_collaboration_formation(year, directions, active_authors, year_results)
-
-        # Phase 2: Generate and submit papers
-        submissions_list = self.run_phase_2_submit_papers(
-            year, directions, active_authors, resubmissions_list, year_results
-        )
-        # Batched metadata (keywords + embeddings + novelty) for all new papers this year
-        self.record_paper_metadata_batch(year)
-        self.wandb_logger.log_phase(year, 2, year_results, self)
-
-        # Charge annual costs
-        self.charge_annual_costs(year)
-
-        # Phase 3: Peer review
-        self.run_phase_3_peer_review(year, year_results)
-        self.wandb_logger.log_phase(year, 3, year_results, self)
-
-        # Apply strategy-dependent quality adjustment (between review and acceptance)
-        self.apply_strategy_quality_adjustment(year)
-
-        # Phase 4: Make acceptance decisions
-        self.run_phase_4_acceptance_decisions(year, year_results)
-        self.wandb_logger.log_phase(year, 4, year_results, self)
-
-        # Assign latent citation-potential metadata to newly accepted papers
-        self.assign_citation_potential(year)
-
-        # Phase 5: Update funding
-        self.run_phase_5_update_funding(year, submissions_list, year_results)
-
-        # Collect exploration metrics (if enabled)
-        self.collect_exploration_metrics(year)
-
-        # Graph/temporal integrity checks, written per year (exploration experiment)
-        if self.is_exploration_experiment:
-            self.run_integrity_checks(year)
-
-        # Collect preferential attachment metrics (if enabled)
-        self.collect_preferential_attachment_metrics(year)
-
-        # Get conference statistics
-        year_results['conference_statistics'] = self.conference_system.get_all_statistics()
-        if getattr(self, 'resource_ledger', None) is not None:
-            year_results['resource_balances'] = self.resource_ledger.close_year(
-                year, self.ecosystem.agent_population)
-        self.wandb_logger.log_phase(year, 5, year_results, self)
-
-        return year_results
+        """Commit each phase once; replay an interrupted phase from its entry state."""
+        stages = ['setup', 0, 1, 1.5, 2, 3, 4, 5]
+        cursor = getattr(self, 'resume_cursor', None)
+        start = cursor['next_step'] if cursor and cursor['year'] == year else 0
+        if start == 0:
+            self.phase_context = {}
+        context = self.phase_context
+        self.current_year = year
+        for index in range(start, len(stages)):
+            cutoff = getattr(self.llm, 'stop_at_timestamp', None)
+            if cutoff is not None and time.time() >= cutoff:
+                raise ExperimentTimeLimit('Campaign cutoff reached; last committed phase retained')
+            stage = stages[index]
+            self.save_checkpoint(year, stage, status='running', next_step=index)
+            results = context.get('year_results')
+            if stage == 'setup':
+                context['year_results'] = self.setup_year(year)
+            elif stage == 0:
+                context['resubmissions'] = self.run_phase_0_resubmissions(year, results)
+                self.wandb_logger.log_phase(year, 0, results, self,
+                                           num_resubmissions=len(context['resubmissions']))
+            elif stage == 1:
+                directions, authors, average = self.run_phase_1_research_directions(year, results)
+                context.update(directions=directions, active_author_ids=[a.id for a in authors])
+                self.wandb_logger.log_phase(year, 1, results, self,
+                                           num_active_authors=len(authors), avg_funding=average)
+            elif stage == 1.5:
+                self.run_phase_1_5_collaboration_formation(year, context['directions'],
+                    [self.ecosystem.get_agent_by_id(a) for a in context['active_author_ids']], results)
+            elif stage == 2:
+                context['submissions'] = self.run_phase_2_submit_papers(year, context['directions'],
+                    [self.ecosystem.get_agent_by_id(a) for a in context['active_author_ids']],
+                    context['resubmissions'], results)
+                self.record_paper_metadata_batch(year)
+                self.charge_annual_costs(year)
+                self.wandb_logger.log_phase(year, 2, results, self)
+            elif stage == 3:
+                self.run_phase_3_peer_review(year, results)
+                self.apply_strategy_quality_adjustment(year)
+                self.wandb_logger.log_phase(year, 3, results, self)
+            elif stage == 4:
+                self.run_phase_4_acceptance_decisions(year, results)
+                self.assign_citation_potential(year)
+                self.wandb_logger.log_phase(year, 4, results, self)
+            elif stage == 5:
+                self.run_phase_5_update_funding(year, context['submissions'], results)
+                self.collect_exploration_metrics(year)
+                if self.is_exploration_experiment:
+                    self.run_integrity_checks(year)
+                self.collect_preferential_attachment_metrics(year)
+                results['conference_statistics'] = self.conference_system.get_all_statistics()
+                if getattr(self, 'resource_ledger', None) is not None:
+                    results['resource_balances'] = self.resource_ledger.close_year(
+                        year, self.ecosystem.agent_population)
+                self.wandb_logger.log_phase(year, 5, results, self)
+                if any(row['year'] == year for row in self.yearly_results):
+                    raise ValueError(f'Year {year} was already committed')
+                self.yearly_results.append(results)
+            self.save_checkpoint(year, stage, status='completed', next_step=index + 1)
+        return context['year_results']
 
     def run(self):
         """Run the complete simulation"""
@@ -3923,20 +4003,16 @@ class Simulation:
         start_year = 1
         checkpoint_loaded = False
 
-        # Try to load from checkpoint unless always_rerun is specified
         if not self.always_rerun:
-            # Try to find the most recent checkpoint
-            for year in range(self.num_years, 0, -1):
-                checkpoint_path = os.path.join(self.output_dir, f"checkpoint_year_{year}.json")
-                if os.path.exists(checkpoint_path) or os.path.exists(checkpoint_path + '.gz'):
-                    logger.info(f"Found checkpoint at year {year}, attempting to load...")
-                    if self.load_checkpoint(year):
-                        start_year = year + 1
-                        checkpoint_loaded = True
-                        logger.info(f"Resuming simulation from year {start_year}")
-                        break
-        else:
-            logger.info("--always-rerun specified, ignoring all checkpoints and starting from scratch")
+            from utopia.runtime.provenance import latest_native_checkpoint
+            checkpoint_path = getattr(self.args, 'resume_from', None) or latest_native_checkpoint(self.output_dir)
+            if checkpoint_path:
+                self.load_checkpoint(path=checkpoint_path)
+                start_year = self.current_year
+                if self.resume_cursor is None or self.resume_cursor['next_step'] == 8:
+                    start_year += 1
+                checkpoint_loaded = True
+                logger.info(f"Resuming year {start_year}, cursor={self.resume_cursor}")
 
         if not checkpoint_loaded:
             # Initialize agents
@@ -3991,7 +4067,7 @@ class Simulation:
             logger.info(f"RAG will filter out {len(self.submitted_paper_ids)} already submitted papers")
 
         assert start_year >= 1, "Start year must be >= 1"
-        if start_year == 1:
+        if start_year == 1 and not checkpoint_loaded:
             for agent_id, agent in self.ecosystem.agent_population.items():
                 if getattr(agent, 'resources', None) is not None:
                     self.agent_tracker.record_agent_resources(agent_id, agent.resources, 0)
@@ -3999,8 +4075,6 @@ class Simulation:
         # Run simulation for each year
         for year in range(start_year, self.num_years + 1):
             year_results = self.run_one_round(year)
-            self.yearly_results.append(year_results)
-            self.save_checkpoint(year, phase=5)
         # Generate final report
         self.generate_final_report()
         self.wandb_logger.finish()
@@ -4015,20 +4089,34 @@ class Simulation:
         logger.info("\nSimulation completed!")
         logger.info(f"Results saved to: {self.output_dir}")
 
-    def save_checkpoint(self, year: int, phase: int = 5):
+    def save_checkpoint(self, year: int, phase=5, *, status="completed", next_step=None):
         """Save complete simulation state as checkpoint
 
         Args:
             year: Year number
         """
         checkpoint_path = os.path.join(self.output_dir, f"checkpoint_year_{year}.json")
-        if getattr(self, 'resource_ledger', None) is not None:
-            self.resource_ledger.reconcile(year, self.ecosystem.agent_population, require_closed=True)
+        if next_step is not None:
+            checkpoint_path = os.path.join(self.output_dir, f"checkpoint_year_{year}_stage_{phase}_{status}.json")
+        if (getattr(self, 'resource_ledger', None) is not None
+                and str(year) in self.resource_ledger.years):
+            self.resource_ledger.reconcile(year, self.ecosystem.agent_population,
+                                           require_closed=phase == 5 and status == 'completed')
 
         # Serialize everything to JSON-compatible format
         checkpoint_data = {
             'year': year,
             'phase': phase,
+            'checkpoint_version': 2,
+            'status': status,
+            'next_step': next_step,
+            'checkpoint_args': dict(vars(self.args)),
+            'simulation_config': SIMULATION_CONFIG,
+            'phase_context': json.loads(json.dumps(getattr(self, 'phase_context', {}),
+                                                   default=lambda obj: obj.to_dict())),
+            'influx_history': getattr(self, 'influx_history', {}),
+            'direction_fallback_stats': getattr(self, '_direction_fallback_stats', {}),
+            'pending_paper_metadata': getattr(self, '_pending_paper_metadata', []),
             'rng_state': capture_rng_state(),
             'ecosystem_data': self.ecosystem.to_dict(),
             'conference_system': self.conference_system.to_dict(),
@@ -4039,7 +4127,7 @@ class Simulation:
             'paper_tracker': self.paper_tracker.to_dict(),
             'yearly_results': self.yearly_results,
             'industry_funding_system': self.industry_funding_system.to_dict(),
-            'submitted_paper_ids': list(self.submitted_paper_ids),  # Convert set to list
+            'submitted_paper_ids': sorted(self.submitted_paper_ids),
             'initial_university_count': self.initial_university_count,
             'initial_industry_count': self.initial_industry_count,
         }
@@ -4050,11 +4138,15 @@ class Simulation:
             # Bind the checkpoint itself to its cell, independently of its path
             # or a neighboring manifest. Transport endpoints may change on resume.
             import subprocess
+            try:
+                commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'],
+                    cwd=os.path.dirname(os.path.abspath(__file__)), text=True,
+                    stderr=subprocess.DEVNULL).strip()
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                commit = None
             checkpoint_data['cost_experiment_binding'] = {
                 'args': dict(vars(self.args)),
-                'git_commit': subprocess.check_output(
-                    ['git', 'rev-parse', 'HEAD'],
-                    cwd=os.path.dirname(os.path.abspath(__file__)), text=True).strip(),
+                'git_commit': commit,
             }
 
         # Save exploration experiment trackers if enabled
@@ -4081,7 +4173,7 @@ class Simulation:
             }
 
         # Large-stage runs write gzipped checkpoints (~10x smaller; plan scale rule)
-        if getattr(self.args, 'experiment_stage', None) in ('calibration', 'confirmatory', 'manyworld', 'mechanism', 'funding_cutoff', 'funding_cutoff_cost'):
+        if next_step is not None or getattr(self.args, 'experiment_stage', None) in ('calibration', 'confirmatory', 'manyworld', 'mechanism', 'funding_cutoff', 'funding_cutoff_cost'):
             checkpoint_path += '.gz'
             write_json_gzip_atomic(checkpoint_path, checkpoint_data, create_parent=False)
         else:
@@ -4090,9 +4182,43 @@ class Simulation:
         if getattr(self, 'resource_ledger', None) is not None:
             self.resource_ledger.write(self.output_dir)
 
-        logger.info(f"Checkpoint saved for year {year}: {checkpoint_path}")
+        self.latest_checkpoint_path = checkpoint_path
+        if next_step is not None:
+            self.resume_cursor = dict(year=year, next_step=next_step)
+            write_json_atomic(os.path.join(self.output_dir, 'latest_checkpoint.json'),
+                              dict(path=os.path.basename(checkpoint_path), year=year, phase=phase,
+                                   status=status, next_step=next_step))
+            if phase == 5 and status == 'completed':
+                from utopia.utils.data_utils import atomic_open
+                import shutil
+                with open(checkpoint_path, 'rb') as source, atomic_open(
+                        os.path.join(self.output_dir, f'checkpoint_year_{year}.json.gz'), 'wb') as target:
+                    shutil.copyfileobj(source, target)
+        self.sync_checkpoint_replies(force=True)
+        logger.info(f"Checkpoint saved for year {year}, stage {phase} {status}: {checkpoint_path}")
+        return checkpoint_path
 
-    def load_checkpoint(self, year: int):
+    def sync_checkpoint_replies(self, *unused, force=False):
+        prefix = getattr(self.args, 'checkpoint_s3_prefix', None)
+        if not prefix or not getattr(self, 'latest_checkpoint_path', None):
+            return
+        self.replies_since_sync = getattr(self, 'replies_since_sync', 0) + 1
+        if not force and self.replies_since_sync < 128 and time.monotonic() - self.last_sync_time < 60:
+            return
+        from utopia.runtime.provenance import publish_native_snapshot
+        state = capture_rng_state()
+        try:
+            publish_native_snapshot(self)
+            self.replies_since_sync = 0
+            self.last_sync_time = time.monotonic()
+        except BaseException:
+            if hasattr(self.llm, 'batch_cancelled'):
+                self.llm.batch_cancelled.set()
+            raise
+        finally:
+            restore_rng_state(state)
+
+    def load_checkpoint(self, year=None, *, path=None):
         """Load complete simulation state from checkpoint
 
         Args:
@@ -4101,7 +4227,7 @@ class Simulation:
         Returns:
             bool: True if checkpoint loaded successfully, False otherwise
         """
-        checkpoint_path = os.path.join(self.output_dir, f"checkpoint_year_{year}.json")
+        checkpoint_path = path or os.path.join(self.output_dir, f"checkpoint_year_{year}.json")
 
         from utopia.utils.data_utils import read_json
         if not os.path.exists(checkpoint_path):
@@ -4110,6 +4236,19 @@ class Simulation:
                 return False
             checkpoint_path += '.gz'
         checkpoint_data = read_json(checkpoint_path)
+        year = checkpoint_data['year']
+        self.latest_checkpoint_path = checkpoint_path
+        step = checkpoint_data.get('next_step')
+        self.resume_cursor = dict(year=year, next_step=step) if step is not None else None
+        self.phase_context = checkpoint_data.get('phase_context', {})
+        if self.phase_context.get('directions'):
+            from utopia.agents.research_direction import ResearchDirection
+            for direction in self.phase_context['directions'].values():
+                direction['direction'] = ResearchDirection.from_dict(direction['direction'])
+        self.influx_history = checkpoint_data.get('influx_history', {})
+        self._pending_paper_metadata = checkpoint_data.get('pending_paper_metadata', [])
+        self._direction_fallback_stats = {int(k): v for k, v in
+                                          checkpoint_data.get('direction_fallback_stats', {}).items()}
 
         from utopia.funding.accounting import (
             ResourceLedger,
@@ -4122,8 +4261,6 @@ class Simulation:
             raise ValueError("Checkpoint cost policy differs from requested policy")
         if saved_policy is None and cost_policy_enabled(current_policy):
             raise ValueError("Cannot resume a legacy checkpoint under a new cost/audit policy")
-        if cost_policy_enabled(current_policy) and checkpoint_data.get('phase', 5) != 5:
-            raise ValueError("Cost accounting supports the native end-of-year checkpoints only")
         if current_policy['log_resource_ledger'] and 'resource_ledger' not in checkpoint_data:
             raise ValueError("Audit checkpoint is missing its resource ledger")
         if current_policy['log_resource_ledger']:
@@ -4131,7 +4268,11 @@ class Simulation:
             if not binding:
                 raise ValueError("Audit checkpoint is missing its experiment binding")
             from utopia.analysis.project_cost import scientific_arguments
-            if scientific_arguments(binding['args']) != scientific_arguments(vars(self.args)):
+            saved_arguments = scientific_arguments(binding['args'])
+            current_arguments = scientific_arguments(vars(self.args))
+            # Older checkpoints may predate a newly introduced option. Preserve
+            # every setting they actually recorded; CLI restoration handles it.
+            if any(current_arguments.get(key) != value for key, value in saved_arguments.items()):
                 raise ValueError("Checkpoint scientific arguments differ from requested experiment")
         self.cost_policy = current_policy
         self.resource_ledger = (ResourceLedger(checkpoint_data['resource_ledger'])
@@ -4146,15 +4287,15 @@ class Simulation:
         )
         if self.resource_ledger is not None:
             self.resource_ledger.attach(self.ecosystem.agent_population)
-            self.resource_ledger.reconcile(year, self.ecosystem.agent_population, require_closed=True)
+            if str(year) in self.resource_ledger.years:
+                self.resource_ledger.reconcile(year, self.ecosystem.agent_population,
+                    require_closed=step in (None, 8) and checkpoint_data.get('phase', 5) == 5)
             # A crash may leave newer exports than the last committed checkpoint.
             self.resource_ledger.write(self.output_dir)
 
         # Reconstruct conference system
         self.conference_system = ConferenceSystem.from_dict(checkpoint_data['conference_system'])
 
-        # Reset conferences for the next year (checkpoint was saved before reset)
-        self.conference_system.reset_all_for_new_year(year)
 
         # Reconstruct citation tracker
         self.citation_tracker = CitationTracker.from_dict(checkpoint_data.get('citation_tracker', {'citations': {}}))
@@ -4164,6 +4305,7 @@ class Simulation:
         # Reconstruct paper tracker
         self.paper_tracker = PaperTracker.from_dict(
             checkpoint_data.get('paper_tracker', {}))
+        self.paper_tracker.output_dir = self.output_dir
 
         self.yearly_results = checkpoint_data['yearly_results']
 
@@ -4320,6 +4462,15 @@ def main():
             gpu_memory_utilization=args.gpu_memory_utilization,
             max_model_len=args.max_model_len,
         )
+    if args.fulltext_index and args.vllm_url:
+        from transformers import AutoTokenizer
+        llm.context_tokenizer = AutoTokenizer.from_pretrained(args.model)
+        llm.context_limit = args.max_model_len
+        llm.fail_on_error = True
+    if args.checkpoint_s3_prefix:
+        if not args.save_model_replies or not (args.vllm_url or args.backend == 'bedrock'):
+            raise ValueError('S3 continuation requires saved replies and a vLLM or Bedrock backend')
+        llm.fail_on_error = True
     logger.info(f"LLM initialized in {time.time() - t0:.1f}s")
 
     # Create and run simulation
@@ -4342,7 +4493,19 @@ def main():
         args=args
     )
 
-    simulation.run()
+    try:
+        simulation.run()
+    except BaseException as error:
+        write_run_manifest(
+            args.docs_dir,
+            status='stopped' if isinstance(error, (KeyboardInterrupt, ExperimentTimeLimit)) else 'failed',
+            extra={'error': f'{type(error).__name__}: {error}',
+                   'year': simulation.current_year,
+                   'resume_cursor': simulation.resume_cursor,
+                   'latest_checkpoint': simulation.latest_checkpoint_path})
+        raise
+    finally:
+        simulation.sync_checkpoint_replies(force=True)
 
 
 if __name__ == '__main__':

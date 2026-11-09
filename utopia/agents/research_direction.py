@@ -115,7 +115,7 @@ def build_direction_prompt(
         core_expertise.append(direction.topic)
         related_expertise.update(direction.related_topics)
 
-    related_expertise = list(related_expertise)
+    related_expertise = sorted(related_expertise)
 
     past_accepted_papers, past_rejected_papers = paper_tracker.get_papers_by_decision(agent.id)
 
@@ -335,7 +335,7 @@ def create_research_directions_batch(
         temperature=0.7,
         response_format=direction_response_format,
         desc=f"{len(batch_prompts)} research directions",
-        seed_ctx=('phase1_directions', year),
+        seed_ctx=('phase1_directions', year), item_ids=[a.id for a in agents],
     )
 
     # Step 3: Process results

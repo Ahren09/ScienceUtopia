@@ -439,6 +439,7 @@ class VLLMModel(BaseLLM):
         max_tokens: int = SIMULATION_CONFIG['llm']['max_tokens'],
         desc: Optional[str] = None,
         seed_ctx: Optional[tuple] = None,  # accepted for API parity with VLLMServerModel; unused in-process
+        item_ids=None,
     ) -> List[Tuple[Dict, List[Dict]]]:
         """Process ALL prompts in a single vLLM call - no for-loop over prompts
 
@@ -570,6 +571,7 @@ class APIBatchModel(BaseLLM):
         self.run_seed = run_seed
         self.response_cache_path = Path(response_cache_path) if response_cache_path else None
         self.saved_responses = {}
+        self.progress_callback = None
         self.response_write_lock = threading.Lock()
         self.token_rates = [input_tokens_per_minute, output_tokens_per_minute]
         if min(self.token_rates) < 0:
@@ -591,8 +593,16 @@ class APIBatchModel(BaseLLM):
         if self.response_cache_path:
             self.response_cache_path.parent.mkdir(parents=True, exist_ok=True)
             if self.response_cache_path.exists():
-                with self.response_cache_path.open() as stream:
-                    for line in stream:
+                with self.response_cache_path.open('rb+') as stream:
+                    valid_end = 0
+                    while line := stream.readline():
+                        if not line.endswith(b'\n'):
+                            tail = self.response_cache_path.with_suffix('.partial')
+                            tail.write_bytes(line)
+                            stream.truncate(valid_end)
+                            stream.flush()
+                            os.fsync(stream.fileno())
+                            break
                         if line.strip():
                             row = json.loads(line)
                             if not row.get('cache_replay', False):
@@ -603,13 +613,18 @@ class APIBatchModel(BaseLLM):
                                 phase = str(context[0]) if context else 'default'
                                 output = (row['response'].get('usage') or {}).get('completion_tokens', 0)
                                 self.output_estimates[phase] = max(self.output_estimates.get(phase, 0), output)
+                        valid_end = stream.tell()
         from utopia.models.request_audit import active_audit_for
         self.request_audit = active_audit_for(model_name)
         self.call_stats = dict(n_prompts=0, n_first_attempt_success=0, n_retries=0,
                                n_failures=0, elapsed_seconds=0.0,
                                prompt_tokens=0, completion_tokens=0)
+        import httpx
+        http = httpx.Client(limits=httpx.Limits(
+            max_connections=max_concurrent_requests,
+            max_keepalive_connections=max_concurrent_requests), timeout=600.0)
         self.client = OpenAI(base_url=base_url, api_key=api_key, timeout=600.0,
-                             max_retries=sdk_retries)
+                             max_retries=sdk_retries, http_client=http)
         logger.info(f"Initialized {type(self).__name__} at {base_url} (model: {model_name})")
 
     def build_payload(self, messages, temperature, max_tokens, response_format,
@@ -626,11 +641,16 @@ class APIBatchModel(BaseLLM):
         return 0.0
 
     def find_saved_response(self, request_id, payload):
-        """Reuse matching request IDs; keep input checks when retry queues change order."""
-        fields = ('model', 'messages', 'temperature')
+        """Stable task IDs survive changes to paths, concurrency and transport."""
         for row in reversed(self.saved_responses.get(request_id, [])):
+            if not row.get('complete'):
+                continue
+            if row.get('task_id') is not None:
+                return row['response']
+            # Historical positional IDs can identify different retry-queue items.
+            # Resolve that old ambiguity without imposing checks on stable task IDs.
             saved = row.get('payload', {})
-            if all(saved.get(field) == payload.get(field) for field in fields):
+            if all(saved.get(field) == payload.get(field) for field in ('model', 'messages', 'temperature')):
                 return row['response']
         return None
 
@@ -647,7 +667,7 @@ class APIBatchModel(BaseLLM):
                 for index, rate in enumerate(self.token_rates):
                     if rate:
                         self.token_balances[index] = min(
-                            max(rate, reserved[index]),
+                            max(rate / 60, reserved[index]),
                             self.token_balances[index] + (now - self.quota_time) * rate / 60)
                         delay = max(delay, (reserved[index] - self.token_balances[index]) * 60 / rate)
                 self.quota_time = now
@@ -659,7 +679,7 @@ class APIBatchModel(BaseLLM):
             time.sleep(min(delay, 1.0))
         raise ModelRequestError('Batch stopped; completed replies retained')
 
-    def create_completion(self, *, seed_ctx=None, item_index=0, attempt=0, **payload):
+    def create_completion(self, *, seed_ctx=None, item_index=0, attempt=0, task_id=None, **payload):
         request_id = json.dumps([seed_ctx, item_index, attempt],
                                 ensure_ascii=True, separators=(',', ':'))
         cache_path = getattr(self, 'response_cache_path', None)
@@ -706,21 +726,23 @@ class APIBatchModel(BaseLLM):
             for index, rate in enumerate(self.token_rates):
                 if rate:
                     self.token_balances[index] = min(
-                        rate, self.token_balances[index] + reserved[index] - actual[index])
+                        rate / 60, self.token_balances[index] + reserved[index] - actual[index])
         if cache_path:
             text, finish, _ = self.response_details(response)
             complete = finish == 'stop'
             if complete:
                 try:
                     result = parse_json_response(text)
-                    fmt = payload.get('response_format', {}).get('json_schema', {})
-                    if fmt.get('schema'):
+                    schema = (payload.get('response_format', {}).get('json_schema', {}).get('schema')
+                              or (payload.get('extra_body') or {}).get('structured_outputs', {}).get('json'))
+                    if schema:
                         from jsonschema import validate
-                        validate(result, fmt['schema'])
+                        validate(result, schema)
                 except Exception:
                     complete = False
             record = {
                 'request_id': request_id, 'time_ns': time.time_ns(),
+                'task_id': task_id,
                 'started_ns': started_ns, 'elapsed_seconds': (time.time_ns() - started_ns) / 1e9,
                 'concurrency': self.max_concurrent_requests,
                 'cache_replay': False, 'complete': complete,
@@ -728,10 +750,17 @@ class APIBatchModel(BaseLLM):
             }
             serialized = json.dumps(record, ensure_ascii=True)
             with self.response_write_lock:
+                existed = cache_path.exists()
                 with cache_path.open('a') as stream:
                     stream.write(serialized + '\n')
                     stream.flush()
                     os.fsync(stream.fileno())
+                if not existed:
+                    directory = os.open(cache_path.parent, os.O_RDONLY)
+                    try:
+                        os.fsync(directory)
+                    finally:
+                        os.close(directory)
                 if complete and seed_ctx is not None:
                     self.saved_responses.setdefault(request_id, []).append(json.loads(serialized))
         return response
@@ -781,9 +810,11 @@ class APIBatchModel(BaseLLM):
             started = time.perf_counter()
             attempts = range(3)
             for saved_attempt in range(3):
+                saved_id = json.dumps([context, position, saved_attempt], ensure_ascii=True, separators=(',', ':'))
+                if saved_id not in self.saved_responses:
+                    continue
                 saved_payload = self.build_payload(messages, temperature, max_tokens, formats[index],
                                                    context, position, saved_attempt)
-                saved_id = json.dumps([context, position, saved_attempt], ensure_ascii=True, separators=(',', ':'))
                 if self.find_saved_response(saved_id, saved_payload) is not None:
                     attempts = [saved_attempt]
                     break
@@ -795,7 +826,9 @@ class APIBatchModel(BaseLLM):
                                             ensure_ascii=True, separators=(',', ':'))
                     cache_replay = self.find_saved_response(request_id, payload) is not None
                     response = self.create_completion(seed_ctx=context, item_index=position,
-                                                      attempt=attempt, **payload)
+                                                      attempt=attempt,
+                                                      task_id=item_ids[index] if item_ids is not None else None,
+                                                      **payload)
                     text, finish, usage = self.response_details(response)
                     if not cache_replay:
                         tokens[0] += usage[0]
@@ -805,15 +838,20 @@ class APIBatchModel(BaseLLM):
                     result = parse_json_response(text.strip())
                     if result is None and formats[index] is not None:
                         raise ValueError('Structured output is empty')
-                    if payload.get('response_format', {}).get('json_schema', {}).get('schema'):
+                    schema = payload.get('response_format', {}).get('json_schema', {}).get('schema')
+                    if self.fail_on_error and not schema:
+                        schema = (payload.get('extra_body') or {}).get('structured_outputs', {}).get('json')
+                    if schema:
                         from jsonschema import validate
-                        validate(result, payload['response_format']['json_schema']['schema'])
+                        validate(result, schema)
                     messages.append({'role': 'assistant', 'content': [{'type': 'text', 'text': text}]})
                     return index, (result, messages), dict(success=True, n_retries=retries,
                         prompt_tokens=tokens[0], completion_tokens=tokens[1], cache_replay=cache_replay,
                         finish_reason=finish, max_tokens=max_tokens,
                         elapsed_seconds=time.perf_counter() - started, time_ns=time.time_ns())
                 except Exception as error:
+                    if isinstance(error, (ExperimentTimeLimit, ModelRequestError)) or self.batch_cancelled.is_set():
+                        raise
                     retries += 1
                     error_message = str(error)
                     logger.warning(f'Prompt {index} attempt {attempt + 1}/3 failed: {error}')
@@ -830,28 +868,53 @@ class APIBatchModel(BaseLLM):
         logger.info(f'[{type(self).__name__}] Generating {label}; concurrency={self.max_concurrent_requests}')
         started = time.perf_counter()
         results = [None] * len(prompts)
+        from concurrent.futures import wait, FIRST_COMPLETED
         with ThreadPoolExecutor(max_workers=self.max_concurrent_requests) as executor:
-            futures = [executor.submit(call_single, index) for index in range(len(prompts))]
+            pending = iter(range(len(prompts)))
+            futures = set()
             try:
-                for future in tqdm(as_completed(futures), total=len(prompts), desc=label):
-                    index, result, info = future.result()
-                    results[index] = result
-                    self.call_stats['n_prompts'] += 1
-                    for key in ('n_retries', 'prompt_tokens', 'completion_tokens'):
-                        self.call_stats[key] += info[key]
-                    if info['success'] and info['n_retries'] == 0:
-                        self.call_stats['n_first_attempt_success'] += 1
-                    if not info['success']:
-                        self.call_stats['n_failures'] += 1
-                    if on_result is not None:
-                        on_result(index, result, info)
-                    if self.fail_on_error and not info['success']:
-                        raise ModelRequestError(
-                            f'API request failed: {info["error"]}; completed replies are saved.')
+                for _ in range(min(len(prompts), self.max_concurrent_requests)):
+                    futures.add(executor.submit(call_single, next(pending)))
+                with tqdm(total=len(prompts), desc=label) as progress:
+                    while futures:
+                        done, _ = wait(futures, return_when=FIRST_COMPLETED)
+                        for future in done:
+                            index, result, info = future.result()
+                            futures.remove(future)
+                            results[index] = result
+                            self.call_stats['n_prompts'] += 1
+                            for key in ('n_retries', 'prompt_tokens', 'completion_tokens'):
+                                self.call_stats[key] += info[key]
+                            if info['success'] and info['n_retries'] == 0:
+                                self.call_stats['n_first_attempt_success'] += 1
+                            if not info['success']:
+                                self.call_stats['n_failures'] += 1
+                            if on_result is not None:
+                                on_result(index, result, info)
+                            if self.progress_callback is not None:
+                                self.progress_callback(index, result, info)
+                            if self.fail_on_error and not info['success']:
+                                raise ModelRequestError(
+                                    f'API request failed: {info["error"]}; completed replies are saved.')
+                            progress.update()
+                        for _ in done:
+                            index = next(pending, None)
+                            if index is not None:
+                                futures.add(executor.submit(call_single, index))
             except BaseException:
                 self.batch_cancelled.set()
                 for future in futures:
                     future.cancel()
+                # Keep reply-triggered backups active while issued requests finish.
+                while futures:
+                    done, futures = wait(futures, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        try:
+                            index, result, info = future.result()
+                        except Exception:
+                            continue
+                        if self.progress_callback is not None:
+                            self.progress_callback(index, result, info)
                 raise
         self.call_stats['elapsed_seconds'] += time.perf_counter() - started
         return results
@@ -861,6 +924,8 @@ class VLLMServerModel(APIBatchModel):
     """OpenAI-compatible chat transport for the existing vLLM services."""
 
     def __init__(self, model_name, base_url='http://localhost:8000/v1', **kwargs):
+        # Keep retries in the cancellable batch loop, including at the deadline.
+        kwargs.setdefault('sdk_retries', 0)
         super().__init__(model_name, base_url, api_key=os.environ.get('VLLM_API_KEY', 'EMPTY'), **kwargs)
         self.client.models.list()
 
@@ -884,6 +949,14 @@ class VLLMServerModel(APIBatchModel):
         seed = self.request_seed(seed_ctx, item_index, attempt)
         if seed is not None:
             extra['seed'] = seed
+        if getattr(self, 'context_tokenizer', None) is not None:
+            ids = self.context_tokenizer.apply_chat_template(
+                messages, tokenize=True, add_generation_prompt=True,
+                enable_thinking=self.enable_thinking)
+            if len(ids) + max_tokens > self.context_limit:
+                raise ModelRequestError(
+                    f'Full input requires {len(ids)} + {max_tokens} output tokens, '
+                    f'exceeding context {self.context_limit}; input retained without truncation')
         return dict(model=self.model_name, messages=messages, temperature=temperature,
                     max_tokens=max_tokens, extra_body=extra or None)
 

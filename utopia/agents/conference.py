@@ -327,6 +327,7 @@ class Conference:
             'show_attributes': self.show_attributes,
             'use_configured_rate': self.use_configured_rate,
             'year': self.year,
+            'submitted_papers': self.submitted_papers,
             'decisions': self.decisions,
             'authors_to_accepted_papers': self.authors_to_accepted_papers,
             'authors_to_rejected_papers': self.authors_to_rejected_papers,
@@ -485,7 +486,9 @@ class ConferenceSystem:
     def to_dict(self) -> Dict:
         """Serialize to dictionary"""
         return {
-            'conferences': [conf.to_dict() for conf in self.conferences]
+            'conferences': [conf.to_dict() for conf in self.conferences],
+            'authors_to_accepted_papers': self.authors_to_accepted_papers,
+            'authors_to_rejected_papers': self.authors_to_rejected_papers,
         }
 
     @classmethod
@@ -494,6 +497,14 @@ class ConferenceSystem:
         conferences = [Conference.from_dict(conf_data) for conf_data in data.get('conferences', [])]
 
         conference_system = cls(conferences=conferences)
+        for field in ('authors_to_accepted_papers', 'authors_to_rejected_papers'):
+            restored = data.get(field)
+            if restored is None:
+                restored = defaultdict(list)
+                for conference in conferences:
+                    for author, papers in getattr(conference, field).items():
+                        restored[author].extend(papers)
+            setattr(conference_system, field, defaultdict(list, restored))
         return conference_system
 
 

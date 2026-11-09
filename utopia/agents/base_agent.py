@@ -149,7 +149,7 @@ class MultiAgentEcosystem:
         for agent_id, agent in self.agent_population.items():
             if agent.newest_direction is not None:
                 newest_direction = {
-                    'direction': agent.newest_direction['direction'].topic,
+                    'direction': agent.newest_direction['direction'].to_dict(),
                     'detailed_focus': agent.newest_direction.get('detailed_focus'),
                     'reason': agent.newest_direction.get('reason')
                 }
@@ -177,7 +177,7 @@ class MultiAgentEcosystem:
                 agent_dict['university_name'] = agent.university_name
                 agent_dict['expertise'] = [exp.topic for exp in agent.expertise]
                 agent_dict['funding_success_history'] = agent.funding_success_history
-                agent_dict['conflict_of_interest'] = list(agent.conflict_of_interest)
+                agent_dict['conflict_of_interest'] = sorted(agent.conflict_of_interest)
                 agent_dict['generate_research_proposal'] = agent.generate_research_proposal
                 agent_dict['exploration_strategy'] = agent.exploration_strategy
 
@@ -186,7 +186,8 @@ class MultiAgentEcosystem:
                 agent_dict['expertise'] = [exp.topic for exp in agent.expertise]
                 agent_dict['funding_mode'] = agent.funding_mode
                 agent_dict['budget'] = agent.budget
-                agent_dict['conflict_of_interest'] = list(agent.conflict_of_interest)
+                agent_dict['research_priorities'] = sorted(agent.research_priorities)
+                agent_dict['conflict_of_interest'] = sorted(agent.conflict_of_interest)
                 agent_dict['funding_success_history'] = agent.funding_success_history
                 agent_dict['exploration_strategy'] = agent.exploration_strategy
 
@@ -252,13 +253,15 @@ class MultiAgentEcosystem:
 
             newest_direction_data = agent_data['newest_direction']
             if newest_direction_data is None:
-                assert agent_type == "funding_agency"
                 newest_direction = None
             else:
-                direction_topic = newest_direction_data['direction']
-                assert direction_topic in DIRECTIONS_DICT, f"Direction {direction_topic} not found in DIRECTIONS_DICT"
+                saved_direction = newest_direction_data['direction']
+                if isinstance(saved_direction, dict):
+                    direction = ResearchDirection.from_dict(saved_direction)
+                else:
+                    direction = DIRECTIONS_DICT[saved_direction]
                 newest_direction = {
-                    'direction': DIRECTIONS_DICT[direction_topic],
+                    'direction': direction,
                     'detailed_focus': newest_direction_data.get('detailed_focus'),
                     'reason': newest_direction_data.get('reason')
                 }
@@ -361,6 +364,8 @@ class MultiAgentEcosystem:
                 continue
 
             agent.production_cost_entries = agent_data.get('production_cost_entries', {})
+            agent.can_author = agent_data.get('can_author', agent.can_author)
+            agent.can_review = agent_data.get('can_review', agent.can_review)
             ecosystem.add_agent(agent)
 
         return ecosystem
@@ -513,7 +518,8 @@ Respond in JSON format. An example response is below (DO NOT directly copy the e
         """
         assert review_policy in ('persona', 'standardized'), review_policy
         paper_text = paper.get('full_text', paper['abstract'])
-        paper_label = 'Full paper text' if 'full_text' in paper else 'Abstract'
+        paper_label = paper.get(
+            'review_text_label', 'Full paper text' if 'full_text' in paper else 'Abstract')
         if not isinstance(paper_text, str) or not paper_text.strip():
             raise ValueError(f"Empty review input for paper {paper.get('id')}")
         expertise = [e.topic if hasattr(e, 'topic') else str(e) for e in getattr(self, 'expertise', [])]

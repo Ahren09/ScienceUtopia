@@ -2,6 +2,7 @@
 anthropic
 backoff
 openai
+httpx
 # Viz
 matplotlib
 pypdf

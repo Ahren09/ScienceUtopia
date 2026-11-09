@@ -79,6 +79,13 @@ class DirectionStub:
     def __init__(self, topic):
         self.topic = topic
 
+    def to_dict(self):
+        return {"topic": self.topic}
+
+    @classmethod
+    def from_dict(cls, data):
+        return cls(data["topic"])
+
 
 def original_namespace():
     ns = {
@@ -324,7 +331,9 @@ class FullYearScriptedLLM:
         answers = []
         for prompt in prompts:
             phase = seed_ctx[0]
-            if phase == "phase1_directions":
+            if phase == "phase0_resubmit":
+                answer = {"resubmitted_papers": []}
+            elif phase == "phase1_directions":
                 choices = re.findall(
                     r"### Direction \d+: ([^\n]+)\n.*?- Expected Project Duration: (\d+)",
                     prompt,
@@ -627,7 +636,7 @@ def initialize_actual_simulator(cls):
     counts = Counter()
     for i, doc in enumerate(original_cache["documents"]):
         year = doc.metadata["publication_year"]
-        if year in (2016, 2017) and counts[year] < 64:
+        if year in (2016, 2017, 2018) and counts[year] < 64:
             selected.append(i)
             counts[year] += 1
     documents = [original_cache["documents"][i] for i in selected]

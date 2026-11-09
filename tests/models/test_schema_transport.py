@@ -95,6 +95,20 @@ class TestVLLMSchemaTransport(TransportFixture):
         self.assertEqual(captured[0]['finish_reason'], 'length')
         self.assertFalse(captured[0]['success'])
 
+    def test_strict_fulltext_transport_rejects_invalid_review_fields(self):
+        client, wire = self.make_client(WireRecorder(
+            respond=lambda body, index: '{"overall_score": 4, "justification": null}'))
+        client.fail_on_error = True
+        schema = {'type': 'json_schema', 'json_object': {'schema': {
+            'type': 'object',
+            'properties': {'overall_score': {'type': 'number'}, 'justification': {'type': 'string'}},
+            'required': ['overall_score', 'justification']}}}
+        with self.assertRaises(CLIENT_NS['ModelRequestError']):
+            client.generate_batch(['whole paper'], response_format=schema,
+                                  item_ids=['paper:reviewer'], seed_ctx=('phase3_reviews', 3))
+        self.assertEqual(len(wire.payloads), 3)
+        self.assertEqual(client.call_stats['n_failures'], 1)
+
     def test_saved_request_ids_resume_without_new_http_calls(self):
         import tempfile
         with tempfile.TemporaryDirectory() as directory:
@@ -106,7 +120,7 @@ class TestVLLMSchemaTransport(TransportFixture):
                 ['first', 'second'], item_ids=['a', 'b'], seed_ctx=('world', 1))
             captured = []
             resumed = client.generate_batch(
-                ['second'], item_ids=['b'], seed_ctx=('world', 1),
+                ['second (relocated input)'], item_ids=['b'], seed_ctx=('world', 1),
                 on_result=lambda index, value, metadata: captured.append(metadata))
             self.assertEqual(len(wire.payloads), 2)
             self.assertEqual(first[1][0], resumed[0][0])
@@ -115,6 +129,81 @@ class TestVLLMSchemaTransport(TransportFixture):
             self.assertTrue(all(row['cache_replay'] is False for row in rows))
             self.assertTrue(captured[0]['cache_replay'])
             self.assertEqual(len({row['request_id'] for row in rows}), 2)
+
+    def test_full_context_limit_rejects_whole_input_without_http_or_truncation(self):
+        from types import SimpleNamespace
+        client, wire = self.make_client()
+        seen = []
+        def encode(messages, **kwargs):
+            seen.append(messages[-1]['content'])
+            return list(range(90))
+        client.context_tokenizer = SimpleNamespace(apply_chat_template=encode)
+        client.context_limit = 100
+        with self.assertRaisesRegex(CLIENT_NS['ModelRequestError'], 'without truncation'):
+            client.generate_batch(['Introduction ' + 'body ' * 100 + 'Appendix END'],
+                                  max_tokens=20, item_ids=['paper:a'], seed_ctx=('phase3_reviews', 3))
+        self.assertFalse(wire.payloads)
+        self.assertTrue(seen[0].endswith('Appendix END'))
+
+    def test_interrupt_during_initial_submission_cancels_waiters_and_backs_up_replies(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            client, wire = self.make_client()
+            client.max_concurrent_requests = 3
+            client.response_cache_path = Path(directory) / 'replies.jsonl'
+            issued = threading.Event()
+            captured = []
+
+            def respond(body, index):
+                issued.set()
+                client.batch_cancelled.wait(timeout=2)
+                return '{"sentinel":true}'
+
+            wire.respond = respond
+            client.progress_callback = lambda index, result, info: captured.append(
+                (index, len(client.response_cache_path.read_text().splitlines())))
+
+            class InterruptedSubmission(ThreadPoolExecutor):
+                def __init__(self, **kwargs):
+                    super().__init__(max_workers=1)
+                    self.submitted = 0
+
+                def submit(self, function, *args, **kwargs):
+                    self.submitted += 1
+                    if self.submitted == 3:
+                        raise KeyboardInterrupt
+                    future = super().submit(function, *args, **kwargs)
+                    if self.submitted == 1:
+                        if not issued.wait(timeout=2):
+                            raise AssertionError('First HTTP request did not start')
+                    return future
+
+            with patch.dict(CLIENT_NS, {'ThreadPoolExecutor': InterruptedSubmission}):
+                with self.assertRaises(KeyboardInterrupt):
+                    client.generate_batch(['issued', 'queued', 'not submitted'],
+                                          item_ids=['a', 'b', 'c'], seed_ctx=('interrupt',))
+            self.assertTrue(client.batch_cancelled.is_set())
+            self.assertEqual(len(wire.payloads), 1)
+            self.assertEqual(captured, [(0, 1)])
+            client.generate_batch(['issued'], item_ids=['a'], seed_ctx=('interrupt',))
+            self.assertEqual(len(wire.payloads), 1)
+
+    def test_partial_reply_tail_is_preserved_and_completed_ids_still_replay(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            client, wire = self.make_client()
+            cache = Path(directory) / 'replies.jsonl'
+            client.response_cache_path = cache
+            client.generate_batch(['saved'], item_ids=['paper:a'], seed_ctx=('year', 3))
+            row = cache.read_bytes()
+            with cache.open('ab') as stream:
+                stream.write(b'{"request_id":')
+            # Constructor reads exactly the completed prefix, preserving the torn tail.
+            with patch.dict(CLIENT_NS, {'OpenAI': lambda **kwargs: client.client}):
+                restored = Client(client.model_name, response_cache_path=cache)
+            self.assertEqual(cache.read_bytes(), row)
+            self.assertEqual(cache.with_suffix('.partial').read_bytes(), b'{"request_id":')
+            self.assertEqual(len(restored.saved_responses), 1)
 
     def test_item_id_seeds_survive_reordering_and_callbacks_capture_new_replies(self):
         first, first_wire = self.make_client()
@@ -403,7 +492,12 @@ class TestBedrockBatchTransport(TransportFixture):
         recorder = recorder or WireRecorder()
         http = httpx.Client(transport=httpx.MockTransport(recorder.handle))
         self.addCleanup(http.close)
-        with patch.dict(CLIENT_NS, {'OpenAI': lambda **kw: OpenAI(http_client=http, **kw)}):
+        def factory(**kwargs):
+            configured_http = kwargs.pop('http_client', None)
+            if configured_http is not None:
+                configured_http.close()
+            return OpenAI(http_client=http, **kwargs)
+        with patch.dict(CLIENT_NS, {'OpenAI': factory}):
             with patch.dict(os.environ, {'AWS_BEARER_TOKEN_BEDROCK': 'fixture-key'}):
                 client = CLIENT_NS['BedrockModel'](
                     'openai.gpt-5.6-luna', base_url='http://schema-fixture.invalid/openai/v1',
@@ -687,6 +781,22 @@ class TestBedrockBatchTransport(TransportFixture):
             with self.assertRaises(CLIENT_NS['ModelRequestError']):
                 client.wait_for_quota(payload, 'ranking')
 
+    def test_backup_idle_time_does_not_accumulate_a_minute_of_burst_credit(self):
+        client, _ = self.make_bedrock()
+        client.token_rates = [0, 6000]
+        client.token_balances = [0, 0]
+        client.output_estimates['ranking'] = 100
+        client.quota_time = 0
+        clock = [300.0]
+        def sleep(seconds):
+            clock[0] += seconds
+        with patch.object(CLIENT_NS['time'], 'monotonic', lambda: clock[0]), \
+                patch.object(CLIENT_NS['time'], 'sleep', sleep):
+            payload = {'messages': []}
+            for _ in range(4):
+                client.wait_for_quota(payload, 'ranking')
+        self.assertEqual(clock[0], 303.0)
+
     def test_quota_failure_drains_and_preserves_other_issued_reply(self):
         import tempfile
 
@@ -696,6 +806,9 @@ class TestBedrockBatchTransport(TransportFixture):
             client, wire = self.make_bedrock(cache=cache)
             create = client.client.chat.completions.create
             barrier = threading.Barrier(2)
+            backed_up = []
+            client.progress_callback = lambda index, result, info: backed_up.append(
+                (index, info['success']))
             def respond(**payload):
                 barrier.wait(timeout=5)
                 if payload['messages'][-1]['content'].endswith('failure'):
@@ -711,6 +824,7 @@ class TestBedrockBatchTransport(TransportFixture):
             rows = [json.loads(line) for line in cache.read_text().splitlines()]
             self.assertEqual(len(rows), 1)
             self.assertTrue(rows[0]['complete'])
+            self.assertIn((1, True), backed_up)
             resumed, resumed_wire = self.make_bedrock(cache=cache)
             resumed.generate_batch(['success'], item_ids=['keep'], seed_ctx=('drain',))
             self.assertEqual(len(wire.payloads), 1)

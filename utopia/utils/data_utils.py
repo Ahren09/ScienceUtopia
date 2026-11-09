@@ -92,7 +92,14 @@ def atomic_open(
     try:
         with temporary.open(mode) as stream:
             yield stream
+            stream.flush()
+            os.fsync(stream.fileno())
         os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
         published = True
     finally:
         if (published or cleanup_on_error) and temporary.exists():

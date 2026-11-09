@@ -26,6 +26,7 @@ import sys
 import threading
 import time
 import unittest
+from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 from enum import Enum
@@ -94,7 +95,7 @@ def client_definitions():
         "logger": logging.getLogger("schema-transport-test"),
         "ThreadPoolExecutor": ThreadPoolExecutor,
         "as_completed": as_completed,
-        "tqdm": lambda iterable, **kwargs: iterable,
+        "tqdm": tqdm,
     }
     compile_nodes(nodes, ns, path)
     return ns
@@ -237,11 +238,15 @@ class WireRecorder:
 
 class TransportFixture(unittest.TestCase):
     def setUp(self):
-        replacement = patch.dict(
-            sys.modules, {"utopia.utils.seeding": SEED_MODULE}
-        )
-        replacement.start()
-        self.addCleanup(replacement.stop)
+        name = "utopia.utils.seeding"
+        previous = sys.modules.get(name)
+        sys.modules[name] = SEED_MODULE
+        def restore_seed_module():
+            if previous is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
+        self.addCleanup(restore_seed_module)
 
     def make_client(self, recorder=None, *, thinking=True, seed=42):
         recorder = recorder or WireRecorder()
@@ -251,6 +256,9 @@ class TransportFixture(unittest.TestCase):
         def factory(**kwargs):
             # Exercise the original client's initialization and /models request
             # while fixing the SDK transport to an in-memory handler.
+            configured_http = kwargs.pop("http_client", None)
+            if configured_http is not None:
+                configured_http.close()
             return OpenAI(http_client=http, **kwargs)
 
         with patch.dict(CLIENT_NS, {"OpenAI": factory}):

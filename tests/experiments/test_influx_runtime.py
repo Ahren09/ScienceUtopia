@@ -26,6 +26,7 @@ import sys
 import tempfile
 import types
 import unittest
+from collections import defaultdict
 from pathlib import Path
 from unittest import mock
 
@@ -61,7 +62,7 @@ def population_module():
             self.can_author = False
 
     ns = {
-        'List': list, 'Dict': dict, 'random': random,
+        'List': list, 'Dict': dict, 'random': random, 'defaultdict': defaultdict,
         'SIMULATION_CONFIG': {'exploration_experiment': {'institution_strategy_mix': ['balanced'] * 5}},
         'AVAILABLE_DIRECTIONS': [types.SimpleNamespace(topic=f'topic{i}') for i in range(12)],
         'UniversityResearcher': UniversityResearcher, 'IndustryResearcher': IndustryResearcher,
@@ -412,7 +413,7 @@ class LauncherTests(unittest.TestCase):
             self.assertNotIn('--population_mode', command)  # Preserve legacy default.
             self.assertNotIn('--num_institutions', command)
             self.assertEqual('--disable_resubmission' in command, job['cell'] in 'AB')
-            self.assertEqual('--annual_influx_rate' in command, job['cell'] in 'BD')
+            self.assertEqual('--annual-population-influx' in command, job['cell'] in 'BD')
             self.assertTrue(Path(job['output_dir']).is_relative_to(self.root))
         command = runner.server_cmd(args)
         self.assertIn(runner.REVISION, command)

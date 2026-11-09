@@ -18,6 +18,194 @@ write_json = partial(write_json_atomic, indent=2, allow_nan=False)
 
 ROOT = project_root(__file__)
 
+def latest_native_checkpoint(directory):
+    """Prefer a committed stage cursor; retain annual-checkpoint compatibility."""
+    from utopia.utils.data_utils import read_json
+    directory = Path(directory)
+    latest = directory / 'latest_checkpoint.json'
+    if latest.exists():
+        path = directory / read_json(latest)['path']
+        if not path.is_file():
+            raise ValueError(f'Committed checkpoint is missing: {path}')
+        return str(path)
+    candidates = list(directory.glob('checkpoint_year_*.json*'))
+    candidates = [p for p in candidates if '_stage_' not in p.name and not p.name.endswith('.tmp')]
+    return str(max(candidates, key=lambda p: int(p.name.split('_')[2].split('.')[0]))) if candidates else None
+
+
+def s3_location(uri):
+    from urllib.parse import urlsplit
+    parsed = urlsplit(uri)
+    if parsed.scheme != 's3' or not parsed.netloc:
+        raise ValueError(f'Expected an s3://bucket/prefix location: {uri}')
+    return parsed.netloc, parsed.path.strip('/')
+
+
+def upload_verified(client, path, bucket, key):
+    """Publish and independently read back bytes; no content-hash admission gate."""
+    from boto3.s3.transfer import TransferConfig
+    path = Path(path)
+    client.upload_file(str(path), bucket, key, Config=TransferConfig(max_concurrency=4))
+    remote = client.get_object(Bucket=bucket, Key=key)['Body']
+    try:
+        with path.open('rb') as local:
+            while True:
+                chunk = local.read(8 * 1024 * 1024)
+                if remote.read(len(chunk) or 1) != chunk:
+                    raise IOError(f'S3 readback differs: s3://{bucket}/{key}')
+                if not chunk:
+                    break
+    finally:
+        remote.close()
+    return dict(key=key, bytes=path.stat().st_size)
+
+
+def publish_native_snapshot(simulation):
+    """Upload immutable objects before publishing the checkpoint/reply manifest."""
+    import boto3
+    import tarfile
+    import tempfile
+    import time
+    from utopia.utils.data_utils import atomic_open, read_json
+    args = simulation.args
+    bucket, prefix = s3_location(args.checkpoint_s3_prefix)
+    client = boto3.client('s3')
+    output = Path(simulation.output_dir)
+    inventory_path = output / 's3_inventory.json'
+    inventory = read_json(inventory_path) if inventory_path.exists() else {'files': {}, 'replies': [], 'offset': 0}
+    if inventory.get('destination') != [bucket, prefix]:
+        inventory = {'files': {}, 'replies': [], 'offset': 0}
+    generation = str(time.time_ns())
+    with tempfile.TemporaryDirectory(dir=output, prefix='snapshot-') as temporary:
+        temporary = Path(temporary)
+        # The archive makes the code used to write a checkpoint available on a new host.
+        code = output / 'restore_code.tar.gz'
+        source_files = list((ROOT / 'utopia').rglob('*.py')) + [ROOT / 'requirements.txt', ROOT / 'CLAUDE.md']
+        if not code.exists() or max(p.stat().st_mtime_ns for p in source_files) > code.stat().st_mtime_ns:
+            with atomic_open(code, 'wb') as stream:
+                with tarfile.open(fileobj=stream, mode='w:gz') as archive:
+                    for path in sorted(source_files):
+                        archive.add(path, arcname=str(path.relative_to(ROOT)))
+        files = {'code/restore_code.tar.gz': code,
+                 'checkpoint/' + Path(simulation.latest_checkpoint_path).name: Path(simulation.latest_checkpoint_path)}
+        for path in output.iterdir():
+            if (path.is_file() and path.suffix in ('.json', '.csv', '.jsonl')
+                    and not path.name.startswith(('checkpoint_', 'latest_', 's3_', 'model_replies'))):
+                files['results/' + path.name] = path
+        docs = Path(getattr(args, 'docs_dir', output))
+        if docs != output and docs.exists():
+            for path in docs.iterdir():
+                if path.is_file() and path.suffix in ('.json', '.csv'):
+                    files['docs/' + path.name] = path
+        cache = Path(args.data_cache_dir)
+        if cache.exists():
+            for path in cache.rglob('*'):
+                if path.is_file() and not path.name.endswith(('.tmp', '.lock')):
+                    files['cache/' + str(path.relative_to(cache))] = path
+        if args.fulltext_index:
+            index = Path(args.fulltext_index)
+            stamp = [index.stat().st_size, index.stat().st_mtime_ns]
+            previous = inventory['files'].get('fulltext/index.json', {})
+            if previous.get('stamp') == stamp and inventory.get('fulltext_body'):
+                body = Path(inventory['fulltext_body'])
+                files['fulltext/index.json'] = index
+            else:
+                data = read_json(index)
+                body = index.parent / data['text_file']
+                # A portable index always resolves its text file relative to itself.
+                data['text_file'] = 'texts.utf8'
+                normalized = temporary / 'index.json'
+                write_json(normalized, data)
+                files['fulltext/index.json'] = normalized
+            inventory['fulltext_body'] = str(body)
+            files['fulltext/texts.utf8'] = body
+        entries = {}
+        for logical, path in files.items():
+            stat = path.stat()
+            old = inventory['files'].get(logical)
+            stamp = [stat.st_size, stat.st_mtime_ns]
+            if logical == 'fulltext/index.json':
+                source_stat = Path(args.fulltext_index).stat()
+                stamp = [source_stat.st_size, source_stat.st_mtime_ns]
+            if old and old.get('stamp') == stamp:
+                entry = old
+            else:
+                entry = upload_verified(client, path, bucket, f'{prefix}/objects/{generation}/{logical}')
+                entry['stamp'] = stamp
+            entries[logical] = entry
+        replies = Path(args.log_dir) / 'model_replies.jsonl'
+        offset = inventory['offset']
+        segments = list(inventory['replies'])
+        if replies.exists():
+            chunk_path = temporary / 'replies.jsonl'
+            # Serialize against the existing reply writer; never upload a half record.
+            with simulation.llm.response_write_lock, replies.open('rb') as source:
+                source.seek(offset)
+                with chunk_path.open('wb') as target:
+                    for line in source:
+                        if not line.endswith(b'\n'):
+                            break
+                        json.loads(line)
+                        target.write(line)
+            length = chunk_path.stat().st_size
+            if length:
+                entry = upload_verified(client, chunk_path, bucket,
+                                        f'{prefix}/replies/{generation}/{offset:020d}-{offset + length:020d}.jsonl')
+                segments.append(dict(entry, start=offset, end=offset + length))
+                offset += length
+        manifest = dict(version=1, bucket=bucket, files=entries, replies=segments,
+                        checkpoint='checkpoint/' + Path(simulation.latest_checkpoint_path).name,
+                        experiment_id=getattr(args, 'experiment_id', simulation.experiment_name))
+        manifest_path = temporary / 'manifest.json'
+        write_json(manifest_path, manifest)
+        entry = upload_verified(client, manifest_path, bucket, f'{prefix}/snapshots/{generation}.json')
+        # A reader sees either the previous complete snapshot or this complete one.
+        latest = temporary / 'latest.json'
+        write_json(latest, dict(manifest=entry['key']))
+        upload_verified(client, latest, bucket, f'{prefix}/latest.json')
+        write_json(inventory_path, dict(destination=[bucket, prefix], files=entries,
+                                        replies=segments, offset=offset,
+                                        fulltext_body=inventory.get('fulltext_body')))
+
+
+def restore_native_snapshot(uri, destination):
+    """Restore files and ordered complete reply segments before model construction."""
+    import boto3
+    from utopia.utils.data_utils import atomic_open
+    bucket, key = s3_location(uri)
+    client = boto3.client('s3')
+    key = key if key.endswith('.json') else key + '/latest.json'
+    payload = json.loads(client.get_object(Bucket=bucket, Key=key)['Body'].read())
+    if 'manifest' in payload:
+        payload = json.loads(client.get_object(Bucket=bucket, Key=payload['manifest'])['Body'].read())
+    destination = Path(destination).resolve()
+    destination.mkdir(parents=True, exist_ok=True)
+    for logical, entry in payload['files'].items():
+        target = (destination / logical).resolve()
+        if not target.is_relative_to(destination):
+            raise ValueError(f'Invalid snapshot path: {logical}')
+        with atomic_open(target, 'wb') as stream:
+            client.download_fileobj(bucket, entry['key'], stream)
+            stream.flush()
+            if os.fstat(stream.fileno()).st_size != entry['bytes']:
+                raise IOError(f'Incomplete snapshot object: {logical}')
+    offset = 0
+    with atomic_open(destination / 'model_replies.jsonl', 'wb') as stream:
+        for entry in payload['replies']:
+            if entry['start'] != offset:
+                raise ValueError('Reply snapshot has a gap or duplicate segment')
+            body = client.get_object(Bucket=bucket, Key=entry['key'])['Body']
+            try:
+                while chunk := body.read(8 * 1024 * 1024):
+                    stream.write(chunk)
+            finally:
+                body.close()
+            offset = entry['end']
+            if stream.tell() != offset:
+                raise IOError('Incomplete reply segment')
+    write_json(destination / 'restore_manifest.json', payload)
+    return str(destination / payload['checkpoint'])
+
 
 MODEL = "Qwen/Qwen3-32B"
 

@@ -253,8 +253,16 @@ def serializer_imports(ns, direction):
         module = ModuleType(name)
         module.__dict__.update(values)
         modules[name] = module
-    with patch.dict(sys.modules, modules):
+    previous = {name: sys.modules.get(name) for name in modules}
+    sys.modules.update(modules)
+    try:
         yield
+    finally:
+        for name, original in previous.items():
+            if original is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = original
 
 
 class TestPrimaryAndLegacy(unittest.TestCase):
@@ -630,6 +638,104 @@ class TestActualPrimaryLedger(unittest.TestCase):
     tearDownClass = classmethod(native.restore_actual_simulator)
     make_actual = native.make_actual_simulation
 
+    def make_resume_simulation(self, name):
+        sim, researchers = self.make_actual(name)
+        sim.num_years = sim.args.num_years = 3
+        sim.args.annual_population_influx = 0.2
+        sim.args.initial_funding = 100
+        sim.args.log_resource_ledger = True
+        sim.cost_policy = resolve_cost_policy(sim.args, SIMULATION_CONFIG)
+        sim.resource_ledger = ResourceLedger()
+        return sim
+
+    def test_incomplete_review_set_keeps_phase_entry_checkpoint(self):
+        sim = self.make_resume_simulation("incomplete-reviews")
+        generate = sim.llm.generate_batch
+        def missing_review(prompts, seed_ctx, **kwargs):
+            answers = generate(prompts, seed_ctx, **kwargs)
+            return answers[:-1] if seed_ctx[0] == "phase3_reviews" else answers
+        sim.llm.generate_batch = missing_review
+        with self.assertRaisesRegex(ValueError, "distinct valid reviews"):
+            sim.run_one_round(1)
+        self.assertEqual(sim.resume_cursor, {"year": 1, "next_step": 5})
+        self.assertEqual(sim.yearly_results, [])
+        self.assertTrue(sim.latest_checkpoint_path.endswith("stage_3_running.json.gz"))
+        sim.wandb_logger.finish()
+
+    @unittest.skipUnless(sys.platform == "linux", "SIGKILL migration test runs on the GPU host's CPU")
+    def test_year_three_stage_four_sigkill_and_migration(self):
+        """Kill after decisions, restore the phase entry elsewhere, and compare all science state."""
+        baseline = self.make_resume_simulation("resume-baseline")
+        for year in (1, 2, 3):
+            baseline.run_one_round(year)
+        killed_dir = self.fixture_root / "killed"
+        program = """
+import os, signal, sys
+from tests.funding.test_accounting import TestActualPrimaryLedger
+TestActualPrimaryLedger.setUpClass()
+case = TestActualPrimaryLedger()
+sim = case.make_resume_simulation(sys.argv[1])
+# Emulate a saved run from before page-limited review contexts were introduced.
+del sim.args.review_main_text_pages
+decide = sim.run_phase_4_acceptance_decisions
+def interrupted(year, results):
+    result = decide(year, results)
+    if year == 3:
+        os.kill(os.getpid(), signal.SIGKILL)
+    return result
+sim.run_phase_4_acceptance_decisions = interrupted
+for year in (1, 2, 3):
+    sim.run_one_round(year)
+"""
+        log = self.fixture_root / "killed.log"
+        with log.open("w") as stream:
+            child = subprocess.run([sys.executable, "-c", program, str(killed_dir)],
+                                   cwd=ROOT, stdout=stream, stderr=stream, timeout=240)
+        self.assertEqual(child.returncode, -9, log.read_text()[-8000:])
+        checkpoints = list(killed_dir.rglob("checkpoint_year_3_stage_4_running.json.gz"))
+        self.assertEqual(len(checkpoints), 1)
+        migrated = self.make_resume_simulation("migrated")
+        migrated.args.vllm_url = "http://different-host:8100/v1"
+        migrated.args.batch_size = 1024
+        migrated.args.api_budget_usd = 500
+        migrated.args.input_tokens_per_minute = 500000
+        migrated.args.output_tokens_per_minute = 100000
+        migrated.args.review_main_text_pages = 9
+        migrated.load_checkpoint(path=str(checkpoints[0]))
+        self.assertEqual(migrated.resume_cursor, {"year": 3, "next_step": 6})
+        self.assertEqual(len(migrated.yearly_results), 2)
+        self.assertTrue(any(c.submitted_papers for c in migrated.conference_system.conferences))
+        # A migrated host also rebuilds the lazy encoder on the next paper phase.
+        # That runtime initialization must not advance the world's random streams.
+        from utopia.utils.seeding import capture_rng_state
+        rng_before = capture_rng_state()
+        migrated.prepare_paper_index(3)
+        self.assertEqual(capture_rng_state(), rng_before)
+        migrated.run_one_round(3)
+        self.assertEqual(len(migrated.yearly_results), 3)
+        self.assertTrue(all(call[1][0].startswith("phase5_") for call in migrated.llm.calls))
+        from utopia.utils.data_utils import read_json
+        expected = read_json(baseline.latest_checkpoint_path)
+        actual = read_json(migrated.latest_checkpoint_path)
+
+        def science(value):
+            if isinstance(value, dict):
+                return {key: science(item) for key, item in value.items()
+                        if key not in {"review_time", "submission_time", "decision_time",
+                                       "timestamp", "output_dir"}}
+            if isinstance(value, list):
+                return [science(item) for item in value]
+            return value
+
+        for field in ("ecosystem_data", "conference_system", "citation_tracker",
+                      "agent_tracker", "funding_tracker", "rag", "paper_tracker",
+                      "yearly_results", "industry_funding_system", "submitted_paper_ids",
+                      "influx_history", "resource_ledger", "rng_state"):
+            with self.subTest(field=field):
+                self.assertEqual(science(actual[field]), science(expected[field]))
+        baseline.wandb_logger.finish()
+        migrated.wandb_logger.finish()
+
     def test_two_year_primary_ledger_checkpoint_and_independent_audit(self):
         from utopia.analysis.project_cost import validate_ledger
 
@@ -657,7 +763,7 @@ class TestActualPrimaryLedger(unittest.TestCase):
             founders = {a.id for a in researchers}
             self.assertEqual(len(founders), 12)
             for year in (1, 2):
-                sim.yearly_results.append(sim.run_one_round(year))
+                sim.run_one_round(year)
                 sim.save_checkpoint(year, phase=5)
                 path = Path(sim.output_dir) / f"checkpoint_year_{year}.json"
                 opener = path.open if path.exists() else lambda mode: gzip.open(str(path) + ".gz", mode)
@@ -781,6 +887,10 @@ class TestSubmissionRefactorCompatibility(unittest.TestCase):
                 return {"citations": [0]}
 
             def generate_batch(prompts, seed_ctx, **kwargs):
+                ids = kwargs.pop("item_ids", None)
+                if ids is not None:
+                    self.assertEqual(len(ids), len(prompts))
+                    self.assertEqual(len(set(ids)), len(ids))
                 calls.append((deepcopy(prompts), seed_ctx, deepcopy(kwargs)))
                 attempt = seed_ctx[-1] if len(seed_ctx) == 3 else 0
                 return [(response(seed_ctx[0], attempt, index), []) for index in range(len(prompts))]
@@ -852,6 +962,9 @@ class TestSubmissionRefactorCompatibility(unittest.TestCase):
                 calls = []
 
                 def decisions(prompts, seed_ctx, **kwargs):
+                    ids = kwargs.pop("item_ids", None)
+                    if ids is not None:
+                        self.assertEqual(ids, [agent.id])
                     calls.append((deepcopy(prompts), seed_ctx, deepcopy(kwargs)))
                     entries = [{"arxiv_id": "p0", "conference": "C"},
                                {"arxiv_id": "p0", "conference": "C"},

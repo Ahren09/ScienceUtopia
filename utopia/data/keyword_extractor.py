@@ -127,6 +127,7 @@ JSON:"""
                 prompts, response_format=KEYWORD_RESPONSE_FORMAT, temperature=0.3,
                 desc=f"keywords batch ({len(prompts)} papers, attempt {attempt + 1})",
                 seed_ctx=('keywords', attempt),
+                item_ids=[paper_id for paper_id, _ in pending],
             )
             still_pending = []
             for (paper_id, abstract), (response, _) in zip(pending, batch_results):

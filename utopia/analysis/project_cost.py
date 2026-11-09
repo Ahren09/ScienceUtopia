@@ -27,8 +27,17 @@ PRIMARY_METRICS = ("X3_award_coverage", "P2_resub_review_share")
 
 def scientific_arguments(args):
     transport = {"vllm_url", "output_dir", "log_dir", "checkpoint_dir", "visual_dir",
-                 "docs_dir", "data_cache_dir", "always_rerun", "verbose"}
-    return {key: value for key, value in args.items() if key not in transport}
+                 "docs_dir", "data_cache_dir", "always_rerun", "verbose", "batch_size",
+                 "fulltext_index", "resume_from", "resume_artifacts", "resume_reply_source",
+                 "checkpoint_s3_prefix", "tensor_parallel_size", "gpu_memory_utilization",
+                 "max_model_len", "rag_device", "stop_at_utc", "save_model_replies",
+                 "api_budget_usd", "input_tokens_per_minute", "output_tokens_per_minute",
+                 "wandb", "wandb_mode"}
+    result = {key: value for key, value in args.items() if key not in transport}
+    if 'annual_influx_rate' in result:
+        result.setdefault('annual_population_influx', result.pop('annual_influx_rate'))
+        result.setdefault('population_influx_mode', 'legacy_fixed')
+    return result
 
 
 def validate_job_binding(manifest, checkpoint, job):
