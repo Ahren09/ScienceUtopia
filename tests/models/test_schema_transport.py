@@ -803,28 +803,45 @@ class TestBedrockBatchTransport(TransportFixture):
         import openai
         with tempfile.TemporaryDirectory() as directory:
             cache = Path(directory)/'replies.jsonl'
-            client, wire = self.make_bedrock(cache=cache)
+            client, wire = self.make_bedrock(cache=cache, concurrency=3)
             create = client.client.chat.completions.create
+            reserve = client.wait_for_quota
             barrier = threading.Barrier(2)
+            waiter_started = threading.Event()
+            waiter_cancelled = threading.Event()
             backed_up = []
             client.progress_callback = lambda index, result, info: backed_up.append(
                 (index, info['success']))
+            def reserve_or_wait(payload, phase):
+                if payload['messages'][-1]['content'].endswith('waiting'):
+                    waiter_started.set()
+                    if not client.batch_cancelled.wait(timeout=5):
+                        raise AssertionError('Quota waiter was not cancelled')
+                    waiter_cancelled.set()
+                    raise CLIENT_NS['ModelRequestError']('Batch stopped; completed replies retained')
+                return reserve(payload, phase)
             def respond(**payload):
                 barrier.wait(timeout=5)
                 if payload['messages'][-1]['content'].endswith('failure'):
+                    if not waiter_started.wait(timeout=5):
+                        raise AssertionError('Quota waiter did not start')
                     raise openai.RateLimitError(
                         'output quota', response=httpx.Response(
                             429, request=httpx.Request('POST', 'http://fixture')), body=None)
+                if not waiter_cancelled.wait(timeout=5):
+                    raise AssertionError('Quota waiter did not stop')
                 time.sleep(0.02)
                 return create(**payload)
-            with patch.object(client.client.chat.completions, 'create', side_effect=respond):
-                with self.assertRaises(CLIENT_NS['ModelRequestError']):
-                    client.generate_batch(['failure', 'success'], item_ids=['drop', 'keep'],
+            with patch.object(client, 'wait_for_quota', side_effect=reserve_or_wait), \
+                    patch.object(client.client.chat.completions, 'create', side_effect=respond):
+                with self.assertRaisesRegex(CLIENT_NS['ModelRequestError'], 'output quota'):
+                    client.generate_batch(['failure', 'waiting', 'success'],
+                                          item_ids=['drop', 'wait', 'keep'],
                                           seed_ctx=('drain',))
             rows = [json.loads(line) for line in cache.read_text().splitlines()]
             self.assertEqual(len(rows), 1)
             self.assertTrue(rows[0]['complete'])
-            self.assertIn((1, True), backed_up)
+            self.assertIn((2, True), backed_up)
             resumed, resumed_wire = self.make_bedrock(cache=cache)
             resumed.generate_batch(['success'], item_ids=['keep'], seed_ctx=('drain',))
             self.assertEqual(len(wire.payloads), 1)

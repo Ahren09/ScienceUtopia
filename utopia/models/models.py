@@ -911,7 +911,8 @@ class APIBatchModel(BaseLLM):
                     for future in done:
                         try:
                             index, result, info = future.result()
-                        except Exception:
+                        except (Exception, ModelRequestError, ExperimentTimeLimit):
+                            # Cancelled quota waiters have no response to back up.
                             continue
                         if self.progress_callback is not None:
                             self.progress_callback(index, result, info)
