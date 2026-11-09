@@ -167,6 +167,67 @@ def test_stage_snapshot_reply_segments_and_failed_upload_preserve_latest(tmp_pat
     assert (migrated / 'fulltext/texts.utf8').read_bytes() == body.read_bytes()
 
 
+def test_snapshot_parallel_files_finish_readback_before_latest(tmp_path, monkeypatch):
+    import boto3
+    from utopia.runtime import provenance
+
+    s3 = SnapshotS3()
+    monkeypatch.setattr(boto3, 'client', lambda *a, **k: s3)
+    output = tmp_path / 'original'
+    cache = output / 'cache'
+    cache.mkdir(parents=True)
+    checkpoint = output / 'checkpoint_year_3_stage_4_running.json'
+    checkpoint.write_text('{"year":3,"phase":4,"next_step":6}')
+    (output / 'model_replies.jsonl').write_text('{"request_id":"paper:A"}\n')
+    assets = {'first.txt', 'second.txt'}
+    for name in assets:
+        (cache / name).write_text(name)
+    sim = SimpleNamespace(
+        output_dir=str(output), experiment_name='fixture',
+        latest_checkpoint_path=str(checkpoint),
+        llm=SimpleNamespace(response_write_lock=threading.Lock()),
+        args=SimpleNamespace(checkpoint_s3_prefix='s3://aaron0929/population_influx/parallel',
+                             log_dir=str(output), data_cache_dir=str(cache),
+                             fulltext_index=None, experiment_id='fixture'))
+    barrier = threading.Barrier(2)
+    verified = set()
+    upload = provenance.upload_verified
+
+    def verify_file(client, path, bucket, key):
+        asset = '/cache/' in key
+        if asset:
+            barrier.wait(timeout=3)
+        if key.endswith('/latest.json'):
+            assert verified == assets
+        result = upload(client, path, bucket, key)
+        if asset:
+            verified.add(Path(path).name)
+        return result
+
+    monkeypatch.setattr(provenance, 'upload_verified', verify_file)
+    provenance.publish_native_snapshot(sim)
+    latest_key = ('aaron0929', 'population_influx/parallel/latest.json')
+    latest = s3.objects[latest_key]
+    for name in assets:
+        (cache / name).write_text('changed ' + name)
+    get_object = s3.get_object
+
+    def corrupt_one_readback(Bucket, Key):
+        if Key.endswith('/cache/second.txt'):
+            return {'Body': io.BytesIO(b'corrupt')}
+        return get_object(Bucket=Bucket, Key=Key)
+
+    monkeypatch.setattr(s3, 'get_object', corrupt_one_readback)
+    verified.clear()
+    with pytest.raises(IOError, match='S3 readback differs'):
+        provenance.publish_native_snapshot(sim)
+    assert s3.objects[latest_key] == latest
+    monkeypatch.setattr(s3, 'get_object', get_object)
+    destination = tmp_path / 'another-machine'
+    provenance.restore_native_snapshot('s3://aaron0929/population_influx/parallel', destination)
+    assert all((destination / 'cache' / name).read_text() == name for name in assets)
+
+
 def test_resume_arguments_restore_population_and_allow_runtime_changes(tmp_path):
     from utopia.arguments import parse_arguments
     source = tmp_path / 'old'

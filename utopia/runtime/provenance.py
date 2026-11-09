@@ -63,13 +63,15 @@ def upload_verified(client, path, bucket, key):
 def publish_native_snapshot(simulation):
     """Upload immutable objects before publishing the checkpoint/reply manifest."""
     import boto3
+    from botocore.config import Config
+    from concurrent.futures import ThreadPoolExecutor
     import tarfile
     import tempfile
     import time
     from utopia.utils.data_utils import atomic_open, read_json
     args = simulation.args
     bucket, prefix = s3_location(args.checkpoint_s3_prefix)
-    client = boto3.client('s3')
+    client = boto3.client('s3', config=Config(max_pool_connections=64))
     output = Path(simulation.output_dir)
     inventory_path = output / 's3_inventory.json'
     inventory = read_json(inventory_path) if inventory_path.exists() else {'files': {}, 'replies': [], 'offset': 0}
@@ -119,8 +121,8 @@ def publish_native_snapshot(simulation):
                 files['fulltext/index.json'] = normalized
             inventory['fulltext_body'] = str(body)
             files['fulltext/texts.utf8'] = body
-        entries = {}
-        for logical, path in files.items():
+        def upload_snapshot_file(item):
+            logical, path = item
             stat = path.stat()
             old = inventory['files'].get(logical)
             stamp = [stat.st_size, stat.st_mtime_ns]
@@ -132,7 +134,11 @@ def publish_native_snapshot(simulation):
             else:
                 entry = upload_verified(client, path, bucket, f'{prefix}/objects/{generation}/{logical}')
                 entry['stamp'] = stamp
-            entries[logical] = entry
+            return logical, entry
+
+        # Finish every file's readback before publishing the recovery manifest.
+        with ThreadPoolExecutor(max_workers=16) as executor:
+            entries = dict(executor.map(upload_snapshot_file, files.items()))
         replies = Path(args.log_dir) / 'model_replies.jsonl'
         offset = inventory['offset']
         segments = list(inventory['replies'])
