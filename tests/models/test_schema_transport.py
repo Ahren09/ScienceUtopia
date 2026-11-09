@@ -781,6 +781,35 @@ class TestBedrockBatchTransport(TransportFixture):
             with self.assertRaises(CLIENT_NS['ModelRequestError']):
                 client.wait_for_quota(payload, 'ranking')
 
+    def test_output_reservation_refund_paces_by_actual_tokens_after_long_reply(self):
+        for output_tokens in (7, 1200):
+            with self.subTest(output_tokens=output_tokens):
+                client, wire = self.make_bedrock()
+                client.token_rates = [0, 6000]
+                client.token_balances = [0, 1200]
+                client.output_estimates['ranking'] = 1200
+                client.quota_time = 0
+                clock = [0.0]
+                create = client.client.chat.completions.create
+
+                def respond(**payload):
+                    response = create(**payload)
+                    response.usage.completion_tokens = output_tokens
+                    return response
+
+                def sleep(seconds):
+                    clock[0] += seconds
+
+                with patch.object(CLIENT_NS['time'], 'monotonic', lambda: clock[0]), \
+                        patch.object(CLIENT_NS['time'], 'sleep', sleep), \
+                        patch.object(client.client.chat.completions, 'create', respond):
+                    for position in range(2):
+                        client.create_completion(
+                            model=client.model_name, messages=[], max_completion_tokens=16384,
+                            seed_ctx=('ranking',), item_index=position)
+                self.assertAlmostEqual(clock[0], output_tokens / 100)
+                self.assertEqual(len(wire.payloads), 2)
+
     def test_backup_idle_time_does_not_accumulate_a_minute_of_burst_credit(self):
         client, _ = self.make_bedrock()
         client.token_rates = [0, 6000]

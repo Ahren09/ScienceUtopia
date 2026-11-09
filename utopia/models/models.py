@@ -725,8 +725,11 @@ class APIBatchModel(BaseLLM):
             self.output_estimates[phase] = max(self.output_estimates.get(phase, 0), actual[1])
             for index, rate in enumerate(self.token_rates):
                 if rate:
+                    # Keep unused reservation credit; a long prior reply must
+                    # not make every later short reply wait for that full length.
                     self.token_balances[index] = min(
-                        rate / 60, self.token_balances[index] + reserved[index] - actual[index])
+                        max(rate / 60, reserved[index]),
+                        self.token_balances[index] + reserved[index] - actual[index])
         if cache_path:
             text, finish, _ = self.response_details(response)
             complete = finish == 'stop'
