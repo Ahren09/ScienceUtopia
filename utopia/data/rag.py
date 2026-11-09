@@ -101,12 +101,14 @@ class FullTextCorpus:
             stream.write(response.content)
         return path, url
 
-    def prepare_review_texts(self, paper_ids):
+    def prepare_review_texts(self, paper_ids, paper_titles=None):
         """Download independently; publish the shared text index in input order."""
         if not self.main_text_pages:
             return
         from concurrent.futures import ThreadPoolExecutor
         ids = sorted({re.sub(r'v\d+$', '', str(pid).split('/abs/')[-1]) for pid in paper_ids})
+        titles = {re.sub(r'v\d+$', '', str(pid).split('/abs/')[-1]): title
+                  for pid, title in (paper_titles or {}).items()}
         policy = f'first_{self.main_text_pages}_pages_no_appendix'
         pending = [pid for pid in ids
                    if policy not in self.supplement.get('review_texts', {}).get(pid, {})]
@@ -115,11 +117,11 @@ class FullTextCorpus:
             sources = executor.map(self.download_source, pending)
             for pid, source in tqdm(zip(pending, sources), total=len(pending),
                                     desc='Preparing review pages'):
-                self.review_text(pid, source=source)
+                self.review_text(pid, source=source, paper_title=titles.get(pid))
         finally:
             executor.shutdown(wait=True, cancel_futures=True)
 
-    def extract_main_pages(self, pdf):
+    def extract_main_pages(self, pdf, paper_title=None):
         """Take physical pages from the start, stopping at an appendix heading."""
         parts = []
         seen_references = False
@@ -127,6 +129,25 @@ class FullTextCorpus:
         for page_number in range(min(self.main_text_pages, len(pdf))):
             page = pdf[page_number]
             lines = page.get_text(sort=True).splitlines()
+            title_lines = set()
+            if page_number == 0 and paper_title:
+                # A selected document's title can itself start with "Appendix"
+                # or "Supplementary Material". Only its first-page title is
+                # exempt; identically named sections later still end the text.
+                title = re.sub(r'\W+', '', paper_title.casefold())
+                for start in range(min(8, len(lines))):
+                    if not lines[start].strip():
+                        continue
+                    candidate = ''
+                    for end in range(start, min(start + 8, len(lines))):
+                        candidate += re.sub(r'\W+', '', lines[end].casefold())
+                        if not title.startswith(candidate):
+                            break
+                        if candidate == title:
+                            title_lines.update(range(start, end + 1))
+                            break
+                    if title_lines:
+                        break
             contents_page = any(re.fullmatch(r'(?:table of )?contents', line.strip(), re.I)
                                 for line in lines)
             styles = {}
@@ -142,7 +163,7 @@ class FullTextCorpus:
                         sizes[round(span['size'], 1)] += len(span['text'])
             body_size = sizes.most_common(1)[0][0] if sizes else 0
             kept = []
-            for line in lines:
+            for line_number, line in enumerate(lines):
                 label = line.strip()
                 size, bold = styles.get(label, (body_size, False))
                 heading_style = bold or size > body_size + 0.5
@@ -159,7 +180,8 @@ class FullTextCorpus:
                                      r'presents?|includes?|is|are|can)\b', label, re.I))
                 lettered_appendix = (seen_references and heading_style
                                      and bool(re.match(r'^[A-Z](?:[.]\s+|\s+)\S', label)))
-                if (not contents_page and not is_contents_entry
+                if (line_number not in title_lines
+                        and not contents_page and not is_contents_entry
                         and ((explicit_appendix and (heading_style or short_heading))
                              or lettered_appendix)):
                     appendix_page = page_number + 1
@@ -174,7 +196,7 @@ class FullTextCorpus:
                 break
         return '\n\n'.join(parts), len(parts), appendix_page
 
-    def review_text(self, paper_id, source=None):
+    def review_text(self, paper_id, source=None, paper_title=None):
         import io
         import pymupdf
         from utopia.utils.data_utils import atomic_open, write_json_atomic
@@ -199,7 +221,7 @@ class FullTextCorpus:
                         stream.write(buffer.getvalue())
                 path = rendered
             with pymupdf.open(path) as pdf:
-                text, pages, appendix = self.extract_main_pages(pdf)
+                text, pages, appendix = self.extract_main_pages(pdf, paper_title=paper_title)
                 source_pages = len(pdf)
             content = text.encode('utf-8')
             if not content.strip():
@@ -213,6 +235,8 @@ class FullTextCorpus:
                                    source_pages=source_pages, appendix_start_page=appendix,
                                    max_pages=self.main_text_pages, exclude_appendices=True,
                                    page_source=page_source, source_url=url)
+            if paper_title:
+                entries[policy]['paper_title'] = paper_title
             write_json_atomic(self.cache_dir / 'index.json', self.supplement, ensure_ascii=True)
         entry = entries[policy]
         with (self.cache_dir / self.supplement['text_file']).open('rb') as stream:

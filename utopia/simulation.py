@@ -2889,9 +2889,11 @@ class Simulation:
         logger.info(f"Year {year} Phase 3: Conducting peer reviews...")
 
         if getattr(self, 'fulltext_corpus', None) is not None:
-            self.fulltext_corpus.prepare_review_texts([
-                paper['id'] for conference in self.conference_system.conferences
-                for paper in conference.submitted_papers])
+            review_papers = [paper for conference in self.conference_system.conferences
+                             for paper in conference.submitted_papers]
+            self.fulltext_corpus.prepare_review_texts(
+                [paper['id'] for paper in review_papers],
+                paper_titles={paper['id']: paper.get('title', '') for paper in review_papers})
         self.conference_system.start_all_review_processes()
 
         # Map conference ids to dict of papers

@@ -375,6 +375,62 @@ def test_review_handles_long_pdf_spacing_without_losing_main_text(tmp_path):
     assert pages == appendix_page == 1
 
 
+@pytest.mark.parametrize("appendix_page", [1, 3, None])
+def test_review_keeps_submitted_document_title_and_excludes_internal_appendices(
+        tmp_path, monkeypatch, appendix_page):
+    import pymupdf
+    from utopia.data.rag import FullTextCorpus
+    title = "Supplementary Material for the Information Sciences Paper: An Experimental Study"
+    index = tmp_path / "index.json"
+    index.write_text(json.dumps({"text_file": "texts.utf8", "papers": {}}))
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    with pymupdf.open() as pdf:
+        for number in range(1, 12):
+            page = pdf.new_page()
+            if number == 1:
+                page.insert_text((50, 50), "Supplementary Material for the", fontsize=14,
+                                 fontname="hebo")
+                page.insert_text((50, 70), "Information Sciences Paper: An Experimental Study",
+                                 fontsize=14, fontname="hebo")
+                page.insert_text((50, 110), "A. Author, Example University", fontsize=11)
+                page.insert_text((50, 140), "1. Introduction", fontsize=12, fontname="hebo")
+            page.insert_text((50, 180), f"PAGE_{number}_MAIN", fontsize=11)
+            if number == appendix_page:
+                page.insert_text((50, 210), "References", fontsize=12, fontname="hebo")
+                page.insert_text((50, 235), "A. Author, Reference within the main text.", fontsize=11)
+                page.insert_text((50, 270), "Supplementary Material for the", fontsize=14,
+                                 fontname="hebo")
+                page.insert_text((50, 290), "Information Sciences Paper: An Experimental Study",
+                                 fontsize=14, fontname="hebo")
+                page.insert_text((50, 330), "APPENDIX_SECRET", fontsize=11)
+        pdf.save(cache / "1702.04501.pdf")
+    corpus = FullTextCorpus(index, cache_dir=cache, main_text_pages=9)
+    # Without submission metadata, the original failure is reproducible.
+    with pytest.raises(ValueError, match="No main text"):
+        corpus.text("1702.04501")
+    corpus.prepare_review_texts(["https://arxiv.org/abs/1702.04501v1"],
+                               paper_titles={"https://arxiv.org/abs/1702.04501v1": title})
+    text = corpus.text("1702.04501")
+    assert "1. Introduction" in text
+    assert "PAGE_1_MAIN" in text
+    assert "APPENDIX_SECRET" not in text
+    assert "PAGE_10_MAIN" not in text
+    if appendix_page:
+        assert "Reference within the main text" in text
+        assert f"PAGE_{appendix_page + 1}_MAIN" not in text
+    else:
+        assert "PAGE_9_MAIN" in text
+    entry = corpus.supplement["review_texts"]["1702.04501"]["first_9_pages_no_appendix"]
+    assert entry["paper_title"] == title
+    assert entry["appendix_start_page"] == appendix_page
+    assert entry["exclude_appendices"] is True
+    resumed = FullTextCorpus(index, cache_dir=cache, main_text_pages=9)
+    monkeypatch.setattr(resumed, "download_source",
+                        lambda pid: pytest.fail("Reuse the prepared document by ID"))
+    assert resumed.text("1702.04501") == text
+
+
 def test_conference_checkpoint_retains_submissions_reviews_and_decisions():
     from utopia.agents.conference import Conference, ConferenceSystem
     conference = Conference(conference_id="C", name="Conference", topics=["cs.LG"])
