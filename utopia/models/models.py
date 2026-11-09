@@ -607,12 +607,12 @@ class APIBatchModel(BaseLLM):
                             row = json.loads(line)
                             if not row.get('cache_replay', False):
                                 self.cost_usd += self.response_cost(row['response'].get('usage') or {})
-                            if row.get('complete'):
-                                self.saved_responses.setdefault(row['request_id'], []).append(row)
                                 context = json.loads(row['request_id'])[0]
                                 phase = str(context[0]) if context else 'default'
                                 output = (row['response'].get('usage') or {}).get('completion_tokens', 0)
-                                self.output_estimates[phase] = max(self.output_estimates.get(phase, 0), output)
+                                self.update_output_estimate(phase, output)
+                            if row.get('complete'):
+                                self.saved_responses.setdefault(row['request_id'], []).append(row)
                         valid_end = stream.tell()
         from utopia.models.request_audit import active_audit_for
         self.request_audit = active_audit_for(model_name)
@@ -639,6 +639,13 @@ class APIBatchModel(BaseLLM):
 
     def response_cost(self, usage):
         return 0.0
+
+    def update_output_estimate(self, phase, output_tokens):
+        """Adapt reservations to recent replies; actual usage is charged separately."""
+        previous = self.output_estimates.get(phase, output_tokens)
+        # A single length-limited reply must not serialize every later short
+        # request by reserving the historical maximum for the whole phase.
+        self.output_estimates[phase] = (7 * previous + output_tokens) / 8
 
     def find_saved_response(self, request_id, payload):
         """Stable task IDs survive changes to paths, concurrency and transport."""
@@ -722,7 +729,7 @@ class APIBatchModel(BaseLLM):
         with self.response_write_lock:
             self.pending_cost_usd -= reserved_cost
             self.cost_usd += self.response_cost(response.usage.model_dump() if response.usage else {})
-            self.output_estimates[phase] = max(self.output_estimates.get(phase, 0), actual[1])
+            self.update_output_estimate(phase, actual[1])
             for index, rate in enumerate(self.token_rates):
                 if rate:
                     # Keep unused reservation credit; a long prior reply must
@@ -1002,11 +1009,14 @@ class BedrockModel(APIBatchModel):
                 schema=openai_schema(source['schema'])))
         payload = dict(model=self.model_name, messages=messages, temperature=temperature,
                        max_completion_tokens=max_tokens, reasoning_effort='none', response_format=fmt)
-        if seed_ctx and seed_ctx[0] in ('phase3_reviews', 'keywords'):
+        if seed_ctx and seed_ctx[0] in ('phase3_reviews', 'keywords', 'phase5_funding_apps'):
             properties = fmt.get('json_schema', {}).get('schema', {}).get('properties', {})
-            text_schema = (properties.get('justification', {})
-                           if seed_ctx[0] == 'phase3_reviews'
-                           else properties.get('keywords', {}).get('items', {}))
+            if seed_ctx[0] == 'phase3_reviews':
+                text_schema = properties.get('justification', {})
+            elif seed_ctx[0] == 'keywords':
+                text_schema = properties.get('keywords', {}).get('items', {})
+            else:
+                text_schema = properties.get('research_proposal', {})
             saved_ids = [json.dumps([seed_ctx, item_index, number], ensure_ascii=True,
                                     separators=(',', ':')) for number in range(3)]
             # Keep saved replies reusable, including those from the older schema.

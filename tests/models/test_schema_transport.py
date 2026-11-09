@@ -569,6 +569,49 @@ class TestBedrockBatchTransport(TransportFixture):
             self.assertTrue(body['response_format']['json_schema']['strict'])
             self.assertEqual(body['response_format']['json_schema']['schema']['additionalProperties'], False)
 
+    def test_funding_escape_pattern_preserves_proposal_scope_and_saved_ids(self):
+        import tempfile
+        funding_format = next(value for value in FORMATS.values()
+                              if value['json_object']['name'] == 'funding_application')
+        original = deepcopy(funding_format)
+        reply = {'research_proposal': 'First line.\nSecond line\twith Unicode α.',
+                 'submit': True, 'relevant_projects': [0, 2]}
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / 'replies.jsonl'
+            client, wire = self.make_bedrock(
+                WireRecorder(lambda body, index: json.dumps(reply)), cache=cache)
+            client.completion_token_floor = 16384
+            prompt = 'Complete project evidence ' * 1000 + 'FINAL PROJECT'
+            context = ('phase5_funding_apps', 2, 0)
+            client.generate_batch([prompt], item_ids=['applicant:NSF_THEORY'],
+                                  response_format=funding_format, seed_ctx=context)
+            payload = wire.payloads[0]
+            schema = payload['response_format']['json_schema']['schema']
+            self.assertEqual(payload['messages'][-1]['content'],
+                             IMPORTANT_NOTES + '\n\n' + prompt)
+            self.assertEqual(payload['max_completion_tokens'], 16384)
+            self.assertEqual(funding_format, original)
+            jsonschema.validate(reply, schema)
+            with self.assertRaises(jsonschema.ValidationError):
+                jsonschema.validate({**reply, 'research_proposal': 'Proposal \x1b[0m' * 5},
+                                    schema)
+            self.assertEqual(schema['properties']['relevant_projects']['items']['type'],
+                             'integer')
+            self.assertEqual(schema['properties']['submit']['type'], 'boolean')
+
+            row = json.loads(cache.read_text())
+            row['payload']['response_format']['json_schema']['schema']['properties'][
+                'research_proposal'].pop('pattern')
+            row['response']['choices'][0]['message']['content'] = json.dumps(
+                {**reply, 'research_proposal': 'Previously saved \x1b[0m proposal'})
+            cache.write_text(json.dumps(row) + '\n')
+            resumed, resumed_wire = self.make_bedrock(cache=cache)
+            result = resumed.generate_batch(
+                [prompt], item_ids=['applicant:NSF_THEORY'],
+                response_format=funding_format, seed_ctx=context)
+            self.assertEqual(result[0][0]['research_proposal'], 'Previously saved \x1b[0m proposal')
+            self.assertFalse(resumed_wire.payloads)
+
     def test_review_escape_pattern_preserves_inputs_and_legacy_cached_replies(self):
         import tempfile
         review_format = {'type': 'json_schema', 'json_object': {'schema': {
@@ -782,7 +825,7 @@ class TestBedrockBatchTransport(TransportFixture):
                 client.wait_for_quota(payload, 'ranking')
 
     def test_output_reservation_refund_paces_by_actual_tokens_after_long_reply(self):
-        for output_tokens in (7, 1200):
+        for output_tokens in (7, 1200, 2400):
             with self.subTest(output_tokens=output_tokens):
                 client, wire = self.make_bedrock()
                 client.token_rates = [0, 6000]
@@ -802,6 +845,7 @@ class TestBedrockBatchTransport(TransportFixture):
 
                 with patch.object(CLIENT_NS['time'], 'monotonic', lambda: clock[0]), \
                         patch.object(CLIENT_NS['time'], 'sleep', sleep), \
+                        patch.object(client, 'update_output_estimate'), \
                         patch.object(client.client.chat.completions, 'create', respond):
                     for position in range(2):
                         client.create_completion(
@@ -809,6 +853,70 @@ class TestBedrockBatchTransport(TransportFixture):
                             seed_ctx=('ranking',), item_index=position)
                 self.assertAlmostEqual(clock[0], output_tokens / 100)
                 self.assertEqual(len(wire.payloads), 2)
+
+    def test_long_output_outlier_does_not_serialize_later_short_requests(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / 'replies.jsonl'
+            client, wire = self.make_bedrock(cache=cache)
+            client.completion_token_floor = 16384
+            create = client.client.chat.completions.create
+
+            def long_first_reply(**payload):
+                response = create(**payload)
+                if len(wire.payloads) == 1:
+                    response.usage.completion_tokens = 16384
+                    response.choices[0].finish_reason = 'length'
+                return response
+
+            context = ('phase5_funding_apps', 2, 0)
+            with patch.object(client.client.chat.completions, 'create', long_first_reply):
+                client.generate_batch(['proposal'], item_ids=['outlier'], seed_ctx=context)
+            client.generate_batch(
+                ['short'] * 40, item_ids=[f'short-{i}' for i in range(40)],
+                seed_ctx=context)
+            rows = [json.loads(line) for line in cache.read_text().splitlines()]
+            self.assertFalse(rows[0]['complete'])
+            self.assertTrue(rows[1]['complete'])
+            self.assertEqual(json.loads(rows[0]['request_id'])[-1], 0)
+            self.assertEqual(json.loads(rows[1]['request_id'])[-1], 1)
+            self.assertTrue(all(row['payload']['max_completion_tokens'] == 16384
+                                for row in rows))
+            self.assertAlmostEqual(
+                client.cost_usd,
+                sum(client.response_cost(row['response']['usage']) for row in rows))
+
+            resumed, resumed_wire = self.make_bedrock(cache=cache)
+            resumed.completion_token_floor = 16384
+            self.assertAlmostEqual(resumed.cost_usd, client.cost_usd)
+            self.assertAlmostEqual(resumed.output_estimates[context[0]],
+                                   client.output_estimates[context[0]])
+            resumed.generate_batch(['proposal'], item_ids=['outlier'], seed_ctx=context)
+            self.assertFalse(resumed_wire.payloads)
+
+            for model in (client, resumed):
+                with self.subTest(resumed=model is resumed):
+                    model.token_rates = [0, 100000]
+                    model.token_balances = [0, 100000 / 60]
+                    model.quota_time = time.monotonic()
+                    barrier = threading.Barrier(2)
+                    create = model.client.chat.completions.create
+
+                    def overlapping_replies(**payload):
+                        try:
+                            barrier.wait(timeout=2)
+                        except threading.BrokenBarrierError:
+                            model.batch_cancelled.set()
+                            raise AssertionError('Short requests were serialized after an outlier')
+                        return create(**payload)
+
+                    with patch.object(model.client.chat.completions, 'create',
+                                      overlapping_replies):
+                        result = model.generate_batch(
+                            ['next-a', 'next-b'], item_ids=['next-a', 'next-b'],
+                            seed_ctx=context)
+                    self.assertEqual(len(result), 2)
+                    self.assertEqual(model.token_rates, [0, 100000])
 
     def test_backup_idle_time_does_not_accumulate_a_minute_of_burst_credit(self):
         client, _ = self.make_bedrock()
