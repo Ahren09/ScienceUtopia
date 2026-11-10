@@ -934,6 +934,88 @@ class TestBedrockBatchTransport(TransportFixture):
                 client.wait_for_quota(payload, 'ranking')
         self.assertEqual(clock[0], 303.0)
 
+    def test_tpm_429_cools_down_then_reuses_the_valid_stable_request(self):
+        import tempfile
+        from types import SimpleNamespace
+        import openai
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / 'replies.jsonl'
+            client, wire = self.make_bedrock(cache=cache, concurrency=1)
+            client.token_rates = [600000, 0]
+            client.token_balances = [10000, 0]
+            client.input_tokenizer = SimpleNamespace(encode=lambda *a, **kw: [0] * 56)
+            client.api_budget_usd = 5000
+            clock = [time.monotonic()]
+            client.quota_time = clock[0]
+            issued = []
+            create = client.client.chat.completions.create
+
+            def sleep(seconds):
+                clock[0] += seconds
+
+            def respond(**payload):
+                issued.append(clock[0])
+                if len(issued) == 1:
+                    raise openai.RateLimitError(
+                        'InputTokens quota exceeded', response=httpx.Response(
+                            429, request=httpx.Request('POST', 'http://fixture')), body=None)
+                return create(**payload)
+
+            with patch.object(CLIENT_NS['time'], 'monotonic', lambda: clock[0]), patch.object(
+                    CLIENT_NS['time'], 'sleep', sleep), patch.object(
+                    client.client.chat.completions, 'create', side_effect=respond):
+                result = client.generate_batch(['retry'], item_ids=['stable'], seed_ctx=('tpm',))
+                cost = client.cost_usd
+                replay = client.generate_batch(['retry'], item_ids=['stable'], seed_ctx=('tpm',))
+            self.assertTrue(result[0][0]['sentinel'])
+            self.assertEqual(replay[0][0], result[0][0])
+            self.assertEqual(len(issued), 2)
+            self.assertEqual(issued[1] - issued[0], 60.0)
+            self.assertEqual(len(wire.payloads), 1)
+            self.assertGreater(cost, 0)
+            self.assertEqual(client.cost_usd, cost)
+            self.assertEqual(client.pending_cost_usd, 0)
+            rows = [json.loads(line) for line in cache.read_text().splitlines()]
+            self.assertEqual(len(rows), 1)
+            self.assertTrue(rows[0]['complete'])
+            self.assertEqual(json.loads(rows[0]['request_id']), [['tpm', 'stable'], 0, 1])
+
+    def test_tpm_429_retries_stay_bounded_and_cooldown_honors_cutoff(self):
+        from types import SimpleNamespace
+        import openai
+
+        client, wire = self.make_bedrock(concurrency=1)
+        client.token_rates = [600000, 0]
+        client.token_balances = [10000, 0]
+        client.input_tokenizer = SimpleNamespace(encode=lambda *a, **kw: [0] * 56)
+        clock = [time.monotonic()]
+        client.quota_time = clock[0]
+        issued = []
+
+        def sleep(seconds):
+            clock[0] += seconds
+
+        def respond(**payload):
+            issued.append(clock[0])
+            raise openai.RateLimitError(
+                'InputTokens quota exceeded', response=httpx.Response(
+                    429, request=httpx.Request('POST', 'http://fixture')), body=None)
+
+        with patch.object(CLIENT_NS['time'], 'monotonic', lambda: clock[0]), patch.object(
+                CLIENT_NS['time'], 'sleep', sleep), patch.object(
+                client.client.chat.completions, 'create', side_effect=respond):
+            with self.assertRaisesRegex(CLIENT_NS['ModelRequestError'], 'InputTokens'):
+                client.generate_batch(['retry'], item_ids=['stable'], seed_ctx=('tpm',))
+            self.assertEqual([x - issued[0] for x in issued], [0, 60, 120])
+            self.assertEqual(client.pending_cost_usd, 0)
+            self.assertFalse(wire.payloads)
+            client.batch_cancelled.clear()
+            client.stop_at_timestamp = time.time() - 1
+            with self.assertRaises(CLIENT_NS['ExperimentTimeLimit']):
+                client.wait_for_quota({'messages': []}, 'another-phase')
+            self.assertEqual(len(issued), 3)
+
     def test_quota_failure_drains_and_preserves_other_issued_reply(self):
         import tempfile
 

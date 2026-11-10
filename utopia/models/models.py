@@ -581,6 +581,7 @@ class APIBatchModel(BaseLLM):
             self.input_tokenizer = tiktoken.get_encoding('o200k_base')
         self.token_balances = [0.0, 0.0]
         self.quota_time = time.monotonic()
+        self.quota_retry_at = 0.0
         self.output_estimates = {}
         self.batch_cancelled = threading.Event()
         self.api_budget_usd = api_budget_usd
@@ -667,10 +668,13 @@ class APIBatchModel(BaseLLM):
         input_tokens = (len(self.input_tokenizer.encode(content, disallowed_special=())) + 64
                         if self.token_rates[0] or self.api_budget_usd else 0)
         while not self.batch_cancelled.is_set():
+            cutoff = getattr(self, 'stop_at_timestamp', None)
+            if cutoff is not None and time.time() >= cutoff:
+                raise ExperimentTimeLimit('Campaign compute cutoff reached; saved replies retained')
             with self.response_write_lock:
                 now = time.monotonic()
                 reserved = [input_tokens, self.output_estimates.get(phase, 1024)]
-                delay = 0.0
+                delay = max(0.0, self.quota_retry_at - now)
                 for index, rate in enumerate(self.token_rates):
                     if rate:
                         self.token_balances[index] = min(
@@ -721,6 +725,10 @@ class APIBatchModel(BaseLLM):
         except Exception as error:
             with self.response_write_lock:
                 self.pending_cost_usd -= reserved_cost
+                if getattr(error, 'status_code', None) == 429 and any(self.token_rates):
+                    # Provider TPM windows can differ from the local token bucket.
+                    # Cool down all waiting calls before the existing bounded retry.
+                    self.quota_retry_at = max(self.quota_retry_at, time.monotonic() + 60.0)
             if getattr(error, 'status_code', None) in (400, 401, 403, 404):
                 self.batch_cancelled.set()
                 raise ModelRequestError(f'Model access failed: {error}') from error
@@ -865,9 +873,11 @@ class APIBatchModel(BaseLLM):
                     retries += 1
                     error_message = str(error)
                     logger.warning(f'Prompt {index} attempt {attempt + 1}/3 failed: {error}')
-                    # Drain the batch before the caller selects a lower concurrency.
-                    if self.fail_on_error and (getattr(error, 'status_code', None) == 429
-                                              or type(error).__name__ == 'APITimeoutError'):
+                    # Token-paced requests retry after the shared quota cooldown.
+                    # Other saturation or timeout failures still drain the batch.
+                    if self.fail_on_error and ((getattr(error, 'status_code', None) == 429
+                                                and not any(self.token_rates))
+                                               or type(error).__name__ == 'APITimeoutError'):
                         break
             return index, (None, messages), dict(success=False, n_retries=retries,
                 prompt_tokens=tokens[0], completion_tokens=tokens[1], cache_replay=cache_replay,
