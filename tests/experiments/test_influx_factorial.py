@@ -452,3 +452,88 @@ def test_experiment_name_whitelist_accepts_influx():
         # replicate the utopia/simulation.py whitelist check
         assert name.startswith(('default', 'acl-acceptance-rates',
                                 'acl_schedule_smoke', 'influx'))
+
+
+def test_parallel_review_preparation_preserves_order_bytes_and_reuses_ids(tmp_path, monkeypatch):
+    import shutil
+    import pymupdf
+    from utopia.data.rag import FullTextCorpus
+    from utopia.utils import data_utils
+
+    index = tmp_path / 'base.json'
+    index.write_text(json.dumps({'text_file': 'base.txt', 'papers': {}}))
+    serial_cache, parallel_cache = tmp_path / 'serial', tmp_path / 'parallel'
+    serial_cache.mkdir()
+    with pymupdf.open() as pdf:
+        for number in range(1, 12):
+            page = pdf.new_page()
+            page.insert_text((50, 60), f'PAGE_{number}_MAIN')
+            if number == 3:
+                page.insert_text((50, 100), 'Appendix A', fontsize=15, fontname='hebo')
+                page.insert_text((50, 130), 'APPENDIX_SECRET')
+        source = pdf.tobytes()
+    ids = [f'1601.{number:05d}' for number in range(130)]
+    for pid in ids[:-1]:
+        (serial_cache / f'{pid}.pdf').write_bytes(source)
+    (serial_cache / f'{ids[-1]}.html').write_text(
+        '<h1>Paper</h1><p>HTML MAIN</p><h2>Appendix A</h2><p>APPENDIX_SECRET</p>')
+    shutil.copytree(serial_cache, parallel_cache)
+    serial = FullTextCorpus(index, cache_dir=serial_cache, main_text_pages=9)
+    for pid in ids:
+        serial.review_text(pid)
+    parallel = FullTextCorpus(index, cache_dir=parallel_cache, main_text_pages=9)
+    writes = []
+    original_write = data_utils.write_json_atomic
+    def record_write(path, data, **kwargs):
+        writes.append(str(path))
+        return original_write(path, data, **kwargs)
+    monkeypatch.setattr(data_utils, 'write_json_atomic', record_write)
+    before_python, before_numpy = random.getstate(), np.random.get_state()
+    parallel.prepare_review_texts(
+        [f'https://arxiv.org/abs/{pid}v2' for pid in reversed(ids)] + [ids[0]],
+        max_workers=2)
+    assert random.getstate() == before_python
+    assert np.array_equal(np.random.get_state()[1], before_numpy[1])
+    assert parallel.supplement == serial.supplement
+    assert (parallel_cache / 'texts.utf8').read_bytes() == (serial_cache / 'texts.utf8').read_bytes()
+    assert 0 < len(writes) < len(ids) // 8
+    for pid in (ids[0], ids[-1]):
+        assert parallel.text(pid) == serial.text(pid)
+        assert 'APPENDIX_SECRET' not in parallel.text(pid)
+    saved = (parallel_cache / 'index.json').read_bytes()
+    monkeypatch.setattr(parallel, 'download_source',
+                        lambda pid: pytest.fail('An existing ID must reuse prepared text'))
+    parallel.prepare_review_texts(ids, max_workers=2)
+    assert (parallel_cache / 'index.json').read_bytes() == saved
+
+
+def test_parallel_review_preparation_keeps_completed_prefix_on_worker_error(tmp_path, monkeypatch):
+    import pymupdf
+    from utopia.data.rag import FullTextCorpus
+
+    index = tmp_path / 'base.json'
+    index.write_text(json.dumps({'text_file': 'base.txt', 'papers': {}}))
+    cache = tmp_path / 'cache'
+    cache.mkdir()
+    with pymupdf.open() as pdf:
+        pdf.new_page().insert_text((50, 60), 'COMPLETE MAIN TEXT')
+        source = pdf.tobytes()
+    good, bad = '1601.00001', '1601.00002'
+    (cache / f'{good}.pdf').write_bytes(source)
+    (cache / f'{bad}.pdf').write_bytes(b'invalid pdf')
+    corpus = FullTextCorpus(index, cache_dir=cache, main_text_pages=9)
+    with pytest.raises(pymupdf.FileDataError):
+        corpus.prepare_review_texts([bad, good], max_workers=2)
+    resumed = FullTextCorpus(index, cache_dir=cache, main_text_pages=9)
+    assert set(resumed.supplement['review_texts']) == {good}
+    prefix = (cache / 'texts.utf8').read_bytes()
+    assert resumed.text(good).strip() == 'COMPLETE MAIN TEXT'
+    (cache / f'{bad}.pdf').write_bytes(source)
+    original_download = resumed.download_source
+    def only_missing(pid):
+        assert pid == bad
+        return original_download(pid)
+    monkeypatch.setattr(resumed, 'download_source', only_missing)
+    resumed.prepare_review_texts([good, bad], max_workers=2)
+    assert (cache / 'texts.utf8').read_bytes() == prefix + prefix
+    assert resumed.text(good) == resumed.text(bad)

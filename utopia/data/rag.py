@@ -36,6 +36,116 @@ from tqdm import tqdm, trange
 from utopia.agents.conference import ALL_CS_TOPICS, ARXIV_CATEGORY_NAMES
 
 
+def extract_main_pages(pdf, main_text_pages, paper_title=None):
+    """Take physical pages from the start, stopping at an appendix heading."""
+    parts = []
+    seen_references = False
+    appendix_page = None
+    for page_number in range(min(main_text_pages, len(pdf))):
+        page = pdf[page_number]
+        lines = page.get_text(sort=True).splitlines()
+        title_lines = set()
+        if page_number == 0 and paper_title:
+            # A selected document's title can itself start with "Appendix"
+            # or "Supplementary Material". Only its first-page title is
+            # exempt; identically named sections later still end the text.
+            title = re.sub(r'\W+', '', paper_title.casefold())
+            for start in range(min(8, len(lines))):
+                if not lines[start].strip():
+                    continue
+                candidate = ''
+                for end in range(start, min(start + 8, len(lines))):
+                    candidate += re.sub(r'\W+', '', lines[end].casefold())
+                    if not title.startswith(candidate):
+                        break
+                    if candidate == title:
+                        title_lines.update(range(start, end + 1))
+                        break
+                if title_lines:
+                    break
+        contents_page = any(re.fullmatch(r'(?:table of )?contents', line.strip(), re.I)
+                            for line in lines)
+        styles = {}
+        sizes = Counter()
+        for block in page.get_text('dict')['blocks']:
+            for line in block.get('lines', []):
+                spans = line.get('spans', [])
+                label = ''.join(span['text'] for span in spans).strip()
+                if spans:
+                    styles[label] = (max(span['size'] for span in spans),
+                                     any(span['flags'] & 16 for span in spans))
+                for span in spans:
+                    sizes[round(span['size'], 1)] += len(span['text'])
+        body_size = sizes.most_common(1)[0][0] if sizes else 0
+        kept = []
+        for line_number, line in enumerate(lines):
+            label = line.strip()
+            size, bold = styles.get(label, (body_size, False))
+            heading_style = bold or size > body_size + 0.5
+            # A fixed whitespace width avoids quadratic backtracking on
+            # very sparse PDF lines produced by layout-preserving extraction.
+            is_contents_entry = bool(re.search(r'\.{3,}|\s{3}\d+$', line.rstrip()))
+            explicit_appendix = bool(re.match(
+                r'^(?:(?:[A-Z]|\d+(?:\.\d+)*)[.)]?\s+)?'
+                r'(?:appendix|appendices|supplementary material|supplemental material)'
+                r'\b', label, re.I))
+            short_heading = (len(label) <= 100 and not label.endswith(('.', ',', ';'))
+                             and not re.search(
+                                 r'\b(?:provides?|contains?|shows?|describes?|discusses?|'
+                                 r'presents?|includes?|is|are|can)\b', label, re.I))
+            lettered_appendix = (seen_references and heading_style
+                                 and bool(re.match(r'^[A-Z](?:[.]\s+|\s+)\S', label)))
+            if (line_number not in title_lines
+                    and not contents_page and not is_contents_entry
+                    and ((explicit_appendix and (heading_style or short_heading))
+                         or lettered_appendix)):
+                appendix_page = page_number + 1
+                break
+            if not contents_page and re.fullmatch(
+                    r'(?:\d+[.]?\s+)?(?:references|bibliography)', label, re.I):
+                seen_references = True
+            kept.append(re.sub(r'[^\S\n]+', ' ', line).rstrip())
+        if '\n'.join(kept).strip():
+            parts.append('\n'.join(kept))
+        if appendix_page is not None:
+            break
+    return '\n\n'.join(parts), len(parts), appendix_page
+
+
+def extract_review_source(source, main_text_pages, paper_title=None):
+    """Extract one independent source without writing the shared text index."""
+    import io
+    import pymupdf
+    from utopia.utils.data_utils import atomic_open
+    path, url = source
+    page_source = 'original_pdf'
+    if path.suffix == '.html':
+        page_source = 'html_rendered_a4'
+        rendered = path.with_suffix('.rendered.pdf')
+        if not rendered.exists():
+            buffer = io.BytesIO()
+            writer = pymupdf.DocumentWriter(buffer)
+            story = pymupdf.Story(html=path.read_text())
+            page = pymupdf.paper_rect('a4')
+            story.write(writer, lambda number, filled: (page, page + (36, 36, -36, -36), None))
+            writer.close()
+            with atomic_open(rendered, 'wb') as stream:
+                stream.write(buffer.getvalue())
+        path = rendered
+    with pymupdf.open(path) as pdf:
+        text, pages, appendix = extract_main_pages(pdf, main_text_pages, paper_title)
+        source_pages = len(pdf)
+    content = text.encode('utf-8')
+    if not content.strip():
+        raise ValueError(f'No main text in first {main_text_pages} pages: {path.stem}')
+    entry = dict(nbytes=len(content), pages=pages, source_pages=source_pages,
+                 appendix_start_page=appendix, max_pages=main_text_pages,
+                 exclude_appendices=True, page_source=page_source, source_url=url)
+    if paper_title:
+        entry['paper_title'] = paper_title
+    return content, entry
+
+
 class FullTextCorpus:
     """Read complete UTF-8 papers from the existing papers/offset/nbytes index."""
 
@@ -101,143 +211,72 @@ class FullTextCorpus:
             stream.write(response.content)
         return path, url
 
-    def prepare_review_texts(self, paper_ids, paper_titles=None):
-        """Download independently; publish the shared text index in input order."""
+    def prepare_review_texts(self, paper_ids, paper_titles=None, max_workers=16):
+        """Extract papers in CPU processes; publish ordered batches in the parent."""
         if not self.main_text_pages:
             return
-        from concurrent.futures import ThreadPoolExecutor
+        from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+        from itertools import islice, repeat
+        from multiprocessing import get_context
         ids = sorted({re.sub(r'v\d+$', '', str(pid).split('/abs/')[-1]) for pid in paper_ids})
         titles = {re.sub(r'v\d+$', '', str(pid).split('/abs/')[-1]): title
                   for pid, title in (paper_titles or {}).items()}
         policy = f'first_{self.main_text_pages}_pages_no_appendix'
         pending = [pid for pid in ids
                    if policy not in self.supplement.get('review_texts', {}).get(pid, {})]
-        executor = ThreadPoolExecutor(max_workers=8)
+        if not pending:
+            return
+        workers = min(max_workers, len(pending), os.cpu_count() or 1)
+        downloads = ThreadPoolExecutor(max_workers=8)
+        processes = (ProcessPoolExecutor(max_workers=workers, mp_context=get_context('spawn'))
+                     if workers > 1 else None)
         try:
-            sources = executor.map(self.download_source, pending)
-            for pid, source in tqdm(zip(pending, sources), total=len(pending),
-                                    desc='Preparing review pages'):
-                self.review_text(pid, source=source, paper_title=titles.get(pid))
+            sources = downloads.map(self.download_source, pending)
+            with tqdm(total=len(pending), desc='Preparing review pages') as progress:
+                for start in range(0, len(pending), 128):
+                    batch = pending[start:start + 128]
+                    apply = processes.map if processes else map
+                    results = apply(extract_review_source, islice(sources, len(batch)),
+                                    repeat(self.main_text_pages),
+                                    (titles.get(pid) for pid in batch))
+                    self.save_review_texts(zip(batch, results))
+                    progress.update(len(batch))
         finally:
-            executor.shutdown(wait=True, cancel_futures=True)
+            downloads.shutdown(wait=True, cancel_futures=True)
+            if processes:
+                processes.shutdown(wait=True, cancel_futures=True)
 
     def extract_main_pages(self, pdf, paper_title=None):
-        """Take physical pages from the start, stopping at an appendix heading."""
-        parts = []
-        seen_references = False
-        appendix_page = None
-        for page_number in range(min(self.main_text_pages, len(pdf))):
-            page = pdf[page_number]
-            lines = page.get_text(sort=True).splitlines()
-            title_lines = set()
-            if page_number == 0 and paper_title:
-                # A selected document's title can itself start with "Appendix"
-                # or "Supplementary Material". Only its first-page title is
-                # exempt; identically named sections later still end the text.
-                title = re.sub(r'\W+', '', paper_title.casefold())
-                for start in range(min(8, len(lines))):
-                    if not lines[start].strip():
+        return extract_main_pages(pdf, self.main_text_pages, paper_title)
+
+    def save_review_texts(self, prepared):
+        """Publish a complete ordered prefix, including when a later worker fails."""
+        from utopia.utils.data_utils import write_json_atomic
+        policy = f'first_{self.main_text_pages}_pages_no_appendix'
+        written = 0
+        with (self.cache_dir / self.supplement['text_file']).open('ab') as stream:
+            try:
+                for paper_id, (content, metadata) in prepared:
+                    entries = self.supplement.setdefault('review_texts', {}).setdefault(paper_id, {})
+                    if policy in entries:
                         continue
-                    candidate = ''
-                    for end in range(start, min(start + 8, len(lines))):
-                        candidate += re.sub(r'\W+', '', lines[end].casefold())
-                        if not title.startswith(candidate):
-                            break
-                        if candidate == title:
-                            title_lines.update(range(start, end + 1))
-                            break
-                    if title_lines:
-                        break
-            contents_page = any(re.fullmatch(r'(?:table of )?contents', line.strip(), re.I)
-                                for line in lines)
-            styles = {}
-            sizes = Counter()
-            for block in page.get_text('dict')['blocks']:
-                for line in block.get('lines', []):
-                    spans = line.get('spans', [])
-                    label = ''.join(span['text'] for span in spans).strip()
-                    if spans:
-                        styles[label] = (max(span['size'] for span in spans),
-                                         any(span['flags'] & 16 for span in spans))
-                    for span in spans:
-                        sizes[round(span['size'], 1)] += len(span['text'])
-            body_size = sizes.most_common(1)[0][0] if sizes else 0
-            kept = []
-            for line_number, line in enumerate(lines):
-                label = line.strip()
-                size, bold = styles.get(label, (body_size, False))
-                heading_style = bold or size > body_size + 0.5
-                # A fixed whitespace width avoids quadratic backtracking on
-                # very sparse PDF lines produced by layout-preserving extraction.
-                is_contents_entry = bool(re.search(r'\.{3,}|\s{3}\d+$', line.rstrip()))
-                explicit_appendix = bool(re.match(
-                    r'^(?:(?:[A-Z]|\d+(?:\.\d+)*)[.)]?\s+)?'
-                    r'(?:appendix|appendices|supplementary material|supplemental material)'
-                    r'\b', label, re.I))
-                short_heading = (len(label) <= 100 and not label.endswith(('.', ',', ';'))
-                                 and not re.search(
-                                     r'\b(?:provides?|contains?|shows?|describes?|discusses?|'
-                                     r'presents?|includes?|is|are|can)\b', label, re.I))
-                lettered_appendix = (seen_references and heading_style
-                                     and bool(re.match(r'^[A-Z](?:[.]\s+|\s+)\S', label)))
-                if (line_number not in title_lines
-                        and not contents_page and not is_contents_entry
-                        and ((explicit_appendix and (heading_style or short_heading))
-                             or lettered_appendix)):
-                    appendix_page = page_number + 1
-                    break
-                if not contents_page and re.fullmatch(
-                        r'(?:\d+[.]?\s+)?(?:references|bibliography)', label, re.I):
-                    seen_references = True
-                kept.append(re.sub(r'[^\S\n]+', ' ', line).rstrip())
-            if '\n'.join(kept).strip():
-                parts.append('\n'.join(kept))
-            if appendix_page is not None:
-                break
-        return '\n\n'.join(parts), len(parts), appendix_page
+                    offset = stream.tell()
+                    stream.write(content)
+                    entries[policy] = dict(offset=offset, **metadata)
+                    written += 1
+            finally:
+                if written:
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                    write_json_atomic(self.cache_dir / 'index.json', self.supplement, ensure_ascii=True)
 
     def review_text(self, paper_id, source=None, paper_title=None):
-        import io
-        import pymupdf
-        from utopia.utils.data_utils import atomic_open, write_json_atomic
         policy = f'first_{self.main_text_pages}_pages_no_appendix'
         entries = self.supplement.setdefault('review_texts', {}).setdefault(paper_id, {})
         if policy not in entries:
-            path, url = source or self.download_source(paper_id)
-            page_source = 'original_pdf'
-            if path.suffix == '.html':
-                # HTML-only arXiv proceedings have no original PDF pagination.
-                # Preserve the source and use a reproducible A4 print layout.
-                page_source = 'html_rendered_a4'
-                rendered = path.with_suffix('.rendered.pdf')
-                if not rendered.exists():
-                    buffer = io.BytesIO()
-                    writer = pymupdf.DocumentWriter(buffer)
-                    story = pymupdf.Story(html=path.read_text())
-                    page = pymupdf.paper_rect('a4')
-                    story.write(writer, lambda number, filled: (page, page + (36, 36, -36, -36), None))
-                    writer.close()
-                    with atomic_open(rendered, 'wb') as stream:
-                        stream.write(buffer.getvalue())
-                path = rendered
-            with pymupdf.open(path) as pdf:
-                text, pages, appendix = self.extract_main_pages(pdf, paper_title=paper_title)
-                source_pages = len(pdf)
-            content = text.encode('utf-8')
-            if not content.strip():
-                raise ValueError(f'No main text in first {self.main_text_pages} pages: {paper_id}')
-            with (self.cache_dir / self.supplement['text_file']).open('ab') as stream:
-                offset = stream.tell()
-                stream.write(content)
-                stream.flush()
-                os.fsync(stream.fileno())
-            entries[policy] = dict(offset=offset, nbytes=len(content), pages=pages,
-                                   source_pages=source_pages, appendix_start_page=appendix,
-                                   max_pages=self.main_text_pages, exclude_appendices=True,
-                                   page_source=page_source, source_url=url)
-            if paper_title:
-                entries[policy]['paper_title'] = paper_title
-            write_json_atomic(self.cache_dir / 'index.json', self.supplement, ensure_ascii=True)
+            result = extract_review_source(source or self.download_source(paper_id),
+                                           self.main_text_pages, paper_title)
+            self.save_review_texts([(paper_id, result)])
         entry = entries[policy]
         with (self.cache_dir / self.supplement['text_file']).open('rb') as stream:
             stream.seek(entry['offset'])
