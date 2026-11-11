@@ -35,6 +35,7 @@ Run (after utopia.analysis.influx_factorial):
 """
 import argparse
 import json
+import math
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -142,33 +143,44 @@ def burden_panel(ax, stats_by_cell: dict, years):
     ax.set_axisbelow(True)
 
 
-def multiplier_figure(stats_by_cell: dict, years, out_dir: Path):
-    """Supplementary: recycling multiplier M_t for the two recycling worlds."""
-    # Standalone appendix figure: give the two recycling worlds DISTINCT colors
-    # (both trajectories are recycling-on, so the main figure's color=recycling
-    # encoding would render them near-identical). Dashed/solid still encodes
-    # influx; "no recycling" is the dotted gray reference line at 1.
+def multiplier_panel(ax, stats_by_cell: dict, years, *, show_legend=True):
+    """Draw the archived multiplier series, also used by the combined appendix."""
     styles = {'C': {'color': COOL, 'linestyle': (0, (4, 2))},
               'D': {'color': WARM, 'linestyle': '-'}}
-    fig, ax = plt.subplots(figsize=(2.6, 2.0))
     for cell in ('C', 'D'):
-        ax.plot(years,
-                _series(stats_by_cell[cell], 'recycling_multiplier_by_year', years),
-                linewidth=1.2, marker='o', markersize=2.2,
+        records = stats_by_cell[cell]['recycling_multiplier_by_year']
+        values = [float(records.get(str(y), records.get(y, float('nan'))))
+                  for y in years]
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError(f'Missing or nonfinite multiplier for cell {cell}')
+        ax.plot(years, values,
+                linewidth=1.2, marker='o' if cell == 'C' else 's', markersize=2.7,
                 markeredgecolor='white', markeredgewidth=0.3,
                 label=CELL_NICE[cell], **styles[cell])
+        ax.annotate(f'{values[-1]:.2f}', xy=(years[-1], values[-1]),
+                    xytext=(4, 6 if cell == 'C' else -6),
+                    textcoords='offset points', ha='left', va='center',
+                    fontsize=6.5, color=styles[cell]['color'])
     ax.axhline(1.0, color=MUTED, linewidth=0.6, linestyle=':')
-    ax.annotate('No recycling (= 1)', xy=(years[0], 1.0), xytext=(0, 4),
-                textcoords='offset points', fontsize=5.5, color=MUTED)
-    ax.set_xlabel('Year', labelpad=1)
-    ax.set_ylabel('Submission events per new manuscript')
-    ax.set_title('Recycling multiplier', pad=2)
+    ax.annotate('No resubmission', xy=(years[0], 1.0), xytext=(0, 5),
+                textcoords='offset points', fontsize=6.2, color=MUTED)
+    ax.set_xlabel('Simulation year', labelpad=3)
+    ax.set_ylabel('Submissions / first submissions', labelpad=3)
+    ax.set_title('Submission multiplier', pad=5)
     ax.set_xticks(years[::3])
+    ax.set_xlim(years[0] - 0.25, years[-1] + 1.65)
     ax.set_yticks([1, 2, 3, 4])
     ax.set_ylim(0.85, 4.4)
-    ax.legend(fontsize=6, frameon=False, loc='lower right')
+    if show_legend:
+        ax.legend(fontsize=6.5, frameon=False, loc='lower right')
     ax.grid(axis='y', linewidth=0.5, color=GRID)
     ax.set_axisbelow(True)
+
+
+def multiplier_figure(stats_by_cell: dict, years, out_dir: Path):
+    """Standalone export retained for callers of the factorial figure script."""
+    fig, ax = plt.subplots(figsize=(2.6, 2.0))
+    multiplier_panel(ax, stats_by_cell, years)
     sns.despine(fig)
     fig.tight_layout()
     for ext in ('pdf', 'png'):
