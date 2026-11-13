@@ -1,10 +1,14 @@
-"""Opt-in request accounting for the prospectively frozen James experiments.
+"""Opt-in request accounting for the prospectively frozen Funding feedback experiments.
 
 No prompts, decoding parameters, request seeds, or retry policies are changed.
 The exact pinned chat tokenizer checks input plus the caller's output reservation
 before HTTP. Deterministic context violations, provenance mismatches and failed
 audit writes escape the simulator's broad ``except Exception`` fallbacks.
 """
+
+from utopia.utils.data_utils import json_sha256
+
+from utopia.utils.data_utils import file_sha256
 
 from contextlib import contextmanager
 import hashlib
@@ -34,7 +38,8 @@ def _json(value):
 
 
 def _sha(value):
-    return hashlib.sha256(_json(value).encode()).hexdigest()
+    return json_sha256(value, ensure_ascii=False, sort_keys=True,
+                       separators=(",", ":"), allow_nan=False)
 
 
 @contextmanager
@@ -55,7 +60,7 @@ def _preserve_rng():
             torch.set_rng_state(torch_state)
 
 
-def _load_tokenizer():
+def _load_tokenizer(model_name=MODEL, revision=REVISION):
     with _preserve_rng():
         from huggingface_hub import snapshot_download
         from transformers import AutoTokenizer
@@ -64,19 +69,28 @@ def _load_tokenizer():
         # trigger model_info in _patch_mistral_regex despite local_files_only.
         # An existing absolute snapshot directory keeps that path local too.
         snapshot = Path(snapshot_download(
-            repo_id=MODEL, revision=REVISION, local_files_only=True)).resolve(strict=True)
-        if (not snapshot.is_dir() or snapshot.name != REVISION
+            repo_id=model_name, revision=revision, local_files_only=True)).resolve(strict=True)
+        if (not snapshot.is_dir() or snapshot.name != revision
                 or snapshot.parent.name != "snapshots"
-                or snapshot.parent.parent.name != "models--" + MODEL.replace("/", "--")):
+                or snapshot.parent.parent.name != "models--" + model_name.replace("/", "--")):
             raise ValueError("Cached tokenizer snapshot does not match the pinned model/revision")
         return AutoTokenizer.from_pretrained(
             str(snapshot), local_files_only=True, trust_remote_code=False)
 
 
 class RequestAudit:
-    def __init__(self, path, model_name=MODEL, *, _tokenizer=None):
-        if model_name != MODEL:
+    def __init__(self, path, model_name=MODEL, *, _tokenizer=None,
+                 model_revision=None, context_tokens=CONTEXT_TOKENS, sdk_retries=5, allow_empty=False):
+        if model_name != MODEL and not model_revision:
             raise RequestAuditFailure(f"Unpinned request model: {model_name!r}")
+        self.model_revision = model_revision or REVISION
+        if len(self.model_revision) != 40 or any(c not in "0123456789abcdef" for c in self.model_revision):
+            raise RequestAuditFailure("Model revision must be an immutable commit SHA")
+        if type(context_tokens) is not int or context_tokens <= 0:
+            raise RequestAuditFailure("Context limit must be a positive integer")
+        self.context_tokens = context_tokens
+        self.sdk_retries = sdk_retries
+        self.allow_empty = bool(allow_empty)
         self.path = Path(path)
         if not self.path.is_absolute() or not self.path.parent.is_dir():
             raise RequestAuditFailure("Request audit requires an existing absolute output directory")
@@ -93,21 +107,25 @@ class RequestAudit:
             "n_responses": 0, "n_transport_errors": 0,
             "guard_failures": 0, "finish_reasons": {},
             "prompt_tokens": 0, "completion_tokens": 0,
+            "cache_replays": 0, "inference_responses": 0,
+            "inference_prompt_tokens": 0, "inference_completion_tokens": 0,
             "max_input_tokens": 0, "max_reserved_total_tokens": 0,
         }
         self._pending = set()
         try:
-            self.tokenizer = _tokenizer if _tokenizer is not None else _load_tokenizer()
+            self.tokenizer = (_tokenizer if _tokenizer is not None else
+                              (_load_tokenizer() if model_name == MODEL and self.model_revision == REVISION
+                               else _load_tokenizer(model_name, self.model_revision)))
             self._fd = os.open(
                 self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_APPEND
                 | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
             self.identity = {
-                "protocol": "james-request-audit-v1", "model": MODEL,
-                "model_revision": REVISION, "context_tokens": CONTEXT_TOKENS,
+                "protocol": "request-audit-v1", "model": self.model_name,
+                "model_revision": self.model_revision, "context_tokens": self.context_tokens,
                 "chat_template_sha256": _sha(self.tokenizer.chat_template),
-                "audit_source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-                "sdk_retries": 5,
-                "scope": "One event per SDK call; SDK-internal transport retries are not individual events.",
+                "audit_source_sha256": file_sha256(Path(__file__)),
+                "sdk_retries": self.sdk_retries, "allow_empty": self.allow_empty,
+                "scope": "One event per logical call; cache replays are separate from inference. SDK-internal retries are not individual events.",
             }
             self._write({"event": "initialized", **self.identity})
             os.fsync(self._fd)
@@ -145,6 +163,16 @@ class RequestAudit:
             self._write({"event": "guard_failure", "message": message, **details})
         raise RequestAuditFailure(message)
 
+    def count_input(self, messages, template_kwargs):
+        """Count the complete request with the same rendering used by before()."""
+        with self._token_lock:
+            text = self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+                **template_kwargs)
+            token_ids = self.tokenizer(
+                text, add_special_tokens=False, truncation=False)["input_ids"]
+        return len(token_ids), text
+
     def before(self, payload, *, seed_ctx=None, item_index=0, attempt=0):
         """Count the exact untruncated chat request, including generation prefix."""
         try:
@@ -159,19 +187,11 @@ class RequestAudit:
                 self._fail("Unreviewed chat template arguments", keys=sorted(template_kwargs))
             if "guided_json" in extra or "truncate_prompt_tokens" in extra:
                 self._fail("Legacy guided_json or prompt truncation is forbidden")
-            with self._token_lock:
-                # vLLM 0.12 renders text first, then tokenizes without extra
-                # special tokens. Using both steps also audits the rendered text.
-                text = self.tokenizer.apply_chat_template(
-                    payload["messages"], tokenize=False, add_generation_prompt=True,
-                    **template_kwargs)
-                token_ids = self.tokenizer(
-                    text, add_special_tokens=False, truncation=False)["input_ids"]
-            count = len(token_ids)
+            count, text = self.count_input(payload["messages"], template_kwargs)
             record = {
                 "seed_ctx": list(seed_ctx) if seed_ctx is not None else None,
                 "item_index": item_index, "attempt": attempt,
-                "request_seed": extra.get("seed"), "temperature": payload["temperature"],
+                "request_seed": payload.get("seed", extra.get("seed")), "temperature": payload["temperature"],
                 "input_tokens": count, "max_tokens": output,
                 "reserved_total_tokens": count + output,
                 "payload_sha256": _sha(payload),
@@ -182,7 +202,7 @@ class RequestAudit:
                 self._stats["max_input_tokens"] = max(self._stats["max_input_tokens"], count)
                 self._stats["max_reserved_total_tokens"] = max(
                     self._stats["max_reserved_total_tokens"], count + output)
-                if count + output > CONTEXT_TOKENS:
+                if count + output > self.context_tokens:
                     self._fail("Input plus requested output exceeds pinned context", **record)
                 request_id = self._stats["n_requests"]
                 self._stats["n_requests"] += 1
@@ -209,9 +229,10 @@ class RequestAudit:
             completion_tokens = getattr(usage, "completion_tokens", None)
             choices = getattr(response, "choices", [])
             reasons = [getattr(choice, "finish_reason", None) for choice in choices]
+            cache_hit = bool(getattr(response, "_portable_cache_hit", False))
             self._write({"event": "response", "request_id": ticket["request_id"],
                          "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
-                         "finish_reasons": reasons})
+                         "finish_reasons": reasons, "cache_replay": cache_hit})
             if (type(prompt_tokens) is not int or prompt_tokens != ticket["input_tokens"]
                     or type(completion_tokens) is not int or completion_tokens < 0
                     or completion_tokens > ticket["max_tokens"]):
@@ -225,6 +246,12 @@ class RequestAudit:
             counts[reason] = counts.get(reason, 0) + 1
             self._stats["prompt_tokens"] += prompt_tokens
             self._stats["completion_tokens"] += completion_tokens
+            if cache_hit:
+                self._stats["cache_replays"] += 1
+            else:
+                self._stats["inference_responses"] += 1
+                self._stats["inference_prompt_tokens"] += prompt_tokens
+                self._stats["inference_completion_tokens"] += completion_tokens
 
     def create(self, callback, *, seed_ctx=None, item_index=0, attempt=0, **payload):
         ticket = self.before(payload, seed_ctx=seed_ctx, item_index=item_index, attempt=attempt)
@@ -253,7 +280,7 @@ class RequestAudit:
 
     def close(self, successful):
         with self._lock:
-            valid = (self._stats["n_clients"] == 1 and self._stats["n_requests"] > 0
+            valid = (self._stats["n_clients"] == 1 and (self._stats["n_requests"] > 0 or self.allow_empty)
                      and not self._pending and self._stats["guard_failures"] == 0)
             self._stats["status"] = "complete" if successful and valid else "failed"
             summary = self.summary()
@@ -279,7 +306,8 @@ def active_audit_for(model_name):
 
 
 @contextmanager
-def request_audit_scope(path, model_name=MODEL, *, _tokenizer=None):
+def request_audit_scope(path, model_name=MODEL, *, _tokenizer=None,
+                        model_revision=None, context_tokens=CONTEXT_TOKENS, sdk_retries=5, allow_empty=False):
     """Wrap model construction and the complete simulation in one process."""
     global _ACTIVE
     if not _SCOPE_LOCK.acquire(blocking=False):
@@ -287,7 +315,9 @@ def request_audit_scope(path, model_name=MODEL, *, _tokenizer=None):
     audit = None
     successful = False
     try:
-        audit = RequestAudit(path, model_name, _tokenizer=_tokenizer)
+        audit = RequestAudit(path, model_name, _tokenizer=_tokenizer,
+                             model_revision=model_revision, context_tokens=context_tokens,
+                             sdk_retries=sdk_retries, allow_empty=allow_empty)
         _ACTIVE = audit
         yield audit
         successful = True

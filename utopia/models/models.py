@@ -1,10 +1,8 @@
 import base64
 import json
 import logging
-import math
 import os
 import re
-import sys
 import time
 from io import BytesIO
 from typing import List, Optional, Union, Dict, Tuple
@@ -14,11 +12,22 @@ import google.generativeai as genai
 import numpy as np
 from PIL import Image
 from openai import AzureOpenAI, OpenAI
-from const import IMPORTANT_NOTES
+from utopia.constants import IMPORTANT_NOTES
 from utopia.config import SIMULATION_CONFIG
 from utopia.models.structured_outputs import build_vllm_extra_body
 
 logger = logging.getLogger(__name__)
+
+
+def encode_message_text(value):
+    """Escape non-UTF-8 surrogate code units without changing stored source text."""
+    if isinstance(value, str):
+        return value.encode("utf-8", errors="backslashreplace").decode("utf-8")
+    if isinstance(value, list):
+        return [encode_message_text(item) for item in value]
+    if isinstance(value, dict):
+        return {key: encode_message_text(item) for key, item in value.items()}
+    return value
 
 
 class BaseLLM:
@@ -260,7 +269,7 @@ def parse_json_response(text: str) -> Dict:
     json_match = re.search(r"\{[\s\S]*", text)
     if json_match:
         candidate = json_match.group()
-    if candidate.count("{") - candidate.count("}") == 1:
+    if candidate.strip() != "{" and candidate.count("{") - candidate.count("}") == 1:
         try:
             return json.loads(candidate + "}")
         except json.JSONDecodeError:
@@ -537,8 +546,50 @@ class VLLMServerModel(BaseLLM):
         base_url: str = "http://localhost:8000/v1",
         max_concurrent_requests: int = 32,
         run_seed: Optional[int] = None,
+        response_cache_dir=None,
+        checkpoint_binding=None,
+        model_revision=None,
+        max_tokens_override=None,
+        sdk_max_retries: int = 5,
+        request_timeout: float = 600.0,
+        length_exhaustion_max_tokens=None,
+        answer_recovery_max_tokens=None,
     ):
         super().__init__(model_name)
+        self.model_revision = model_revision
+        self.max_tokens_override = max_tokens_override
+        if max_tokens_override is not None and (type(max_tokens_override) is not int or max_tokens_override <= 0):
+            raise ValueError("max_tokens_override must be a positive integer")
+        self.length_exhaustion_max_tokens = length_exhaustion_max_tokens
+        self.answer_recovery_max_tokens = answer_recovery_max_tokens
+        if answer_recovery_max_tokens is not None:
+            if (type(answer_recovery_max_tokens) is not int
+                    or answer_recovery_max_tokens != 32768
+                    or length_exhaustion_max_tokens != 32768):
+                raise ValueError("Answer recovery requires integer 32768 and the retained length extension")
+        extension_audit = None
+        if length_exhaustion_max_tokens is not None:
+            if type(length_exhaustion_max_tokens) is not int or length_exhaustion_max_tokens != 32768:
+                raise ValueError("length_exhaustion_max_tokens must be None or integer 32768")
+            if response_cache_dir is None or max_tokens_override != 8192:
+                raise ValueError("Length extension requires a response cache and max_tokens_override=8192")
+            from utopia.models.request_audit import active_audit_for
+            extension_audit = active_audit_for(model_name)
+            if extension_audit is None:
+                raise ValueError("Length extension requires an active request audit")
+        self.response_cache = None
+        if response_cache_dir is not None:
+            from pathlib import Path
+            from utopia.models.response_cache import CompletedResponseCache
+            from utopia.runtime.checkpointing import PortableCheckpointError, validate_binding
+            binding = validate_binding(checkpoint_binding)
+            if (binding['model'] != model_name or binding['model_revision'] != model_revision
+                    or binding['seed'] != run_seed):
+                raise PortableCheckpointError("Model client differs from portable cache binding")
+            if sdk_max_retries != 0:
+                raise PortableCheckpointError("Portable calls require sdk_max_retries=0")
+            self.response_cache = CompletedResponseCache(
+                Path(response_cache_dir) / "responses.sqlite", binding=binding)
         self.base_url = base_url
         self.max_concurrent_requests = max_concurrent_requests
         self.enable_thinking = SIMULATION_CONFIG['llm']['enable_thinking']
@@ -546,7 +597,7 @@ class VLLMServerModel(BaseLLM):
         # derived from (run_seed, seed_ctx..., item_index, attempt).
         self.run_seed = run_seed
         from utopia.models.request_audit import active_audit_for
-        self.request_audit = active_audit_for(model_name)
+        self.request_audit = extension_audit if extension_audit is not None else active_audit_for(model_name)
         # Cumulative call statistics for the run manifest and fallback-rate gates
         self.call_stats = {
             'n_prompts': 0,
@@ -563,8 +614,8 @@ class VLLMServerModel(BaseLLM):
         self.client = OpenAI(
             base_url=base_url,
             api_key=os.environ.get("VLLM_API_KEY", "EMPTY"),
-            timeout=600.0,
-            max_retries=5,
+            timeout=request_timeout,
+            max_retries=sdk_max_retries,
         )
 
         # Test connection (warning only, not fatal)
@@ -574,7 +625,7 @@ class VLLMServerModel(BaseLLM):
     def _request_seed(self, seed_ctx: Optional[tuple], idx: int, attempt: int) -> Optional[int]:
         if self.run_seed is None:
             return None
-        from utopia.utils.generail_utils import derive_seed
+        from utopia.utils.seeding import derive_seed
         return derive_seed(self.run_seed, *(seed_ctx or ('noctx',)), idx, attempt)
         
     def _build_extra_body(self, response_format: Optional[Dict] = None) -> dict:
@@ -586,12 +637,72 @@ class VLLMServerModel(BaseLLM):
         return build_vllm_extra_body(schema, enable_thinking=self.enable_thinking)
 
     def _create_completion(self, *, seed_ctx=None, item_index=0, attempt=0, **payload):
+        # Audit and HTTP must see identical UTF-8 text; histories remain untouched.
+        payload["messages"] = encode_message_text(payload["messages"])
         audit = self.request_audit
+        cache = getattr(self, 'response_cache', None)
+        callback = self.client.chat.completions.create
+        if cache is not None:
+            raw_callback = callback
+            def callback(**request):
+                return cache.create(raw_callback, seed_ctx=seed_ctx,
+                                    item_index=item_index, attempt=attempt, **request)
         if audit is None:
-            return self.client.chat.completions.create(**payload)
-        return audit.create(
-            self.client.chat.completions.create, seed_ctx=seed_ctx,
-            item_index=item_index, attempt=attempt, **payload)
+            response = callback(**payload)
+        else:
+            response = audit.create(callback, seed_ctx=seed_ctx,
+                                    item_index=item_index, attempt=attempt, **payload)
+        if cache is not None and cache.stop is not None:
+            cache.stop.check()
+        return response
+
+    def _length_exhaustion_limit(self, responses):
+        """One recorded amendment attempt, only after three audited empty length replies."""
+        if getattr(self, 'length_exhaustion_max_tokens', None) is None or len(responses) != 3:
+            return None
+        prompt_counts = []
+        for response in responses:
+            choices = getattr(response, 'choices', None)
+            if not choices or len(choices) != 1 or getattr(choices[0], 'finish_reason', None) != 'length':
+                return None
+            message = getattr(choices[0], 'message', None)
+            if message is None:
+                return None
+            content = getattr(message, 'content', None)
+            if content is not None and (not isinstance(content, str) or content.strip()):
+                return None
+            if (getattr(message, 'refusal', None) is not None
+                    or getattr(message, 'tool_calls', None)
+                    or getattr(message, 'function_call', None)):
+                return None
+            prompt_counts.append(getattr(getattr(response, 'usage', None), 'prompt_tokens', None))
+        context = getattr(self.request_audit, 'context_tokens', None)
+        if (type(context) is not int or context <= 0
+                or any(type(count) is not int or count <= 0 for count in prompt_counts)
+                or len(set(prompt_counts)) != 1):
+            return None
+        # request_audit has already verified these counts against the complete messages.
+        remaining = context - prompt_counts[0]
+        return min(self.length_exhaustion_max_tokens, remaining) if remaining > 0 else None
+
+    def _answer_recovery_limit(self, responses, messages):
+        """One nonthinking answer after failed legacy replies; never repair text locally."""
+        if getattr(self, 'answer_recovery_max_tokens', None) is None or len(responses) not in (3, 4):
+            return None
+        for response in responses:
+            choices = getattr(response, 'choices', None)
+            if not choices or len(choices) != 1 or choices[0].finish_reason not in ('length', 'stop'):
+                return None
+            message = choices[0].message
+            if (message is None or getattr(message, 'refusal', None) is not None
+                    or getattr(message, 'tool_calls', None)
+                    or getattr(message, 'function_call', None)):
+                return None
+        # Disabling thinking changes the generation prefix, so count that exact
+        # template rather than reusing a prior thinking request's token count.
+        count, _ = self.request_audit.count_input(encode_message_text(messages), {"enable_thinking": False})
+        remaining = self.request_audit.context_tokens - count
+        return min(self.answer_recovery_max_tokens, remaining) if remaining > 0 else None
 
     def generate(
         self,
@@ -622,6 +733,8 @@ class VLLMServerModel(BaseLLM):
                 messages.append({"role": "system", "content": system_prompt})
             messages.append({"role": "user", "content": prompt})
 
+        if self.max_tokens_override is not None:
+            max_tokens = self.max_tokens_override
         extra_body = self._build_extra_body(response_format)
         request_seed = self._request_seed(seed_ctx, 0, 0)
         if request_seed is not None:
@@ -636,9 +749,19 @@ class VLLMServerModel(BaseLLM):
             extra_body=extra_body if extra_body else None,
         )
 
-        response_text = response.choices[0].message.content.strip()
-
-        response_json = parse_json_response(response_text)
+        try:
+            response_text = response.choices[0].message.content.strip()
+            response_json = parse_json_response(response_text)
+            if response_json is None and getattr(self, 'response_cache', None) is not None:
+                raise ValueError("Portable response parsed as None")
+        except Exception as error:
+            if getattr(self, 'response_cache', None) is not None:
+                from utopia.runtime.checkpointing import PortableCheckpointError
+                failure = PortableCheckpointError(f"Invalid portable response for {seed_ctx!r}: {error}")
+                if self.response_cache.stop is not None:
+                    self.response_cache.stop.fail(failure)
+                raise failure from error
+            raise
 
         messages.append({
             "role": "assistant",
@@ -670,9 +793,13 @@ class VLLMServerModel(BaseLLM):
         if not prompts:
             return []
 
+        if self.max_tokens_override is not None:
+            max_tokens = self.max_tokens_override
         base_extra_body = self._build_extra_body(response_format)
 
         max_retries = 3
+        extend_length = getattr(self, 'length_exhaustion_max_tokens', None) is not None
+        recover_answer = getattr(self, 'answer_recovery_max_tokens', None) is not None
 
         def _call_single(idx_prompt):
             idx, prompt = idx_prompt
@@ -687,9 +814,33 @@ class VLLMServerModel(BaseLLM):
             response_json = None
             n_retries = 0
             tokens = (0, 0)  # (prompt, completion) — accumulated by the main thread
-            for attempt in range(max_retries):
+            returned_responses = []
+            for attempt in range(5 if recover_answer else max_retries + int(extend_length)):
+                attempt_max_tokens = max_tokens
+                if attempt == max_retries:
+                    attempt_max_tokens = self._length_exhaustion_limit(returned_responses)
+                    if attempt_max_tokens is None:
+                        if recover_answer:
+                            continue
+                        break
+                    logger.info(
+                        f"Prompt {idx}: three empty length replies; approved attempt 3 "
+                        f"with max_tokens={attempt_max_tokens}")
+                if attempt == 4:
+                    if len(returned_responses) != n_retries:
+                        # An exception without a returned reply is not a JSON
+                        # failure and must not unlock a different request.
+                        break
+                    attempt_max_tokens = self._answer_recovery_limit(returned_responses, msgs)
+                    if attempt_max_tokens is None:
+                        break
+                    logger.info(
+                        f"Prompt {idx}: approved nonthinking answer recovery at index 4 "
+                        f"with max_tokens={attempt_max_tokens}")
                 try:
                     extra_body = dict(base_extra_body)
+                    if attempt == 4:
+                        extra_body['chat_template_kwargs'] = {'enable_thinking': False}
                     request_seed = self._request_seed(seed_ctx, idx, attempt)
                     if request_seed is not None:
                         extra_body['seed'] = request_seed
@@ -698,14 +849,27 @@ class VLLMServerModel(BaseLLM):
                         model=self.model_name,
                         messages=msgs,
                         temperature=temperature,
-                        max_tokens=max_tokens,
+                        max_tokens=attempt_max_tokens,
                         extra_body=extra_body if extra_body else None,
                     )
+                    if (extend_length and attempt < max_retries) or (recover_answer and attempt < 4):
+                        # Only returned, audited replies qualify. Request exceptions
+                        # cannot supply an entry, and fatal cache/audit guards escape.
+                        returned_responses.append(resp)
                     response_text = resp.choices[0].message.content.strip()
                     if getattr(resp, 'usage', None):
                         tokens = (resp.usage.prompt_tokens or 0, resp.usage.completion_tokens or 0)
-                    response_json = parse_json_response(response_text)
-                    if response_json is None and response_format is not None:
+                    if attempt == 4:
+                        choice = resp.choices[0]
+                        if (choice.finish_reason != 'stop'
+                                or getattr(choice.message, 'refusal', None) is not None
+                                or getattr(choice.message, 'tool_calls', None)
+                                or getattr(choice.message, 'function_call', None)):
+                            raise ValueError("Answer recovery did not return a complete final answer")
+                        response_json = json.loads(response_text)
+                    else:
+                        response_json = parse_json_response(response_text)
+                    if response_json is None and (response_format is not None or getattr(self, 'response_cache', None) is not None):
                         raise ValueError("Parsed JSON is None but structured output was expected")
                     success = True
                     break
@@ -714,9 +878,16 @@ class VLLMServerModel(BaseLLM):
                     if attempt < max_retries - 1:
                         logger.warning(f"Prompt {idx} attempt {attempt + 1}/{max_retries} failed: {e}. Retrying...")
                     else:
-                        logger.error(f"Prompt {idx} failed after {max_retries} attempts: {e}")
+                        logger.error(f"Prompt {idx} failed after {attempt + 1} attempts: {e}")
 
             if not success:
+                if getattr(self, 'response_cache', None) is not None:
+                    from utopia.runtime.checkpointing import PortableCheckpointError
+                    failure = PortableCheckpointError(
+                        f"Portable request {seed_ctx!r}/{idx} exhausted {n_retries} response attempts")
+                    if self.response_cache.stop is not None:
+                        self.response_cache.stop.fail(failure)
+                    raise failure
                 return idx, (None, msgs), n_retries, False, tokens
 
             msgs.append({

@@ -68,6 +68,8 @@ Run
     (writes to the paper repo's figures/fig_topic_diversity_selection_gate.pdf
     by default; override with --out)
 """
+
+from utopia.analysis.statistics import wilson_ci
 import argparse
 
 import matplotlib.pyplot as plt
@@ -76,7 +78,7 @@ import pandas as pd
 import seaborn as sns
 
 from utopia.analysis.exploration_cross_seed import discover_runs, validate_runs, load_table
-from utopia.utils.visual_utils import nature_style, INK, MUTED, STRATEGY_PALETTE
+from utopia.visual.common import nature_style, INK, MUTED, STRATEGY_PALETTE
 
 # Panels (a, b): composition-intervention worlds
 SETS = [2001, 2002, 2003, 2004, 2005, 2006, 2009, 2010, 2013, 2014]
@@ -112,12 +114,6 @@ def load_diversity():
     return pd.DataFrame(rows)
 
 
-def wilson_ci(k, n, z=1.96):
-    p = k / n
-    d = 1 + z**2 / n
-    c = (p + z**2 / (2 * n)) / d
-    h = z * np.sqrt(p * (1 - p) / n + z**2 / (4 * n**2)) / d
-    return c - h, c + h
 
 
 def boot_ci(values, n_boot=2000, seed=0):
@@ -249,7 +245,7 @@ def main():
     draw_diversity(axes[:2])
     draw_selection_gate(axes[2], args.run_prefix)
     axes[2].set_title('c  Acceptance and impact', pad=0)
-    handles = draw(axes[3], disruption_table(load_papers(args.run_prefix)[0]), legend=False)
+    handles = draw(axes[3], disruption_table(load_papers(args.run_prefix)[0]))
     axes[3].set_xlabel(XLABEL)
     axes[3].set_title('d  Disruption by strategy', pad=0)
 

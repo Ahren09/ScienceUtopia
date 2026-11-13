@@ -1,7 +1,7 @@
 """Analysis functions for simulation results"""
 
-import argparse
-import json
+from utopia.utils.data_utils import write_json as write_json_file
+
 import logging
 from pathlib import Path
 from typing import Dict, Any, Optional
@@ -93,8 +93,7 @@ def generate_report(data: Dict[str, Any], output_file: Optional[str] = None) -> 
     }
 
     if output_file:
-        with open(output_file, 'w') as f:
-            json.dump(report, f, indent=2, default=str)
+        write_json_file(report, output_file, indent=2, default=str)
         logger.info(f"Report saved to {output_file}")
 
     return report
@@ -124,9 +123,9 @@ class SimulationAnalyzer:
 
 def main():
     """CLI entry point"""
-    from run_simulation import Simulation
+    from utopia.simulation import Simulation
     from utopia.arguments import parse_arguments
-    from utopia.utils.generail_utils import project_setup
+    from utopia.runtime.setup import project_setup
 
     args = parse_arguments()
     project_setup()
@@ -148,13 +147,7 @@ def main():
         analyzer = SimulationAnalyzer(output_dir=args.output_dir)
         analyzer.load_from_simulation(simulation)
         analyzer.generate_report(str(Path(args.output_dir) / "simulation_report.json"))
-
-        # Generate visualizations using the same simulation object
-        logger.info("Generating visualizations...")
-        from utopia.visual.visualizer import VisualizationOrchestrator
-        visualizer = VisualizationOrchestrator(simulation, output_dir=args.output_dir)
-        visualizer.generate_all_plots()
-        logger.info("Analysis and visualizations complete!")
+        logger.info("Analysis complete!")
 
 
 if __name__ == '__main__':

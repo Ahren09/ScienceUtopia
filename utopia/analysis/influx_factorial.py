@@ -32,6 +32,8 @@ same-config replication under vLLM serving nondeterminism, not a bitwise check.
 Run (after the four cells complete):
     python -m utopia.analysis.influx_factorial
 """
+
+from utopia.utils.data_utils import write_json as write_json_file
 import argparse
 import json
 from pathlib import Path
@@ -200,7 +202,7 @@ def main():
 
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    json.dump(summary, open(out / 'factorial_summary.json', 'w'), indent=2)
+    write_json_file(summary, out / 'factorial_summary.json', indent=2)
     (out / 'summary.md').write_text(render_markdown(summary))
     print(json.dumps({k: summary[k] for k in ('decomposition',
                                               'replication_check_C_vs_paper')}, indent=2))
