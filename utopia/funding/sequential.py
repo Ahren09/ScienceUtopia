@@ -2,7 +2,7 @@
 
 Install AFTER install_funding_validation(..., compact=True), restore BEFORE it.
 Only registered compact phase5_funding_eval batches are intercepted. Every
-choice, including a singleton, uses the existing client's _create_completion
+choice, including a singleton, uses the existing client's create_completion
 and request audit. There are at most THREE SDK calls per step. The SDK's five
 internal transport retries remain unchanged and are not extra sidecar events.
 No generate_batch nesting, whole-panel retry, filling or deduplication occurs.
@@ -409,8 +409,8 @@ class _Handle:
         for attempt in range(MAX_STEP_CALLS):
             if self.cancel.is_set():
                 raise _Cancelled()
-            extra = model._build_extra_body(response_format)
-            seed = model._request_seed(ctx, 0, attempt)
+            extra = model.build_extra_body(response_format)
+            seed = model.request_seed(ctx, 0, attempt)
             if (seed != _derive_seed(model.run_seed, *ctx, 0, attempt)
                     or extra.get("structured_outputs", {}).get("json") != selection_schema(remaining)
                     or extra.get("chat_template_kwargs") != {"enable_thinking": True}):
@@ -433,7 +433,7 @@ class _Handle:
             started = time.monotonic()
             content, reason, usage, error_type, chosen, n_choices = None, None, None, None, None, None
             try:
-                response = model._create_completion(
+                response = model.create_completion(
                     seed_ctx=ctx, item_index=0, attempt=attempt, model=model.model_name,
                     messages=messages, temperature=options["temperature"], max_tokens=options["max_tokens"],
                     extra_body=extra)
@@ -458,7 +458,7 @@ class _Handle:
                 error_type = type(error).__name__
             except BaseException as error:
                 # The existing request guard may reject a returned response
-                # before _create_completion returns. The reviewed guard exposes
+                # before create_completion returns. The reviewed guard exposes
                 # that response/ticket solely for this terminal audit record.
                 with self.lock:
                     self.cancel.set()

@@ -5,6 +5,7 @@ general checkpoint analyzer in analyze_all_results.py stays unchanged; this
 module reads the structured Parquet tables written per run).
 
 Modes:
+  --experiment_id <exact ID> --aggregates_only           # one world, no prefix matches
   --multi_run_prefix explore_pilot_qwen3_32b_neutral   # discover + aggregate runs
   --power_analysis                                      # simulation-based power from calibration runs
   --manipulation_check                                  # E2/E3 go-no-go style report only
@@ -36,13 +37,20 @@ PRIMARY_CONTRASTS = [('explorer', 'exploiter'),
 
 # ------------------------------------------------------------ run discovery
 
-def discover_runs(prefix: str, outputs_dir: str = 'outputs'):
-    """Find completed runs whose experiment_id starts with prefix.
+def discover_runs(prefix: str = None, outputs_dir: str = 'outputs',
+                  experiment_id: str = None):
+    """Find an exact experiment or runs whose experiment_id starts with prefix.
 
     Returns list of dicts {experiment_id, seed, docs_dir, manifest}.
     """
+    if experiment_id is not None:
+        docs_paths = [os.path.join(outputs_dir, 'docs', experiment_id)]
+    elif prefix is not None:
+        docs_paths = glob.glob(os.path.join(outputs_dir, 'docs', prefix + '*'))
+    else:
+        raise ValueError('Specify an experiment_id or multi-run prefix')
     runs = []
-    for docs_dir in sorted(glob.glob(os.path.join(outputs_dir, 'docs', prefix + '*'))):
+    for docs_dir in sorted(docs_paths):
         if 'invalidated' in os.path.basename(docs_dir):
             continue  # archived pre-commit runs are never analyzed
         manifest_path = os.path.join(docs_dir, 'run_manifest.json')
@@ -62,16 +70,12 @@ def discover_runs(prefix: str, outputs_dir: str = 'outputs'):
 
 
 def validate_runs(runs, require_complete=True):
-    """Check completeness and matching config hashes; returns (valid, excluded)."""
+    """Check completion and required tables; historical hashes are metadata only."""
     valid, excluded = [], []
-    hashes = {r['config_hash'] for r in runs if r['config_hash']}
     for r in runs:
         problems = []
         if require_complete and r['status'] != 'complete':
             problems.append(f"status={r['status']}")
-        if len(hashes) > 1 and r['config_hash'] != max(hashes, key=lambda h: sum(
-                1 for x in runs if x['config_hash'] == h)):
-            problems.append('config_hash differs from majority')
         for table in ('agent_year', 'paper'):
             if not _table_path(r['docs_dir'], table):
                 problems.append(f'missing table {table}')
@@ -122,6 +126,112 @@ def researcher_level(agent_year: pd.DataFrame) -> pd.DataFrame:
     out['acceptance_rate'] = np.where(out['total_papers'] > 0,
                                       out['total_accepted'] / out['total_papers'], np.nan)
     return out
+
+
+def summarize_completed_world(agent_year, paper_age, ecosystem, checkpoint):
+    """Describe one complete founding cohort, with explicit citation follow-up."""
+    horizon = int(checkpoint['year'])
+    years = set(range(1, horizon + 1))
+    if int(checkpoint['phase']) != 5:
+        raise ValueError('World summary requires a completed annual checkpoint')
+    if agent_year.duplicated(['agent_id', 'year']).any():
+        raise ValueError('Duplicate researcher-year rows')
+    if ecosystem['year'].duplicated().any() or set(ecosystem['year']) != years:
+        raise ValueError('Incomplete ecosystem-year coverage')
+    if any(set(block['year']) != years for _, block in agent_year.groupby('agent_id')):
+        raise ValueError('Incomplete founding researcher-year coverage')
+    if agent_year.groupby('agent_id')['strategy'].nunique().ne(1).any():
+        raise ValueError('Strategy changed within a founding researcher')
+
+    agents = checkpoint['ecosystem_data']['agents']
+    if isinstance(agents, dict):
+        agents = list(agents.values())
+    agents = {a['id']: a for a in agents
+              if a.get('type') in ('university', 'industry')}
+    if set(agents) != set(agent_year['agent_id']):
+        raise ValueError('Final researchers do not match the founding cohort')
+    final = agent_year.loc[agent_year['year'].eq(horizon)].set_index('agent_id')
+    if any(bool(final.loc[aid, 'is_active']) != bool(a['is_active'])
+           for aid, a in agents.items()):
+        raise ValueError('Final activity differs between table and checkpoint')
+
+    accepted = [p for p in checkpoint['paper_tracker']['papers']
+                if p['status'] == 'accept']
+    if len({p['id'] for p in accepted}) != len(accepted):
+        raise ValueError('Duplicate accepted paper IDs')
+    if any(p['author_id'] not in agents for p in accepted):
+        raise ValueError('Accepted paper author is outside the founding cohort')
+    if int(agent_year['num_accepted'].sum()) != len(accepted):
+        raise ValueError('Accepted-paper count differs between table and checkpoint')
+    age_three = paper_age.loc[paper_age['age'].eq(3)].copy()
+    expected_age_three = {p['id'] for p in accepted if int(p['year']) <= horizon - 3}
+    if (age_three['paper_id'].duplicated().any()
+            or set(age_three['paper_id']) != expected_age_three
+            or not age_three['observation_year'].eq(age_three['publication_year'] + 3).all()):
+        raise ValueError('Incomplete or inconsistent publication-age-three coverage')
+
+    incoming = checkpoint['citation_tracker']['citations']
+    if any(len(citers) != len(set(citers)) for citers in incoming.values()):
+        raise ValueError('Duplicate citation edges')
+    strategies = []
+    for strategy, block in agent_year.groupby('strategy'):
+        ids = set(block['agent_id'])
+        endpoint = final.loc[sorted(ids)]
+        attempts = block.groupby('agent_id')[['num_papers', 'num_accepted']].sum()
+        submitted = attempts['num_papers'].gt(0)
+        fractions = attempts.loc[submitted, 'num_accepted'] / attempts.loc[submitted, 'num_papers']
+        published = [p for p in accepted if p['author_id'] in ids]
+        aged = age_three.loc[age_three['author_id'].isin(ids)]
+        funding = [
+            sum(float(rec['amount']) for records in
+                (agents[aid].get('funding_success_history') or {}).values()
+                for rec in records)
+            for aid in ids
+        ]
+        direction = block.groupby('agent_id')['direction_distance'].mean().dropna()
+        switches = block.groupby('agent_id')['topic_switched'].mean().dropna()
+        strategies.append({
+            'strategy': strategy,
+            'founders': len(ids),
+            'active_final': int(endpoint['is_active'].sum()),
+            'active_share_final': float(endpoint['is_active'].mean()),
+            'submission_attempts': int(attempts['num_papers'].sum()),
+            'researchers_with_submissions': int(submitted.sum()),
+            'mean_researcher_acceptance_fraction': float(fractions.mean()) if len(fractions) else None,
+            'accepted_papers': len(published),
+            'citations_to_accepted_papers_at_horizon': sum(
+                len(incoming.get(p['id'], [])) for p in published),
+            'papers_at_publication_age_three': len(aged),
+            'mean_citations_at_publication_age_three': float(aged['citations'].mean()) if len(aged) else None,
+            'mean_direction_distance': float(direction.mean()) if len(direction) else None,
+            'mean_topic_switch_rate': float(switches.mean()) if len(switches) else None,
+            'mean_final_resources': float(endpoint['funding'].mean()),
+            'mean_cumulative_grants_received': float(np.mean(funding)),
+        })
+
+    trajectory_columns = [
+        'year', 'topic_entropy_normalized', 'occupied_directions',
+        'num_active_researchers', 'num_submissions', 'num_accepted',
+    ]
+    trajectory = ecosystem.sort_values('year')[trajectory_columns]
+    return {
+        'years': horizon,
+        'founders': len(agents),
+        'worlds': 1,
+        'definitions': {
+            'acceptance': 'Equal-researcher mean of accepted/submitted attempts across the full horizon; researchers with zero attempts are counted separately.',
+            'final_citations': 'Distinct incoming citation edges to accepted papers in the final checkpoint; papers have their observed publication ages.',
+            'age_three_citations': 'Equal-paper mean among accepted papers with complete follow-up at publication age three, including zero citations.',
+            'direction_and_switching': 'Equal-researcher means of observed annual values.',
+            'funding': 'Cumulative successful grant amounts, excluding initial endowment; final resources reported separately.',
+            'activity': 'Year-end active researchers divided by the full founding cohort.',
+            'entropy': 'Normalized topic entropy of annual chosen directions.',
+        },
+        'strategies': strategies,
+        'ecosystem_trajectory': json.loads(trajectory.to_json(orient='records', double_precision=15)),
+        'mean_annual_topic_entropy_normalized': float(trajectory['topic_entropy_normalized'].mean()),
+        'final_topic_entropy_normalized': float(trajectory['topic_entropy_normalized'].iloc[-1]),
+    }
 
 
 def within_institution_contrasts(researchers: pd.DataFrame, outcome: str) -> pd.DataFrame:
@@ -387,7 +497,10 @@ def power_analysis(researchers: pd.DataFrame, out_dir: str,
 def main():
     from utopia.visual.plot_exploration_strategies import make_figures
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--multi_run_prefix', type=str, required=True)
+    selection = parser.add_mutually_exclusive_group(required=True)
+    selection.add_argument('--multi_run_prefix', type=str)
+    selection.add_argument('--experiment_id', type=str,
+                           help='Analyze exactly this world, excluding prompt or venue suffix variants')
     parser.add_argument('--out_dir', type=str, required=True)
     parser.add_argument('--outputs_dir', type=str, default='outputs')
     parser.add_argument('--power_analysis', action='store_true')
@@ -403,13 +516,17 @@ def main():
                         help='Compute only the per-year review-score distribution trajectories '
                              '(review_score_trajectories.csv + review_score_convergence.json) '
                              'from checkpoints and exit, leaving all other outputs untouched')
+    parser.add_argument('--world_summary_only', action='store_true',
+                        help='Describe one exact completed world, including final citation stock '
+                             'and publication-age-three outcomes; requires --funding_horizon_year')
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
-    runs = discover_runs(args.multi_run_prefix, args.outputs_dir)
+    runs = discover_runs(args.multi_run_prefix, args.outputs_dir,
+                         experiment_id=args.experiment_id)
     valid, excluded = validate_runs(runs)
     print(f"Discovered {len(runs)} runs; {len(valid)} valid, {len(excluded)} excluded")
-    if not (args.aggregates_only or args.review_scores_only):
+    if not (args.aggregates_only or args.review_scores_only or args.world_summary_only):
         pd.DataFrame([{k: r[k] for k in ('experiment_id', 'seed', 'status', 'problems')}
                       for r in excluded]).to_csv(
             os.path.join(args.out_dir, 'failed_or_excluded_runs.csv'), index=False)
@@ -423,6 +540,20 @@ def main():
     agent_year = load_table(valid, 'agent_year')
     paper_age = load_table(valid, 'paper_age')
     ecosystem = load_table(valid, 'ecosystem_year')
+    if args.world_summary_only:
+        if not args.experiment_id or len(valid) != 1 or not args.funding_horizon_year:
+            raise SystemExit('World summary requires one exact experiment ID and an explicit horizon')
+        base = os.path.join(args.outputs_dir, 'checkpoints', args.experiment_id,
+                            f'checkpoint_year_{args.funding_horizon_year}.json')
+        checkpoint = read_json(base if os.path.exists(base) else base + '.gz')
+        if int(checkpoint['year']) != args.funding_horizon_year:
+            raise ValueError('Checkpoint does not match the requested horizon')
+        summary = summarize_completed_world(agent_year, paper_age, ecosystem, checkpoint)
+        summary['experiment_id'] = args.experiment_id
+        path = os.path.join(args.out_dir, 'world_summary.json')
+        write_json_file(summary, path, trailing_newline=True, streaming=False, indent=2)
+        print(f'Wrote {path} (one completed world)')
+        return
     researchers = researcher_level(agent_year)
     researchers['log1p_citations'] = np.log1p(researchers['total_citations'])
     # Frozen H4 endpoint: within-seed top-decile citation stock (ITT)
@@ -489,7 +620,7 @@ def main():
         power_analysis(researchers, args.out_dir)
 
     # Markdown report
-    lines = [f"# Cross-seed analysis: {args.multi_run_prefix}", '',
+    lines = [f"# Cross-seed analysis: {args.experiment_id or args.multi_run_prefix}", '',
              f"Valid runs: {len(valid)} ({[r['seed'] for r in valid]}); "
              f"excluded: {len(excluded)}", '',
              '## Balance', balance.to_markdown(index=False), '',

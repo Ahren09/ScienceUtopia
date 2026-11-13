@@ -56,7 +56,18 @@ def parse_arguments(argv=None):
              'Other models (e.g., Qwen/Qwen3-8B) use vLLM. (default: gpt-4o)'
     )
 
-    # vLLM-specific arguments
+    parser.add_argument('--backend', choices=['auto', 'bedrock'], default='auto',
+                        help='Model backend; auto preserves model-name/vLLM routing.')
+    parser.add_argument('--fulltext_index', default=None,
+                        help='Existing offset-index JSON for full-paper peer review.')
+    parser.add_argument('--input_tokens_per_minute', type=int, default=0,
+                        help='Per-client input-token rate; 0 disables pacing.')
+    parser.add_argument('--output_tokens_per_minute', type=int, default=0,
+                        help='Per-client output-token rate; 0 disables pacing.')
+    parser.add_argument('--api_budget_usd', type=float, default=0,
+                        help='Per-run API spending cap, including saved replies; 0 disables it.')
+
+    # Model execution arguments
     parser.add_argument(
         '--tensor_parallel_size',
         type=int,
@@ -79,7 +90,7 @@ def parse_arguments(argv=None):
         '--batch_size',
         type=int,
         default=64,
-        help='Maximum batch size for vLLM batch generation (default: 64)'
+        help='Maximum concurrent HTTP requests or local vLLM batch size (default: 64)'
     )
     parser.add_argument(
         '--vllm_url',
@@ -88,6 +99,17 @@ def parse_arguments(argv=None):
         help='URL of external vLLM server (e.g., http://localhost:8000/v1). '
              'Start server with: vllm serve <model> --gpu-memory-utilization 0.8'
     )
+    parser.add_argument('--save_model_replies', action='store_true',
+                        help='Save each new HTTP reply and reuse completed request IDs on resume.')
+    parser.add_argument('--stop_at_utc', default=None,
+                        help='ISO UTC deadline after which no new model requests are sent.')
+    parser.add_argument('--completion_token_floor', type=int, default=0,
+                        help='Raise model output limits to at least this many tokens; '
+                             'completed responses may stop earlier.')
+    parser.add_argument('--thinking_token_budget', type=int, default=None,
+                        help='Native vLLM reasoning-token budget within the total output limit.')
+    parser.add_argument('--strict_funding_rankings', action='store_true',
+                        help='Constrain funding identifiers and stop on incomplete panel rankings.')
 
     parser.add_argument(
         '--industry_funding_mode',
@@ -211,6 +233,13 @@ def parse_arguments(argv=None):
              'simulated year (values > 1 are percentages, e.g. "28,26,24.5,..."). Overrides the '
              'fixed config acceptance rate. Default: None (fixed rate for all years).'
     )
+    parser.add_argument(
+        '--venue_regime', default='baseline',
+        choices=['baseline', 'uniform', 'heterogeneous_hidden', 'heterogeneous_visible'],
+        help='Three venues with matched topics per category; manipulate rates and visibility.')
+    parser.add_argument(
+        '--review_reuse', action='store_true',
+        help='Carry previous reports forward when an unchanged rejected artifact is resubmitted.')
     parser.add_argument(
         '--strategy_mix',
         type=str,
@@ -366,6 +395,10 @@ def parse_arguments(argv=None):
              'decimal score the prompt already allows (e.g. 2.5).'
     )
     parser.add_argument(
+        '--review_prompt_variant', default='original',
+        choices=['original', 'paraphrase_1', 'paraphrase_2', 'no_distribution'],
+        help='Review wording intervention; preserves score scale and response schema.')
+    parser.add_argument(
         '--acceptance_tiebreak',
         type=str,
         default='stable',
@@ -489,6 +522,12 @@ def parse_arguments(argv=None):
                 f"i{args.num_institutions}_n{n_researchers}_y{args.num_years}_seed{args.seed}{mix_tag}"
             )
         args.experiment_id += cost_tag
+        if args.review_prompt_variant != 'original':
+            args.experiment_id += '_prompt_' + args.review_prompt_variant
+        if args.venue_regime != 'baseline':
+            args.experiment_id += '_venues_' + args.venue_regime
+        if args.review_reuse:
+            args.experiment_id += '_reviewreuse'
         base = args.output_dir  # repository-relative 'outputs'
         args.log_dir = os.path.join(base, 'logs', args.experiment_id)
         args.checkpoint_dir = os.path.join(base, 'checkpoints', args.experiment_id)

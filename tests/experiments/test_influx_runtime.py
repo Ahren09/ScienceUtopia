@@ -294,7 +294,7 @@ class LauncherTests(unittest.TestCase):
                 self.assertTrue(probe.enable_thinking)
                 schema = fmt['json_object']['schema']
                 return {field: schema if field == 'guided_json' else {'json': schema}}
-            module = types.SimpleNamespace(VLLMServerModel=types.SimpleNamespace(_build_extra_body=builder))
+            module = types.SimpleNamespace(VLLMServerModel=types.SimpleNamespace(build_extra_body=builder))
             if field == 'guided_json':
                 with self.assertRaisesRegex(ValueError, 'compatibility fix'):
                     runner.validate_structured_transport(module)
@@ -309,7 +309,7 @@ class LauncherTests(unittest.TestCase):
         tree = ast.parse(path.read_text())
         method = next(f for cls in tree.body if isinstance(cls, ast.ClassDef)
                       and cls.name == 'VLLMServerModel' for f in cls.body
-                      if isinstance(f, ast.FunctionDef) and f.name == '_build_extra_body')
+                      if isinstance(f, ast.FunctionDef) and f.name == 'build_extra_body')
         future = ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')], level=0)
         helper_path = path.with_name('structured_outputs.py')
         spec = importlib.util.spec_from_file_location('influx_transport_probe_helper', helper_path)
@@ -319,7 +319,7 @@ class LauncherTests(unittest.TestCase):
         exec(compile(ast.fix_missing_locations(ast.Module(body=[future, method], type_ignores=[])),
                      str(path), 'exec'), namespace)
         module = types.SimpleNamespace(VLLMServerModel=types.SimpleNamespace(
-            _build_extra_body=namespace['_build_extra_body']))
+            build_extra_body=namespace['build_extra_body']))
         runner.validate_structured_transport(module)
 
     def test_growth_reuses_stock_injection_is_idempotent_and_includes_inactive_coi(self):

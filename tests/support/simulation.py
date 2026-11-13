@@ -491,16 +491,16 @@ class SequentialScriptedLLM(FullYearScriptedLLM):
                 answer["relevant_projects"] = [0]
         return answers
 
-    def _request_seed(self, seed_ctx, item_index, attempt):
+    def request_seed(self, seed_ctx, item_index, attempt):
         return ORIGINAL["derive_seed"](42, *seed_ctx, item_index, attempt)
 
-    def _build_extra_body(self, response_format):
+    def build_extra_body(self, response_format):
         return {
             "structured_outputs": {"json": response_format["json_object"]["schema"]},
             "chat_template_kwargs": {"enable_thinking": True},
         }
 
-    def _create_completion(self, *, seed_ctx, item_index, attempt, **kwargs):
+    def create_completion(self, *, seed_ctx, item_index, attempt, **kwargs):
         self.selection_requests.append(
             deepcopy(
                 {

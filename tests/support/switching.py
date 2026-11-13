@@ -349,7 +349,7 @@ class AuditedPropensityLLM(legacy.SequentialScriptedLLM):
                 temperature=temperature,
                 max_tokens=max_tokens,
                 extra_body={
-                    "seed": self._request_seed(seed_ctx, index, 0),
+                    "seed": self.request_seed(seed_ctx, index, 0),
                     "chat_template_kwargs": {"enable_thinking": True},
                 },
             )

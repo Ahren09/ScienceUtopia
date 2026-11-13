@@ -5,6 +5,38 @@ import numpy as np
 import pandas as pd
 
 
+def paired_spearman_ci(human, baseline, history, n_boot=10000, seed=0):
+    """Resample papers jointly for two correlations and their paired difference."""
+    from scipy.stats import spearmanr
+
+    vectors = np.asarray([human, baseline, history], dtype=float)
+    if vectors.ndim != 2 or vectors.shape[1] < 2 or not np.isfinite(vectors).all():
+        raise ValueError("Three finite aligned score vectors are required")
+    rng = np.random.default_rng(seed)
+
+    def estimates(sample):
+        values = vectors[:, sample]
+        first = spearmanr(values[0], values[1]).statistic
+        second = spearmanr(values[0], values[2]).statistic
+        return np.array([first, second, second - first], dtype=float)
+
+    point = estimates(np.arange(vectors.shape[1]))
+    boot = np.array([
+        estimates(rng.integers(0, vectors.shape[1], vectors.shape[1]))
+        for _ in range(n_boot)
+    ])
+    result = {}
+    for index, name in enumerate(('expertise_only', 'history', 'history_minus_expertise')):
+        valid = boot[:, index][np.isfinite(boot[:, index])]
+        result[name] = {
+            'estimate': float(point[index]) if np.isfinite(point[index]) else None,
+            'ci_lo': float(np.quantile(valid, 0.025)) if len(valid) else None,
+            'ci_hi': float(np.quantile(valid, 0.975)) if len(valid) else None,
+            'valid_bootstrap_draws': len(valid), 'n_papers': vectors.shape[1],
+        }
+    return result
+
+
 def hierarchical_bootstrap(contrasts: pd.DataFrame, n_boot=10000, seed=0):
     """Two-level bootstrap: resample seeds, then institutions within seed.
 

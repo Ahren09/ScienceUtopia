@@ -4,6 +4,8 @@ import logging
 import os
 import re
 import time
+import threading
+from pathlib import Path
 from io import BytesIO
 from typing import List, Optional, Union, Dict, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -17,6 +19,9 @@ from utopia.config import SIMULATION_CONFIG
 from utopia.models.structured_outputs import build_vllm_extra_body
 
 logger = logging.getLogger(__name__)
+
+class ExperimentTimeLimit(BaseException):
+    """Stop new requests at the campaign deadline while retaining saved replies."""
 
 
 class BaseLLM:
@@ -212,7 +217,9 @@ def parse_json_response(text: str) -> Dict:
     2. Extract from ```json ... ``` blocks
     3. Regex match for {...} object
 
-    Also strips Qwen3 </think> content if present.
+    Also strips Qwen3 </think> content if present. Lone Unicode surrogates
+    decoded from model JSON become U+FFFD so later prompts remain encodable;
+    the supplied raw response text is unchanged.
 
     Args:
         text: Raw model response text
@@ -223,6 +230,17 @@ def parse_json_response(text: str) -> Dict:
     Raises:
         ValueError: If JSON parsing fails
     """
+    def decode_json(candidate):
+        value = json.loads(candidate)
+        serialized = json.dumps(value, ensure_ascii=False)
+        try:
+            serialized.encode('utf-8')
+        except UnicodeEncodeError:
+            value = json.loads(
+                serialized.encode('utf-16-le', errors='surrogatepass')
+                .decode('utf-16-le', errors='replace'))
+        return value
+
     text = text.strip()
 
     # For Qwen3 thinking mode, extract content after </think> tag
@@ -231,7 +249,7 @@ def parse_json_response(text: str) -> Dict:
 
     # Strategy 1: Direct parse
     try:
-        return json.loads(text)
+        return decode_json(text)
     except json.JSONDecodeError:
         pass
 
@@ -240,7 +258,7 @@ def parse_json_response(text: str) -> Dict:
     matches = re.findall(json_block_pattern, text)
     for match in matches:
         try:
-            return json.loads(match.strip())
+            return decode_json(match.strip())
         except json.JSONDecodeError:
             continue
 
@@ -249,7 +267,7 @@ def parse_json_response(text: str) -> Dict:
     match = re.search(json_obj_pattern, text)
     if match:
         try:
-            return json.loads(match.group())
+            return decode_json(match.group())
         except json.JSONDecodeError:
             pass
 
@@ -260,7 +278,7 @@ def parse_json_response(text: str) -> Dict:
         candidate = json_match.group()
     if candidate.count("{") - candidate.count("}") == 1:
         try:
-            return json.loads(candidate + "}")
+            return decode_json(candidate + "}")
         except json.JSONDecodeError:
             pass
 
@@ -522,229 +540,436 @@ class VLLMModel(BaseLLM):
         return results
 
 
-class VLLMServerModel(BaseLLM):
-    """Connects to an external vLLM server via OpenAI-compatible API.
+class ModelRequestError(BaseException):
+    """Stop failed API batches after preserving every completed reply."""
 
-    This avoids in-process model loading (30-300s) by connecting to a
-    persistent vLLM server started separately (e.g., `vllm serve Qwen/Qwen3-0.6B`).
-    """
+
+def openai_schema(value):
+    """Translate the existing agent schemas into the OpenAI strict-JSON subset."""
+    if isinstance(value, list):
+        return [openai_schema(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    result = {key: openai_schema(item) for key, item in value.items()
+              if key not in ('default', 'const')}
+    if 'const' in value:
+        constant = value['const']
+        result['enum'] = [constant]
+        result.setdefault('type', 'integer' if isinstance(constant, int) else 'string')
+    if result.get('type') == 'object' or 'properties' in result:
+        properties = result.setdefault('properties', {})
+        required = set(result.get('required', []))
+        for key, schema in properties.items():
+            if key not in required:
+                properties[key] = {'anyOf': [schema, {'type': 'null'}]}
+        result['required'] = list(properties)
+        result['additionalProperties'] = False
+    return result
+
+
+class APIBatchModel(BaseLLM):
+    """Shared ordered batches, bounded retries and request-ID continuation for HTTP models."""
+
+    fail_on_error = False
+    supports_response_formats = True
 
     def __init__(
-        self,
-        model_name: str,
-        base_url: str = "http://localhost:8000/v1",
-        max_concurrent_requests: int = 32,
-        run_seed: Optional[int] = None,
+        self, model_name, base_url, max_concurrent_requests=32, run_seed=None,
+        response_cache_path=None, stop_at_utc=None, completion_token_floor=0,
+        thinking_token_budget=None, api_key=None, sdk_retries=5,
+        input_tokens_per_minute=0, output_tokens_per_minute=0, api_budget_usd=0,
     ):
         super().__init__(model_name)
         self.base_url = base_url
         self.max_concurrent_requests = max_concurrent_requests
+        self.completion_token_floor = completion_token_floor
+        self.thinking_token_budget = thinking_token_budget
         self.enable_thinking = SIMULATION_CONFIG['llm']['enable_thinking']
-        # Run seed: when set, every request gets a deterministic per-request seed
-        # derived from (run_seed, seed_ctx..., item_index, attempt).
         self.run_seed = run_seed
+        self.response_cache_path = Path(response_cache_path) if response_cache_path else None
+        self.saved_responses = {}
+        self.response_write_lock = threading.Lock()
+        self.token_rates = [input_tokens_per_minute, output_tokens_per_minute]
+        if min(self.token_rates) < 0:
+            raise ValueError('Token rates must be nonnegative')
+        if input_tokens_per_minute or api_budget_usd:
+            import tiktoken
+            self.input_tokenizer = tiktoken.get_encoding('o200k_base')
+        self.token_balances = [0.0, 0.0]
+        self.quota_time = time.monotonic()
+        self.output_estimates = {}
+        self.batch_cancelled = threading.Event()
+        self.api_budget_usd = api_budget_usd
+        self.cost_usd = self.pending_cost_usd = 0.0
+        self.stop_at_timestamp = None
+        if stop_at_utc:
+            from datetime import datetime
+            self.stop_at_timestamp = datetime.fromisoformat(
+                stop_at_utc.replace('Z', '+00:00')).timestamp()
+        if self.response_cache_path:
+            self.response_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            if self.response_cache_path.exists():
+                with self.response_cache_path.open() as stream:
+                    for line in stream:
+                        if line.strip():
+                            row = json.loads(line)
+                            if not row.get('cache_replay', False):
+                                self.cost_usd += self.response_cost(row['response'].get('usage') or {})
+                            if row.get('complete'):
+                                self.saved_responses.setdefault(row['request_id'], []).append(row)
+                                context = json.loads(row['request_id'])[0]
+                                phase = str(context[0]) if context else 'default'
+                                output = (row['response'].get('usage') or {}).get('completion_tokens', 0)
+                                self.output_estimates[phase] = max(self.output_estimates.get(phase, 0), output)
         from utopia.models.request_audit import active_audit_for
         self.request_audit = active_audit_for(model_name)
-        # Cumulative call statistics for the run manifest and fallback-rate gates
-        self.call_stats = {
-            'n_prompts': 0,
-            'n_first_attempt_success': 0,
-            'n_retries': 0,
-            'n_failures': 0,
-            'elapsed_seconds': 0.0,
-            'prompt_tokens': 0,
-            'completion_tokens': 0,
-        }
+        self.call_stats = dict(n_prompts=0, n_first_attempt_success=0, n_retries=0,
+                               n_failures=0, elapsed_seconds=0.0,
+                               prompt_tokens=0, completion_tokens=0)
+        self.client = OpenAI(base_url=base_url, api_key=api_key, timeout=600.0,
+                             max_retries=sdk_retries)
+        logger.info(f"Initialized {type(self).__name__} at {base_url} (model: {model_name})")
 
-        # Local vLLM servers need no key ("EMPTY"); remote deployments (e.g. Modal)
-        # set VLLM_API_KEY. Generous timeout + retries tolerate autoscale cold starts.
-        self.client = OpenAI(
-            base_url=base_url,
-            api_key=os.environ.get("VLLM_API_KEY", "EMPTY"),
-            timeout=600.0,
-            max_retries=5,
-        )
+    def build_payload(self, messages, temperature, max_tokens, response_format,
+                      seed_ctx=None, item_index=0, attempt=0):
+        raise NotImplementedError
 
-        # Test connection (warning only, not fatal)
+    def response_details(self, response):
+        choice = response.choices[0]
+        usage = response.usage
+        return (choice.message.content or '', choice.finish_reason,
+                 (usage.prompt_tokens or 0, usage.completion_tokens or 0) if usage else (0, 0))
+
+    def response_cost(self, usage):
+        return 0.0
+
+    def find_saved_response(self, request_id, payload):
+        """Reuse matching request IDs; keep input checks when retry queues change order."""
+        fields = ('model', 'messages', 'temperature')
+        for row in reversed(self.saved_responses.get(request_id, [])):
+            saved = row.get('payload', {})
+            if all(saved.get(field) == payload.get(field) for field in fields):
+                return row['response']
+        return None
+
+    def wait_for_quota(self, payload, phase):
+        """Reserve input and predicted output; sleeping requests remain cancellable."""
+        content = json.dumps([payload['messages'], payload.get('response_format')], ensure_ascii=False)
+        input_tokens = 0
+        if self.token_rates[0] or self.api_budget_usd:
+            try:
+                input_tokens = len(self.input_tokenizer.encode(content, disallowed_special=()))
+            except ValueError as error:
+                if not str(error).startswith('Regex error while tokenizing:'):
+                    raise
+                # Long whitespace runs can exceed the tokenizer's regex stack.
+                # Split only the quota estimate; the request keeps its full text.
+                input_tokens = sum(len(self.input_tokenizer.encode(
+                    content[start:start + 4096], disallowed_special=()))
+                    for start in range(0, len(content), 4096))
+            input_tokens += 64
+        while not self.batch_cancelled.is_set():
+            with self.response_write_lock:
+                now = time.monotonic()
+                reserved = [input_tokens, self.output_estimates.get(phase, 1024)]
+                delay = 0.0
+                for index, rate in enumerate(self.token_rates):
+                    if rate:
+                        self.token_balances[index] = min(
+                            max(rate, reserved[index]),
+                            self.token_balances[index] + (now - self.quota_time) * rate / 60)
+                        delay = max(delay, (reserved[index] - self.token_balances[index]) * 60 / rate)
+                self.quota_time = now
+                if delay <= 0:
+                    for index, rate in enumerate(self.token_rates):
+                        if rate:
+                            self.token_balances[index] -= reserved[index]
+                    return reserved
+            time.sleep(min(delay, 1.0))
+        raise ModelRequestError('Batch stopped; completed replies retained')
+
+    def create_completion(self, *, seed_ctx=None, item_index=0, attempt=0, **payload):
+        request_id = json.dumps([seed_ctx, item_index, attempt],
+                                ensure_ascii=True, separators=(',', ':'))
+        cache_path = getattr(self, 'response_cache_path', None)
+        if cache_path and seed_ctx is not None:
+            saved = self.find_saved_response(request_id, payload)
+            if saved is not None:
+                from openai.types.chat import ChatCompletion
+                return ChatCompletion.model_validate(saved)
+        phase = str(seed_ctx[0]) if seed_ctx else 'default'
+        reserved = self.wait_for_quota(payload, phase)
+        cutoff = getattr(self, 'stop_at_timestamp', None)
+        if cutoff is not None and time.time() >= cutoff:
+            raise ExperimentTimeLimit('Campaign compute cutoff reached; saved replies retained')
+        reserved_cost = self.response_cost({
+            'prompt_tokens': reserved[0],
+            'completion_tokens': payload.get('max_completion_tokens', payload.get('max_tokens', 0)),
+            'prompt_tokens_details': {'cache_write_tokens': reserved[0]},
+        }) if self.api_budget_usd else 0.0
+        with self.response_write_lock:
+            if self.api_budget_usd and self.cost_usd + self.pending_cost_usd + reserved_cost > self.api_budget_usd:
+                self.batch_cancelled.set()
+                raise ModelRequestError(f'API budget reached (${self.cost_usd:.2f}); saved replies retained')
+            self.pending_cost_usd += reserved_cost
+        call = self.client.chat.completions.create
+        started_ns = time.time_ns()
+        try:
+            if self.request_audit is None:
+                response = call(**payload)
+            else:
+                response = self.request_audit.create(
+                    call, seed_ctx=seed_ctx, item_index=item_index, attempt=attempt, **payload)
+        except Exception as error:
+            with self.response_write_lock:
+                self.pending_cost_usd -= reserved_cost
+            if getattr(error, 'status_code', None) in (400, 401, 403, 404):
+                self.batch_cancelled.set()
+                raise ModelRequestError(f'Model access failed: {error}') from error
+            raise
+        _, _, actual = self.response_details(response)
+        with self.response_write_lock:
+            self.pending_cost_usd -= reserved_cost
+            self.cost_usd += self.response_cost(response.usage.model_dump() if response.usage else {})
+            self.output_estimates[phase] = max(self.output_estimates.get(phase, 0), actual[1])
+            for index, rate in enumerate(self.token_rates):
+                if rate:
+                    self.token_balances[index] = min(
+                        rate, self.token_balances[index] + reserved[index] - actual[index])
+        if cache_path:
+            text, finish, _ = self.response_details(response)
+            complete = finish == 'stop'
+            if complete:
+                try:
+                    result = parse_json_response(text)
+                    fmt = payload.get('response_format', {}).get('json_schema', {})
+                    if fmt.get('schema'):
+                        from jsonschema import validate
+                        validate(result, fmt['schema'])
+                except Exception:
+                    complete = False
+            record = {
+                'request_id': request_id, 'time_ns': time.time_ns(),
+                'started_ns': started_ns, 'elapsed_seconds': (time.time_ns() - started_ns) / 1e9,
+                'concurrency': self.max_concurrent_requests,
+                'cache_replay': False, 'complete': complete,
+                'payload': payload, 'response': response.model_dump(mode='json'),
+            }
+            serialized = json.dumps(record, ensure_ascii=True)
+            with self.response_write_lock:
+                with cache_path.open('a') as stream:
+                    stream.write(serialized + '\n')
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                if complete and seed_ctx is not None:
+                    self.saved_responses.setdefault(request_id, []).append(json.loads(serialized))
+        return response
+
+    def generate(self, prompt=None, image=None, temperature=0.7,
+                 system_prompt="This is a simulation of an academic ecosystem, where researchers choose research directions and submit papers, reviewers conduct peer reviews of papers, and funding agencies allocate fundings.",
+                 response_format=None, message_history=None, max_tokens=2048, seed_ctx=None):
+        """Generate one structured reply with the same provider transport as batches."""
+        if image is not None:
+            logger.warning('Image inputs are ignored by the simulation HTTP backend')
+        messages = list(message_history or [])
+        if not messages and system_prompt:
+            messages.append({'role': 'system', 'content': system_prompt})
+        messages.append({'role': 'user', 'content': prompt})
+        payload = self.build_payload(messages, temperature, max(max_tokens, self.completion_token_floor),
+                                     response_format, seed_ctx)
+        response = self.create_completion(seed_ctx=seed_ctx, **payload)
+        text, finish, _ = self.response_details(response)
+        if finish != 'stop':
+            raise ValueError(f'Incomplete model response: {finish}')
+        result = parse_json_response(text.strip())
+        messages.append({'role': 'assistant', 'content': [{'type': 'text', 'text': text}]})
+        return result, messages
+
+    def generate_batch(self, prompts, response_format=None, temperature=0.7,
+                       system_prompt="This is a simulation of an academic ecosystem, where researchers choose research directions and submit papers, reviewers conduct peer reviews of papers, and funding agencies allocate fundings.",
+                       max_tokens=SIMULATION_CONFIG['llm']['max_tokens'], desc=None,
+                       seed_ctx=None, item_ids=None, on_result=None, response_formats=None):
+        """Execute one batch up to the configured concurrency; return in input order."""
+        if not prompts:
+            return []
+        self.batch_cancelled.clear()
+        max_tokens = max(max_tokens, self.completion_token_floor)
+        if item_ids is not None and (len(item_ids) != len(prompts) or len(set(item_ids)) != len(item_ids)):
+            raise ValueError('Each prompt requires one unique item ID')
+        if response_formats is not None and len(response_formats) != len(prompts):
+            raise ValueError('Each prompt requires one response format')
+        formats = response_formats if response_formats is not None else [response_format] * len(prompts)
+
+        def call_single(index):
+            messages = [{'role': 'system', 'content': system_prompt}] if system_prompt else []
+            messages.append({'role': 'user', 'content': f'{IMPORTANT_NOTES}\n\n{prompts[index]}'})
+            context = (*(seed_ctx or ()), item_ids[index]) if item_ids is not None else seed_ctx
+            position = 0 if item_ids is not None else index
+            tokens = [0, 0]
+            finish, error_message, retries, cache_replay = None, None, 0, False
+            started = time.perf_counter()
+            attempts = range(3)
+            for saved_attempt in range(3):
+                saved_payload = self.build_payload(messages, temperature, max_tokens, formats[index],
+                                                   context, position, saved_attempt)
+                saved_id = json.dumps([context, position, saved_attempt], ensure_ascii=True, separators=(',', ':'))
+                if self.find_saved_response(saved_id, saved_payload) is not None:
+                    attempts = [saved_attempt]
+                    break
+            for attempt in attempts:
+                try:
+                    payload = self.build_payload(messages, temperature, max_tokens, formats[index],
+                                                 context, position, attempt)
+                    request_id = json.dumps([context, position, attempt],
+                                            ensure_ascii=True, separators=(',', ':'))
+                    cache_replay = self.find_saved_response(request_id, payload) is not None
+                    response = self.create_completion(seed_ctx=context, item_index=position,
+                                                      attempt=attempt, **payload)
+                    text, finish, usage = self.response_details(response)
+                    if not cache_replay:
+                        tokens[0] += usage[0]
+                        tokens[1] += usage[1]
+                    if finish != 'stop':
+                        raise ValueError(f'Incomplete model response: {finish} (limit {max_tokens})')
+                    result = parse_json_response(text.strip())
+                    if result is None and formats[index] is not None:
+                        raise ValueError('Structured output is empty')
+                    if payload.get('response_format', {}).get('json_schema', {}).get('schema'):
+                        from jsonschema import validate
+                        validate(result, payload['response_format']['json_schema']['schema'])
+                    messages.append({'role': 'assistant', 'content': [{'type': 'text', 'text': text}]})
+                    return index, (result, messages), dict(success=True, n_retries=retries,
+                        prompt_tokens=tokens[0], completion_tokens=tokens[1], cache_replay=cache_replay,
+                        finish_reason=finish, max_tokens=max_tokens,
+                        elapsed_seconds=time.perf_counter() - started, time_ns=time.time_ns())
+                except Exception as error:
+                    retries += 1
+                    error_message = str(error)
+                    logger.warning(f'Prompt {index} attempt {attempt + 1}/3 failed: {error}')
+                    # Drain the batch before the caller selects a lower concurrency.
+                    if self.fail_on_error and (getattr(error, 'status_code', None) == 429
+                                              or type(error).__name__ == 'APITimeoutError'):
+                        break
+            return index, (None, messages), dict(success=False, n_retries=retries,
+                prompt_tokens=tokens[0], completion_tokens=tokens[1], cache_replay=cache_replay,
+                finish_reason=finish, max_tokens=max_tokens, error=error_message,
+                elapsed_seconds=time.perf_counter() - started, time_ns=time.time_ns())
+
+        label = desc or f'batch of {len(prompts)} prompts'
+        logger.info(f'[{type(self).__name__}] Generating {label}; concurrency={self.max_concurrent_requests}')
+        started = time.perf_counter()
+        results = [None] * len(prompts)
+        with ThreadPoolExecutor(max_workers=self.max_concurrent_requests) as executor:
+            futures = [executor.submit(call_single, index) for index in range(len(prompts))]
+            try:
+                for future in tqdm(as_completed(futures), total=len(prompts), desc=label):
+                    index, result, info = future.result()
+                    results[index] = result
+                    self.call_stats['n_prompts'] += 1
+                    for key in ('n_retries', 'prompt_tokens', 'completion_tokens'):
+                        self.call_stats[key] += info[key]
+                    if info['success'] and info['n_retries'] == 0:
+                        self.call_stats['n_first_attempt_success'] += 1
+                    if not info['success']:
+                        self.call_stats['n_failures'] += 1
+                    if on_result is not None:
+                        on_result(index, result, info)
+                    if self.fail_on_error and not info['success']:
+                        raise ModelRequestError(
+                            f'API request failed: {info["error"]}; completed replies are saved.')
+            except BaseException:
+                self.batch_cancelled.set()
+                for future in futures:
+                    future.cancel()
+                raise
+        self.call_stats['elapsed_seconds'] += time.perf_counter() - started
+        return results
+
+
+class VLLMServerModel(APIBatchModel):
+    """OpenAI-compatible chat transport for the existing vLLM services."""
+
+    def __init__(self, model_name, base_url='http://localhost:8000/v1', **kwargs):
+        super().__init__(model_name, base_url, api_key=os.environ.get('VLLM_API_KEY', 'EMPTY'), **kwargs)
         self.client.models.list()
-        logger.info(f"Connected to vLLM server at {base_url} (model: {model_name})")
 
-    def _request_seed(self, seed_ctx: Optional[tuple], idx: int, attempt: int) -> Optional[int]:
+    def request_seed(self, seed_ctx, index, attempt):
         if self.run_seed is None:
             return None
         from utopia.utils.seeding import derive_seed
-        return derive_seed(self.run_seed, *(seed_ctx or ('noctx',)), idx, attempt)
-        
-    def _build_extra_body(self, response_format: Optional[Dict] = None) -> dict:
-        """Translate internal response_format to vLLM 0.12 structured outputs."""
-        schema = None
-        if response_format and response_format.get('type') == 'json_schema':
-            json_object = response_format.get('json_object', {})
-            schema = json_object.get('schema')
-        return build_vllm_extra_body(schema, enable_thinking=self.enable_thinking)
+        return derive_seed(self.run_seed, *(seed_ctx or ('noctx',)), index, attempt)
 
-    def _create_completion(self, *, seed_ctx=None, item_index=0, attempt=0, **payload):
-        audit = self.request_audit
-        if audit is None:
-            return self.client.chat.completions.create(**payload)
-        return audit.create(
-            self.client.chat.completions.create, seed_ctx=seed_ctx,
-            item_index=item_index, attempt=attempt, **payload)
+    def build_extra_body(self, response_format=None):
+        schema = (response_format.get('json_object', {}).get('schema')
+                  if response_format and response_format.get('type') == 'json_schema' else None)
+        extra = build_vllm_extra_body(schema, enable_thinking=self.enable_thinking)
+        if getattr(self, 'thinking_token_budget', None) is not None:
+            extra['thinking_token_budget'] = self.thinking_token_budget
+        return extra
 
-    def generate(
-        self,
-        prompt: Optional[str] = None,
-        image: Optional[List[Union[str, Image.Image]]] = None,
-        temperature: float = 0.7,
-        system_prompt: Optional[str] = "This is a simulation of an academic ecosystem, where researchers choose research directions and submit papers, reviewers conduct peer reviews of papers, and funding agencies allocate fundings.",
-        response_format=None,
-        message_history: Optional[List[Dict]] = None,
-        max_tokens: int = 2048,
-        seed_ctx: Optional[tuple] = None,
-    ) -> Tuple[Dict, List[Dict]]:
-        """Generate response via the external vLLM server.
+    def build_payload(self, messages, temperature, max_tokens, response_format,
+                      seed_ctx=None, item_index=0, attempt=0):
+        extra = self.build_extra_body(response_format)
+        seed = self.request_seed(seed_ctx, item_index, attempt)
+        if seed is not None:
+            extra['seed'] = seed
+        return dict(model=self.model_name, messages=messages, temperature=temperature,
+                    max_tokens=max_tokens, extra_body=extra or None)
 
-        Returns:
-            Tuple of (parsed_json_dict, message_history)
-        """
-        if image is not None:
-            logger.warning("VLLMServerModel does not support images, ignoring image parameter")
 
-        # Build messages (server applies chat template)
-        if message_history:
-            messages = message_history.copy()
-            messages.append({"role": "user", "content": prompt})
-        else:
-            messages = []
-            if system_prompt:
-                messages.append({"role": "system", "content": system_prompt})
-            messages.append({"role": "user", "content": prompt})
+class BedrockModel(APIBatchModel):
+    """Bedrock OpenAI chat transport with online concurrent inference."""
 
-        extra_body = self._build_extra_body(response_format)
-        request_seed = self._request_seed(seed_ctx, 0, 0)
-        if request_seed is not None:
-            extra_body['seed'] = request_seed
+    fail_on_error = True
 
-        response = self._create_completion(
-            seed_ctx=seed_ctx,
-            model=self.model_name,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            extra_body=extra_body if extra_body else None,
-        )
+    def __init__(self, model_name, base_url=None, **kwargs):
+        if kwargs.get('api_budget_usd') and model_name != 'openai.gpt-5.6-luna':
+            raise ValueError('API budget pricing is currently defined for openai.gpt-5.6-luna')
+        region = os.environ.get('AWS_REGION', 'us-west-2')
+        base_url = base_url or f'https://bedrock-mantle.{region}.api.aws/openai/v1'
+        key = os.environ.get('AWS_BEARER_TOKEN_BEDROCK')
+        if not key:
+            raise ModelRequestError('AWS_BEARER_TOKEN_BEDROCK is required')
+        super().__init__(model_name, base_url, api_key=key, sdk_retries=0, **kwargs)
 
-        response_text = response.choices[0].message.content.strip()
+    def response_cost(self, usage):
+        if self.model_name != 'openai.gpt-5.6-luna':
+            return 0.0
+        prompt = usage.get('prompt_tokens', 0)
+        output = usage.get('completion_tokens', 0)
+        details = usage.get('prompt_tokens_details') or {}
+        write = details.get('cache_write_tokens', 0) or 0
+        read = details.get('cached_tokens', 0) or 0
+        prices = (.44, .55, .044, 1.98) if prompt > 272000 else (.22, .275, .022, 1.32)
+        return (max(0, prompt-write-read)*prices[0] + write*prices[1]
+                + read*prices[2] + output*prices[3]) / 1e6
 
-        response_json = parse_json_response(response_text)
-
-        messages.append({
-            "role": "assistant",
-            "content": [{"type": "text", "text": response_text}]
-        })
-
-        return response_json, messages
-
-    def generate_batch(
-        self,
-        prompts: List[str],
-        response_format: Optional[Dict] = None,
-        temperature: float = 0.7,
-        system_prompt: Optional[str] = "This is a simulation of an academic ecosystem, where researchers choose research directions and submit papers, reviewers conduct peer reviews of papers, and funding agencies allocate fundings.",
-        max_tokens: int = SIMULATION_CONFIG['llm']['max_tokens'],
-        desc: Optional[str] = None,
-        seed_ctx: Optional[tuple] = None,
-    ) -> List[Tuple[Dict, List[Dict]]]:
-        """Process prompts concurrently via the external vLLM server.
-
-        Uses ThreadPoolExecutor — the vLLM server handles continuous batching internally.
-        When run_seed is set, each request carries a deterministic seed derived from
-        (run_seed, *seed_ctx, item_index, attempt).
-
-        Returns:
-            List of (parsed_json_dict, message_history) tuples, one per prompt.
-        """
-
-        if not prompts:
-            return []
-
-        base_extra_body = self._build_extra_body(response_format)
-
-        max_retries = 3
-
-        def _call_single(idx_prompt):
-            idx, prompt = idx_prompt
-
-            msgs = []
-            if system_prompt:
-                msgs.append({"role": "system", "content": system_prompt})
-            msgs.append({"role": "user", "content": f"{IMPORTANT_NOTES}\n\n{prompt}"})
-
-            success = False
-            response_text = ""
-            response_json = None
-            n_retries = 0
-            tokens = (0, 0)  # (prompt, completion) — accumulated by the main thread
-            for attempt in range(max_retries):
-                try:
-                    extra_body = dict(base_extra_body)
-                    request_seed = self._request_seed(seed_ctx, idx, attempt)
-                    if request_seed is not None:
-                        extra_body['seed'] = request_seed
-                    resp = self._create_completion(
-                        seed_ctx=seed_ctx, item_index=idx, attempt=attempt,
-                        model=self.model_name,
-                        messages=msgs,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        extra_body=extra_body if extra_body else None,
-                    )
-                    response_text = resp.choices[0].message.content.strip()
-                    if getattr(resp, 'usage', None):
-                        tokens = (resp.usage.prompt_tokens or 0, resp.usage.completion_tokens or 0)
-                    response_json = parse_json_response(response_text)
-                    if response_json is None and response_format is not None:
-                        raise ValueError("Parsed JSON is None but structured output was expected")
-                    success = True
-                    break
-                except Exception as e:
-                    n_retries += 1
-                    if attempt < max_retries - 1:
-                        logger.warning(f"Prompt {idx} attempt {attempt + 1}/{max_retries} failed: {e}. Retrying...")
-                    else:
-                        logger.error(f"Prompt {idx} failed after {max_retries} attempts: {e}")
-
-            if not success:
-                return idx, (None, msgs), n_retries, False, tokens
-
-            msgs.append({
-                "role": "assistant",
-                "content": [{"type": "text", "text": response_text}]
-            })
-            return idx, (response_json, msgs), n_retries, True, tokens
-
-        label = desc or f"batch of {len(prompts)} prompts"
-        logger.info(f"[vLLM Server] Generating {label} ...")
-
-        start_time = time.time()
-        results = [None] * len(prompts)
-        with ThreadPoolExecutor(max_workers=self.max_concurrent_requests) as executor:
-            futures = {executor.submit(_call_single, (i, p)): i for i, p in enumerate(prompts)}
-            for future in tqdm(as_completed(futures), total=len(prompts), desc=label):
-                idx, result, n_retries, success, tokens = future.result()
-                results[idx] = result
-                self.call_stats['n_prompts'] += 1
-                self.call_stats['n_retries'] += n_retries
-                self.call_stats['prompt_tokens'] += tokens[0]
-                self.call_stats['completion_tokens'] += tokens[1]
-                if success and n_retries == 0:
-                    self.call_stats['n_first_attempt_success'] += 1
-                if not success:
-                    self.call_stats['n_failures'] += 1
-        self.call_stats['elapsed_seconds'] += time.time() - start_time
-
-        logger.info(f"Batch generation complete: {len(results)} responses")
-        return results
+    def build_payload(self, messages, temperature, max_tokens, response_format,
+                      seed_ctx=None, item_index=0, attempt=0):
+        fmt = {'type': 'json_object'}
+        if response_format:
+            source = response_format.get('json_object', response_format.get('json_schema', {}))
+            fmt = dict(type='json_schema', json_schema=dict(
+                name=source.get('name', 'response'), strict=True,
+                schema=openai_schema(source['schema'])))
+        payload = dict(model=self.model_name, messages=messages, temperature=temperature,
+                       max_completion_tokens=max_tokens, reasoning_effort='none', response_format=fmt)
+        if seed_ctx and seed_ctx[0] in ('phase3_reviews', 'keywords'):
+            properties = fmt.get('json_schema', {}).get('schema', {}).get('properties', {})
+            text_schema = (properties.get('justification', {})
+                           if seed_ctx[0] == 'phase3_reviews'
+                           else properties.get('keywords', {}).get('items', {}))
+            saved_ids = [json.dumps([seed_ctx, item_index, number], ensure_ascii=True,
+                                    separators=(',', ':')) for number in range(3)]
+            # Keep saved replies reusable, including those from the older schema.
+            if text_schema.get('type') == 'string' and not any(
+                    self.find_saved_response(saved_id, payload) is not None
+                    for saved_id in saved_ids):
+                # Repeated escaped control characters can exhaust the output cap.
+                text_schema['pattern'] = (r'^[^\u0000-\u001f\u007f-\u009f]*$'
+                                          if seed_ctx[0] == 'phase3_reviews'
+                                          else r'^[^\u001b]*$')
+        return payload
 
 
 def load_base64_image(image_input: Union[str, Image.Image], format: str = "JPEG") -> str:

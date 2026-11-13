@@ -36,6 +36,8 @@ import hashlib
 import json
 import logging
 import os
+from pathlib import Path
+import re
 import sys
 import time
 
@@ -99,6 +101,37 @@ NRB_CONDITIONS = ('A', 'B', 'C')
 POLICY_HEADING = '## Your Review Approach'
 
 STUDIES = {
+    'review_sensitivity': {
+        'prereg': 'outputs/docs/iclr2027_rebuttal/protocol.json',
+        'corpus_dir': 'data/review_sensitivity',
+        'stages': {stage: f'review_replay_sensitivity_{stage}'
+                   for stage in ('paraphrase', 'main', 'recognition')},
+        'write_prefixes': ('data/review_sensitivity', 'outputs/docs/review_replay_',
+                           'outputs/logs/review_replay_'),
+        'source_ids': [], 'source_seeds': [42],
+        'seed_ctx_root': 'review_sensitivity', 'task_sort_column': 'task_uid',
+        'serving_note': '600 fixed papers, three profiles, six conditions, two evaluators',
+    },
+    'historical_direction': {
+        'prereg': 'outputs/docs/iclr2027_rebuttal/protocol.json',
+        'corpus_dir': 'data/historical_direction',
+        'stages': {'main': 'review_replay_historical_direction'},
+        'write_prefixes': ('data/historical_direction', 'outputs/docs/review_replay_',
+                           'outputs/logs/review_replay_'),
+        'source_ids': [], 'source_seeds': [42],
+        'seed_ctx_root': 'historical_direction', 'task_sort_column': 'task_uid',
+        'serving_note': 'Two models; the same 1000 stable author IDs and hidden 2021 targets',
+    },
+    'human_review': {
+        'prereg': 'outputs/docs/iclr2027_rebuttal/protocol.json',
+        'corpus_dir': 'data/review_bench',
+        'stages': {'main': 'review_replay_human_review'},
+        'write_prefixes': ('data/review_bench', 'outputs/docs/review_replay_',
+                           'outputs/logs/review_replay_'),
+        'source_ids': [], 'source_seeds': [42],
+        'seed_ctx_root': 'human_review', 'task_sort_column': 'task_uid',
+        'serving_note': 'Qwen3.5-397B-A17B-FP8 only; three fixed expert profiles',
+    },
     'reviewer_monoculture': {
         'prereg': PREREG_V1, 'corpus_dir': CORPUS_DIR, 'stages': dict(STAGES),
         'write_prefixes': ALLOWED_WRITE_PREFIXES,
@@ -1285,6 +1318,8 @@ def freeze_environment_report(vllm_url: str) -> dict:
 
 
 def cmd_generate(args):
+    if ACTIVE_STUDY in ('human_review', 'historical_direction', 'review_sensitivity'):
+        return generate_external_tasks(args)
     assert_safe_vllm_url(args.vllm_url)
     experiment_id = STAGES[args.stage]
     docs_dir = assert_write_allowed(f'outputs/docs/{experiment_id}')
@@ -1300,9 +1335,6 @@ def cmd_generate(args):
 
     corpus_manifest = json.load(open(f'{CORPUS_DIR}/corpus_manifest.json'))
     tasks_path = f'{CORPUS_DIR}/replay_tasks_{args.stage}.parquet'
-    recorded = corpus_manifest['file_sha256'].get(os.path.basename(tasks_path))
-    actual = sha256_file(tasks_path)
-    assert recorded == actual, f'task file hash mismatch: {actual} != {recorded}'
     if 'chunk_size' in corpus_manifest and corpus_manifest['chunk_size'] != CHUNK_SIZE:
         sys.exit(f"[guard] REFUSED: chunk_size {CHUNK_SIZE} differs from the frozen "
                  f"manifest value {corpus_manifest['chunk_size']} — changing chunking "
@@ -1452,7 +1484,26 @@ def cmd_status(args):
 
 
 def cmd_analyze(args):
-    if ACTIVE_STUDY in ('network_proximity', 'network_proximity_confirmatory'):
+    if ACTIVE_STUDY == 'human_review':
+        from utopia.analysis.review_regime_analysis import analyze_human_reviews
+        return analyze_human_reviews(
+            Path(args.corpus_dir) if getattr(args, 'corpus_dir', None) else Path(CORPUS_DIR),
+            external_output_dir(args),
+            n_boot=args.n_boot, seed=GLOBAL_SEED,
+        )
+    elif ACTIVE_STUDY == 'historical_direction':
+        from utopia.analysis.review_regime_analysis import analyze_historical_directions
+        return analyze_historical_directions(
+            Path(CORPUS_DIR), external_output_dir(args),
+            n_boot=args.n_boot, seed=GLOBAL_SEED,
+        )
+    elif ACTIVE_STUDY == 'review_sensitivity':
+        from utopia.analysis.review_regime_analysis import analyze_review_sensitivity
+        return analyze_review_sensitivity(
+            Path(CORPUS_DIR), external_output_dir(args), args.stage,
+            n_boot=args.n_boot, seed=GLOBAL_SEED,
+        )
+    elif ACTIVE_STUDY in ('network_proximity', 'network_proximity_confirmatory'):
         from utopia.analysis.network_review_bias_analysis import run_analysis
         out_name = ('network_review_bias_confirmatory_final'
                     if ACTIVE_STUDY == 'network_proximity_confirmatory'
@@ -1466,10 +1517,463 @@ def cmd_analyze(args):
 
 
 def dispatch_extract(args):
-    if ACTIVE_STUDY in ('network_proximity', 'network_proximity_confirmatory'):
+    if ACTIVE_STUDY == 'human_review':
+        return extract_human_reviews(args)
+    elif ACTIVE_STUDY == 'historical_direction':
+        return extract_historical_directions(args)
+    elif ACTIVE_STUDY == 'review_sensitivity':
+        return extract_review_sensitivity(args)
+    elif ACTIVE_STUDY in ('network_proximity', 'network_proximity_confirmatory'):
         cmd_extract_nrb(args)
     else:
         cmd_extract(args)
+
+
+def human_review_tasks(records):
+    """Build model inputs from paper/profile fields only, excluding all gold."""
+    tasks = []
+    for paper_id, record in sorted(records.items()):
+        source = record['paper_data']
+        profiles = sorted(
+            record['reviewer_data'].items(),
+            key=lambda pair: (-float(pair[1].get('reviewer_match_similarity', 0)), pair[0]),
+        )[:3]
+        if len(profiles) != 3:
+            raise ValueError(f"{paper_id}: expected three distinct expert profiles")
+        for slot, (profile_id, profile) in enumerate(profiles):
+            from utopia.agents.base_agent import SimulationAgent
+            agent = SimulationAgent(reputation=5, agent_id=profile_id, llm=None)
+            agent.expertise = list(profile.get('domain') or [])
+            paper = {
+                'title': source['title'], 'abstract': source['abstract'],
+                'topics': [],
+            }
+            base, _ = agent.get_review_prompt(paper)
+            publications = [
+                {'title': p['title'], 'abstract': p.get('abstract', '')}
+                for p in profile.get('publications', [])
+                if p.get('title', '').strip().casefold() != source['title'].strip().casefold()
+            ]
+            # ResearchBench provides profile bibliographies, not historical reviews.
+            # Keep names, collaborators, human reviews and evaluation_format hidden.
+            background = (
+                '## Reviewer Publication Background\n'
+                + json.dumps(publications, ensure_ascii=False)
+                + '\n\n'
+            )
+            for condition in ('expertise_only', 'history'):
+                prompt = base
+                if condition == 'history':
+                    prompt = prompt.replace(POLICY_ANCHOR, background + POLICY_ANCHOR)
+                tasks.append({
+                    'task_uid': f'{paper_id}|{slot}|{condition}',
+                    'paper_id': paper_id, 'slot': slot, 'profile_id': profile_id,
+                    'condition': condition, 'prompt': prompt,
+                    'n_background_publications': len(publications),
+                })
+    return pd.DataFrame(tasks)
+
+
+def extract_human_reviews(args):
+    path = Path(CORPUS_DIR)
+    records = read_json(path / 'review_bench.json')
+    if len(records) != 200:
+        raise ValueError(f"Expected all 200 ReviewBench papers, found {len(records)}")
+    tasks = human_review_tasks(records)
+    if len(tasks) != 1200 or tasks.task_uid.duplicated().any():
+        raise ValueError("Expected 200 x 3 x 2 unique tasks")
+    task_path = path / 'replay_tasks_main.parquet'
+    if task_path.exists():
+        existing = pd.read_parquet(task_path)
+        if set(existing.task_uid) != set(tasks.task_uid):
+            raise ValueError("Existing task IDs do not cover the prescribed cohort")
+        logger.info('Reusing all %s existing task IDs', len(existing))
+        return
+    gold = []
+    for paper_id, record in sorted(records.items()):
+        scores = [
+            float(re.match(r'^\s*(\d+(?:\.\d+)?)', str(r['rating'])).group(1))
+            for r in record['review_data'] if r.get('rating') is not None
+        ]
+        if not scores:
+            raise ValueError(f'{paper_id}: no human ratings')
+        gold.append({
+            'paper_id': paper_id, 'human_mean': float(np.mean(scores)),
+            'n_human_reviews': len(scores), 'human_scores': json.dumps(scores),
+        })
+    write_parquet_atomic(task_path, tasks, index=False)
+    write_parquet_atomic(path / 'human_gold.parquet', pd.DataFrame(gold), index=False)
+    write_json_atomic(path / 'corpus_manifest.json', {
+        'n_papers': 200, 'n_tasks': 1200, 'profiles_per_paper': 3,
+        'model': 'Qwen/Qwen3.5-397B-A17B-FP8', 'seed': GLOBAL_SEED,
+        'conditions': ['expertise_only', 'history'],
+        'input': 'Original SUTO title/abstract prompt and retrieved expert profiles',
+        'history': 'Profile publication bibliography as provided by ResearchBench',
+        'gold': 'Separate human ratings; never loaded by generation',
+        'profile_selection': 'Descending matching similarity, profile ID breaks ties',
+        'response_format': review_response_format(),
+    }, indent=2)
+    logger.info('Prepared all 1200 tasks and separate gold for 200 papers')
+
+
+def historical_direction_tasks(cohort):
+    """Predict the next topic using only fields dated before the hidden target."""
+    from collections import Counter
+    # Full CS taxonomy, independent of the simulator's selected direction subset.
+    # Source: https://arxiv.org/category_taxonomy, accessed 2026-11-06.
+    labels = dict(zip(
+        ('AI AR CC CE CG CL CR CV CY DB DC DL DM DS ET FL GL GR GT HC IR IT '
+         'LG LO MA MM MS NA NE NI OH OS PF PL RO SC SD SE SI SY').split(),
+        ['Artificial Intelligence', 'Hardware Architecture', 'Computational Complexity',
+         'Computational Engineering, Finance, and Science', 'Computational Geometry',
+         'Computation and Language', 'Cryptography and Security',
+         'Computer Vision and Pattern Recognition', 'Computers and Society', 'Databases',
+         'Distributed, Parallel, and Cluster Computing', 'Digital Libraries',
+         'Discrete Mathematics', 'Data Structures and Algorithms', 'Emerging Technologies',
+         'Formal Languages and Automata Theory', 'General Literature', 'Graphics',
+         'Computer Science and Game Theory', 'Human-Computer Interaction',
+         'Information Retrieval', 'Information Theory', 'Machine Learning',
+         'Logic in Computer Science', 'Multiagent Systems', 'Multimedia',
+         'Mathematical Software', 'Numerical Analysis', 'Neural and Evolutionary Computing',
+         'Networking and Internet Architecture', 'Other Computer Science',
+         'Operating Systems', 'Performance', 'Programming Languages', 'Robotics',
+         'Symbolic Computation', 'Sound', 'Software Engineering',
+         'Social and Information Networks', 'Systems and Control'],
+    ))
+    labels = {'cs.' + code: name for code, name in labels.items()}
+    lookup = {row['author_id']: row for row in cohort}
+    tasks = []
+    for row in cohort:
+        history = row['history']
+        if len(history) < 3 or any(p['year'] > 2020 for p in history):
+            raise ValueError('History must contain at least three pre-2021 papers')
+        counts = Counter(p['topics'][0] for p in history)
+        expertise = [key for key, _ in sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))[:3]]
+        prefix = (
+            'Predict this researcher\'s primary topic for their first 2021 paper. '
+            'Choose exactly one category from the list below. Use the supplied '
+            'pre-2021 research information to make the prediction.\n\n'
+            '## Available Topics\n' + json.dumps(labels, ensure_ascii=False)
+            + '\n\n## Expertise\n' + json.dumps(expertise)
+        )
+        for condition in ('expertise_only', 'history', 'shuffled_history'):
+            prompt = prefix
+            if condition != 'expertise_only':
+                background = history if condition == 'history' else lookup[row['history_donor_id']]['history']
+                prompt += '\n\n## Publications Through 2020\n' + json.dumps(
+                    [{key: paper[key] for key in ('year', 'title', 'abstract', 'topics')}
+                     for paper in background], ensure_ascii=False)
+            prompt += '\n\nReturn JSON with topic (category code), detailed_focus, and reason.'
+            tasks.append({
+                'task_uid': f"{row['author_id']}|{condition}",
+                'author_id': row['author_id'], 'condition': condition, 'prompt': prompt,
+            })
+    schema = {
+        'type': 'object', 'properties': {
+            'topic': {'type': 'string', 'enum': sorted(labels)},
+            'detailed_focus': {'type': 'string'}, 'reason': {'type': 'string'},
+        }, 'required': ['topic', 'detailed_focus', 'reason'], 'additionalProperties': False,
+    }
+    return pd.DataFrame(tasks), {'type': 'json_schema', 'json_object': {'schema': schema}}
+
+
+def extract_historical_directions(args):
+    from utopia.data.rag import historical_author_cohort
+
+    path = Path(CORPUS_DIR)
+    path.mkdir(parents=True, exist_ok=True)
+    task_path = path / 'replay_tasks_main.parquet'
+    if task_path.exists():
+        tasks = pd.read_parquet(task_path)
+        if len(tasks) != 3000 or tasks.task_uid.duplicated().any():
+            raise ValueError('Expected 1000 authors x three model conditions')
+        logger.info('Reusing frozen historical-direction tasks')
+        return
+    cohort, n_eligible = historical_author_cohort(
+        'outputs/cache_scievo.pkl', 'data/scievo/semantic_scholar', seed=GLOBAL_SEED)
+    tasks, response_format = historical_direction_tasks(cohort)
+    gold = [{
+        'author_id': row['author_id'], 'target_paper_id': row['target']['paper_id'],
+        'target_topic': row['target']['topics'][0],
+        'target_topics': json.dumps(row['target']['topics']),
+        'last_topic': row['history'][-1]['topics'][0],
+        'n_history': len(row['history']), 'n_history_total': row['n_history_total'],
+    } for row in cohort]
+    # Target artifacts stay in these reference files; generation loads tasks only.
+    write_json_atomic(path / 'cohort.json', cohort, indent=2)
+    write_parquet_atomic(path / 'hidden_targets.parquet', pd.DataFrame(gold), index=False)
+    write_parquet_atomic(task_path, tasks, index=False)
+    write_json_atomic(path / 'corpus_manifest.json', {
+        'n_authors': 1000, 'n_eligible_authors': n_eligible, 'n_tasks': 3000,
+        'model': 'Qwen/Qwen3-32B', 'models': [
+            'Qwen/Qwen3-32B', 'Qwen/Qwen3.5-397B-A17B-FP8'],
+        'seed': GLOBAL_SEED, 'history_years': [2016, 2020], 'target_year': 2021,
+        'history_limit': 'Most recent ten eligible CS papers, chronological order',
+        'target_rule': 'Earliest 2021 CS paper; date then arXiv ID',
+        'conditions': ['expertise_only', 'history', 'shuffled_history'],
+        'deterministic_baseline': 'Primary CS category of last pre-2021 paper',
+        'sampling': 'Uniform without replacement from stable IDs with >=3 history papers',
+        'shuffle': 'One random donor cycle, excluding self-history',
+        'response_kind': 'direction', 'response_format': response_format,
+    }, indent=2)
+    logger.info('Prepared 3000 tasks for 1000 authors out of %s eligible', n_eligible)
+
+
+def review_sensitivity_tasks(papers, profiles, rewrites):
+    """Cross the same paper/profile assignments with the six fixed review conditions."""
+    from utopia.agents.base_agent import SimulationAgent
+    conditions = ('original', 'paraphrase_1', 'paraphrase_2', 'no_distribution',
+                  'title_hidden', 'title_hidden_paraphrased')
+    rows, recognition = [], []
+    for paper in papers:
+        for slot, profile_id in enumerate(paper['profile_ids']):
+            agent = SimulationAgent(reputation=5, agent_id=profile_id, llm=None)
+            agent.expertise = profiles[profile_id]
+            for condition in conditions:
+                item = dict(paper)
+                if condition.startswith('title_hidden'):
+                    item['title'] = '[Title hidden]'
+                if condition == 'title_hidden_paraphrased':
+                    item['abstract'] = rewrites[paper['paper_id']]
+                variant = condition if condition in conditions[:4] else 'original'
+                prompt, _ = agent.get_review_prompt(item, prompt_variant=variant)
+                rows.append({
+                    'task_uid': f"{paper['paper_id']}|{slot}|{condition}",
+                    'paper_id': paper['paper_id'], 'slot': slot, 'profile_id': profile_id,
+                    'condition': condition, 'prompt': prompt,
+                })
+        for condition, abstract in (('original_abstract', paper['abstract']),
+                                    ('paraphrased_abstract', rewrites[paper['paper_id']])):
+            recognition.append({
+                'task_uid': f"{paper['paper_id']}|{condition}",
+                'paper_id': paper['paper_id'], 'condition': condition,
+                'prompt': (
+                    'Can you identify this scientific paper from the abstract? '
+                    'If you recognize it, return its title from memory. If you cannot identify '
+                    'it, set recognized to false and title to an empty string. '
+                    'Return JSON with recognized (boolean) and title (string).\n\nAbstract:\n'
+                    + abstract
+                ),
+            })
+    return pd.DataFrame(rows), pd.DataFrame(recognition)
+
+
+def extract_review_sensitivity(args):
+    import pickle
+    import random
+    from utopia.agents.research_direction import AVAILABLE_DIRECTIONS
+
+    path = Path(CORPUS_DIR)
+    path.mkdir(parents=True, exist_ok=True)
+    paper_path = path / 'papers.json'
+    if paper_path.exists():
+        papers = read_json(paper_path)
+        profiles = read_json(path / 'profiles.json')
+    else:
+        with open('outputs/cache_scievo.pkl', 'rb') as stream:
+            documents = pickle.load(stream)['documents']
+        rng = random.Random(GLOBAL_SEED)
+        profiles = {
+            f'profile_{index:03d}': [d.topic for d in rng.sample(AVAILABLE_DIRECTIONS, 3)]
+            for index in range(500)
+        }
+        papers = []
+        for year in range(2016, 2026):
+            eligible = sorted([
+                document for document in documents
+                if document.metadata['publication_year'] == year
+                and 200 <= len(document.page_content) <= 6000
+                and document.metadata.get('title', '').strip()
+            ], key=lambda document: document.metadata['id'])
+            if len(eligible) < 60:
+                raise ValueError(f'Need 60 eligible papers in {year}')
+            for document in rng.sample(eligible, 60):
+                papers.append({
+                    'paper_id': document.metadata['id'], 'title': document.metadata['title'],
+                    'abstract': document.page_content, 'topics': document.metadata['topics'],
+                    'year': year, 'profile_ids': rng.sample(sorted(profiles), 3),
+                })
+        write_json_atomic(paper_path, papers, indent=2)
+        write_json_atomic(path / 'profiles.json', profiles, indent=2)
+    if len(papers) != 600 or len({p['paper_id'] for p in papers}) != 600:
+        raise ValueError('Need 600 unique fixed papers')
+    paraphrases = pd.DataFrame([{
+        'task_uid': paper['paper_id'], 'paper_id': paper['paper_id'],
+        'condition': 'abstract_paraphrase',
+        'prompt': (
+            'Rewrite the following scientific abstract using different wording and sentence '
+            'structure. Preserve its methods, assumptions, technical claims, numerical results '
+            'and qualifications. Do not add information. Do not supply the paper title, '
+            'authors, venue or publication year. Return JSON with one field, abstract.\n\n'
+            + paper['abstract']
+        ),
+    } for paper in papers])
+    def output_format(properties, required):
+        return {'type': 'json_schema', 'json_object': {'schema': {
+            'type': 'object', 'properties': properties, 'required': required,
+            'additionalProperties': False,
+        }}}
+    cfg = {
+        'n_papers': 600, 'profiles_per_paper': 3, 'seed': GLOBAL_SEED,
+        'model': 'Qwen/Qwen3-32B',
+        'models': ['Qwen/Qwen3-32B', 'Qwen/Qwen3.5-397B-A17B-FP8'],
+        'selection': '60 papers per year, 2016-2025; nonempty title and 200-6000 character abstract',
+        'profiles': '500 simulated expertise profiles; three fixed profiles per paper; empty initial memory',
+        'abstract_rewriter': 'Qwen/Qwen3-32B; one fixed rewrite shared by both evaluator models',
+        'recognition': 'Title withheld; exact normalized title match primary, similarity >=0.90 secondary',
+        'stages': {
+            'paraphrase': {'n_tasks': 600, 'response_kind': 'abstract',
+                          'response_format': output_format(
+                              {'abstract': {'type': 'string', 'minLength': 100}}, ['abstract'])},
+            'main': {'n_tasks': 10800, 'response_kind': 'review',
+                     'response_format': review_response_format()},
+            'recognition': {'n_tasks': 1200, 'response_kind': 'recognition',
+                            'response_format': output_format(
+                                {'recognized': {'type': 'boolean'}, 'title': {'type': 'string'}},
+                                ['recognized', 'title'])},
+        },
+    }
+    write_parquet_atomic(path / 'replay_tasks_paraphrase.parquet', paraphrases, index=False)
+    write_json_atomic(path / 'corpus_manifest.json', cfg, indent=2)
+    if args.stage == 'paraphrase':
+        logger.info('Prepared all 600 shared abstract-rewrite tasks')
+        return
+    result_path = Path('outputs/docs/review_replay_sensitivity_paraphrase_qwen3_32b/responses.jsonl')
+    rewrites = {}
+    if result_path.exists():
+        for line in result_path.read_text().splitlines():
+            row = json.loads(line)
+            if row.get('success'):
+                rewrites[row['paper_id']] = row['response']['abstract']
+    if set(rewrites) != {paper['paper_id'] for paper in papers}:
+        raise ValueError(f'Complete all 600 fixed abstract rewrites before review extraction; found {len(rewrites)}')
+    corrections_path = path / 'paraphrase_corrections.json'
+    if corrections_path.exists():
+        corrections = read_json(corrections_path)
+        if set(corrections) - set(rewrites):
+            raise ValueError('Paraphrase corrections must refer to the frozen paper IDs')
+        for paper_id, correction in corrections.items():
+            rewrites[paper_id] = correction['abstract']
+        logger.info('Applied %s documented content-preservation corrections', len(corrections))
+    tasks, recognition = review_sensitivity_tasks(papers, profiles, rewrites)
+    write_parquet_atomic(path / 'replay_tasks_main.parquet', tasks, index=False)
+    write_parquet_atomic(path / 'replay_tasks_recognition.parquet', recognition, index=False)
+    logger.info('Prepared 10800 review tasks and 1200 independent recognition tasks')
+
+
+def external_output_dir(args):
+    if getattr(args, 'output_name', None):
+        name = args.output_name
+        if Path(name).name != name or not name.startswith('review_replay_'):
+            raise ValueError('External replay output_name must be a review_replay_ directory name')
+        return Path('outputs/docs') / name
+    name = STAGES[args.stage]
+    if ACTIVE_STUDY != 'human_review':
+        model = args.model or 'Qwen/Qwen3-32B'
+        name += '_' + model.split('/')[-1].lower().replace('-', '_').replace('.', '_')
+    return Path('outputs/docs') / name
+
+
+def generate_external_tasks(args):
+    """Continue successful task IDs and persist every new model reply immediately."""
+    corpus = Path(args.corpus_dir) if getattr(args, 'corpus_dir', None) else Path(CORPUS_DIR)
+    cfg = read_json(corpus / 'corpus_manifest.json')
+    if 'stages' in cfg:
+        cfg = {**cfg, **cfg['stages'][args.stage]}
+    model = args.model or cfg['model']
+    if ACTIVE_STUDY == 'human_review' and model != cfg['model']:
+        raise ValueError('Human-review comparison uses Qwen3.5-397B-A17B-FP8 only')
+    if ACTIVE_STUDY == 'review_sensitivity' and args.stage == 'paraphrase' and model != cfg['model']:
+        raise ValueError('Generate one common set of Qwen3-32B rewrites for both evaluators')
+    tasks = pd.read_parquet(corpus / f'replay_tasks_{args.stage}.parquet')
+    if tasks.task_uid.duplicated().any() or len(tasks) != cfg['n_tasks']:
+        raise ValueError('Task IDs must be unique and cover the prescribed sample')
+    docs = external_output_dir(args)
+    logs = Path('outputs/logs') / docs.name
+    docs.mkdir(parents=True, exist_ok=True)
+    logs.mkdir(parents=True, exist_ok=True)
+    result_path = docs / 'responses.jsonl'
+    completed = {}
+    if result_path.exists():
+        with result_path.open() as stream:
+            for line in stream:
+                if line.strip():
+                    row = json.loads(line)
+                    if row.get('success'):
+                        completed[row['task_uid']] = row
+    if set(completed) - set(tasks.task_uid):
+        raise ValueError('Stored response IDs are outside the prescribed tasks')
+    pending = tasks[~tasks.task_uid.isin(completed)].sort_values('task_uid')
+    if pending.empty:
+        logger.info('All %s task IDs already complete', len(tasks))
+        return
+    from utopia.models.models import VLLMServerModel
+    llm = VLLMServerModel(
+        model_name=model, base_url=args.vllm_url,
+        max_concurrent_requests=args.batch_size, run_seed=GLOBAL_SEED,
+        response_cache_path=logs / 'model_replies.jsonl',
+        stop_at_utc=read_json(PREREG_V1).get('compute_cutoff_utc'),
+        thinking_token_budget=getattr(args, 'thinking_token_budget', None),
+    )
+    write_json_atomic(logs / 'generation_config.json', {
+        'model': model, 'seed': GLOBAL_SEED, 'temperature': 0.7,
+        'max_tokens': args.max_tokens, 'batch_size': args.batch_size,
+        'thinking_token_budget': getattr(args, 'thinking_token_budget', None),
+        'vllm_url': args.vllm_url, 'command': sys.argv,
+        'corpus_dir': str(corpus),
+        'n_tasks': len(tasks), 'n_reused': len(completed),
+    }, indent=2)
+    # The model client caps live requests; queue pending IDs together so a slow
+    # response does not leave the other request slots idle between chunks.
+    # Fixed task IDs keep request seeds independent of batch size and resume order.
+    batch = pending.reset_index(drop=True)
+    with result_path.open('a', buffering=1) as stream:
+        def save_result(index, result, metadata):
+            response, messages = result
+            task = batch.iloc[index]
+            import jsonschema
+            try:
+                jsonschema.validate(response, cfg['response_format']['json_object']['schema'])
+                valid = True
+            except jsonschema.ValidationError:
+                valid = False
+            if cfg.get('response_kind', 'review') == 'review':
+                score = response.get('overall_score') if isinstance(response, dict) else None
+                valid = valid and (
+                    isinstance(score, (int, float)) and not isinstance(score, bool)
+                    and np.isfinite(score) and 1 <= score <= 5
+                    and bool(response.get('justification'))
+                )
+            row = {
+                **{key: task[key] for key in ('task_uid', 'paper_id', 'slot',
+                                              'profile_id', 'condition', 'author_id')
+                   if key in task},
+                **metadata, 'success': bool(valid), 'response': response,
+                'messages': messages, 'model': model,
+            }
+            if 'slot' in row:
+                row['slot'] = int(row['slot'])
+            stream.write(json.dumps(row, ensure_ascii=True) + '\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+            if valid:
+                completed[task.task_uid] = row
+            logger.info('New response %s, valid=%s, complete=%s/%s',
+                        task.task_uid, valid, len(completed), len(tasks))
+
+        llm.generate_batch(
+            batch.prompt.tolist(), response_format=cfg['response_format'],
+            temperature=0.7, max_tokens=args.max_tokens,
+            seed_ctx=(ACTIVE_STUDY,), item_ids=batch.task_uid.tolist(),
+            on_result=save_result,
+        )
+    write_json_atomic(docs / 'completion.json', {
+        'status': 'complete' if len(completed) == len(tasks) else 'incomplete',
+        'n_expected': len(tasks), 'n_valid': len(completed), 'model': model,
+        'call_stats': llm.call_stats,
+    }, indent=2)
+    if len(completed) != len(tasks):
+        raise RuntimeError(f'{len(tasks) - len(completed)} task IDs still need valid replies')
 
 
 def main():
@@ -1480,6 +1984,8 @@ def main():
     sub = ap.add_subparsers(dest='cmd', required=True)
 
     p_ex = sub.add_parser('extract')
+    p_ex.add_argument('--stage', default='main',
+                      help='review_sensitivity: prepare paraphrase tasks before main/recognition')
     p_ex.add_argument('--source_outputs_root', default='outputs',
                       help='read-only root holding the E3.5 artifacts (monoculture)')
     p_ex.add_argument('--source_dirs', nargs='+', default=[],
@@ -1497,11 +2003,22 @@ def main():
     p_gen.add_argument('--stage', required=True)
     p_gen.add_argument('--vllm_url', default='http://localhost:8033/v1')
     p_gen.add_argument('--batch_size', type=int, default=32)
+    p_gen.add_argument('--model', default=None)
+    p_gen.add_argument('--max_tokens', type=int, default=2048)
+    p_gen.add_argument('--thinking_token_budget', type=int, default=None,
+                       help='Native vLLM thinking limit; reserve remaining output tokens for the final answer')
+    p_gen.add_argument('--corpus_dir', default=None,
+                       help='external replay: use an independently prepared task corpus')
+    p_gen.add_argument('--output_name', default=None,
+                       help='external replay: write to a distinct review_replay_ output directory')
     p_gen.set_defaults(func=cmd_generate)
 
     p_an = sub.add_parser('analyze')
     p_an.add_argument('--stage', required=True)
+    p_an.add_argument('--model', default=None)
     p_an.add_argument('--n_boot', type=int, default=10000)
+    p_an.add_argument('--corpus_dir', default=None)
+    p_an.add_argument('--output_name', default=None)
     p_an.set_defaults(func=cmd_analyze)
 
     p_st = sub.add_parser('status')

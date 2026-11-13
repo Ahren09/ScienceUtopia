@@ -205,20 +205,13 @@ def funding_class():
 
 
 def model_class():
-    ns = {
-        "build_vllm_extra_body": body_module.build_vllm_extra_body,
-        "SIMULATION_CONFIG": {"llm": {"max_tokens": 2048}},
-        "logger": logging.getLogger("sequential-model-test"),
-        "IMPORTANT_NOTES": seq.IMPORTANT_NOTES,
-        "parse_json_response": json.loads,
-        "ThreadPoolExecutor": ThreadPoolExecutor,
-        "as_completed": as_completed,
-        "tqdm": lambda values, **kwargs: values,
-        "time": time,
-    }
-    return definitions(
-        ROOT / "utopia/models/models.py",
-        "VLLMServerModel",
-        {"_request_seed", "_build_extra_body", "_create_completion", "generate_batch"},
-        ns,
-    )
+    from tests.support.model_transport import Client
+
+    class ScriptedModel(Client):
+        def __init__(self):
+            self.completion_token_floor = 0
+            self.thinking_token_budget = None
+            self.response_cache_path = None
+            self.saved_responses = {}
+
+    return ScriptedModel

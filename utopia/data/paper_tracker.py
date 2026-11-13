@@ -390,7 +390,9 @@ class PaperTracker:
         """Serialize to dictionary"""
         return {
             'output_dir': str(self.output_dir),
-            'papers': [paper.to_dict() for paper in self.papers_by_id.values()]
+            'papers': [paper.to_dict() for paper in self.papers_by_id.values()],
+            'papers_by_author': {aid: [paper.id for paper in papers]
+                                 for aid, papers in self.papers_by_author.items()}
         }
 
     @classmethod
@@ -423,4 +425,16 @@ class PaperTracker:
                     archive.papers_by_author[aid] = []
                 archive.papers_by_author[aid].append(paper)
 
+        # Prompt construction can reorder an author's papers independently of the ID index.
+        saved_order = data.get('papers_by_author')
+        if saved_order is not None:
+            if set(saved_order) != set(archive.papers_by_author):
+                raise ValueError("Saved paper order has different authors")
+            for aid, paper_ids in saved_order.items():
+                papers = archive.papers_by_author[aid]
+                if len(paper_ids) != len(papers) or set(paper_ids) != {p.id for p in papers}:
+                    raise ValueError(f"Saved paper order has different papers for {aid}")
+            archive.papers_by_author = {
+                aid: [archive.papers_by_id[pid] for pid in paper_ids]
+                for aid, paper_ids in saved_order.items()}
         return archive

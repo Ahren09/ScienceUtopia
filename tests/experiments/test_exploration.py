@@ -53,6 +53,40 @@ class StubAgent:
     def _get_personality_prompt(self, include_exploration_strategy=False):
         return f"You are researcher {self.id} with strategy {self.exploration_strategy}."
 
+def test_mapped_funding_schema_preserves_order_and_rejects_identifier_mismatch():
+    import jsonschema
+    apps = [{'applicant_id': 'alice'}, {'applicant_id': 'bob'}]
+    schema = FundingAgency.mapped_evaluation_format(apps)['json_object']['schema']
+    good = {'ranked_applications': [
+        {'application_id': 1, 'applicant_id': 'bob', 'rank': 1, 'reason': 'preferred'},
+        {'application_id': 0, 'applicant_id': 'alice', 'rank': 2, 'reason': 'next'},
+    ]}
+    jsonschema.validate(good, schema)
+    good['ranked_applications'][0]['applicant_id'] = 'alice'
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(good, schema)
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({'ranked_applications': []}, schema)
+
+
+def test_strict_funding_stops_before_awards_when_panel_coverage_is_incomplete():
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from utopia.simulation import Simulation
+    from utopia.models.models import VLLMServerModel
+    simulation = Simulation.__new__(Simulation)
+    simulation.args = SimpleNamespace(strict_funding_rankings=True)
+    simulation.llm = VLLMServerModel.__new__(VLLMServerModel)
+    simulation.llm.generate_batch = Mock(return_value=[(None, [])])
+    metadata = [{'program_id': 'program', 'panel_index': 0,
+                 'apps': [{'applicant_id': 'alice'}]}]
+    with pytest.raises(RuntimeError, match='Incomplete funding ranking'):
+        simulation._rank_funding_applications(1, ['panel'], metadata, {})
+    assert simulation.llm.generate_batch.call_count == 3
+    assert all(call.kwargs['response_formats'][0]['json_object']['schema']
+               ['properties']['ranked_applications']['minItems'] == 1
+               for call in simulation.llm.generate_batch.call_args_list)
+
 
 def make_paper(pid, author, year, status='accept'):
     return ArchivedPaper(
@@ -73,6 +107,104 @@ def build_citation_world(papers, edges):
 
 
 # ------------------------------------------------- 1-3: population blueprint
+
+def test_analysis_exact_id_excludes_prompt_variants(tmp_path):
+    import json
+    from utopia.analysis.exploration_cross_seed import discover_runs
+
+    control = 'explore_confirmatory_qwen3_32b_seed42_mix131_panel25'
+    variants = [control, control + '_prompt_paraphrase_1',
+                control + '_prompt_paraphrase_2']
+    for experiment_id in variants:
+        docs = tmp_path / 'docs' / experiment_id
+        docs.mkdir(parents=True)
+        (docs / 'run_manifest.json').write_text(json.dumps({
+            'run_seed': 42, 'status': 'complete',
+        }))
+
+    exact = discover_runs(outputs_dir=str(tmp_path), experiment_id=control)
+    assert [r['experiment_id'] for r in exact] == [control]
+    prefixed = discover_runs(control, outputs_dir=str(tmp_path))
+    assert {r['experiment_id'] for r in prefixed} == set(variants)
+    assert discover_runs(outputs_dir=str(tmp_path),
+                         experiment_id=control + '_missing') == []
+
+
+def test_analysis_accepts_complete_runs_with_different_legacy_hashes(tmp_path):
+    from utopia.analysis.exploration_cross_seed import validate_runs
+
+    runs = []
+    for index, legacy_hash in enumerate(('old-a', 'old-b', None)):
+        docs = tmp_path / str(index)
+        docs.mkdir()
+        for table in ('agent_year', 'paper'):
+            (docs / f'{table}.csv').write_text('id\n1\n')
+        runs.append({'docs_dir': str(docs), 'status': 'complete', 'config_hash': legacy_hash})
+    valid, excluded = validate_runs(runs)
+    assert len(valid) == 3
+    assert excluded == []
+    runs[-1]['status'] = 'running'
+    valid, excluded = validate_runs(runs)
+    assert len(valid) == 2
+    assert excluded[0]['problems'] == ['status=running']
+
+
+def test_world_summary_citation_followup_and_founder_denominators():
+    import copy
+    import pandas as pd
+    from utopia.analysis.exploration_cross_seed import summarize_completed_world
+
+    agent_year = pd.DataFrame([
+        {'agent_id': aid, 'year': year, 'strategy': 'explorer',
+         'is_active': aid == 'a' or year < 4, 'num_papers': int(aid == 'a' and year in (1, 2, 4)),
+         'num_accepted': int(aid == 'a' and year in (1, 4)),
+         'direction_distance': 0.8, 'topic_switched': False,
+         'funding': 10.0 if aid == 'a' else 0.0, 'total_citations': 0}
+        for aid in ('a', 'b') for year in range(1, 5)
+    ])
+    age = pd.DataFrame([{
+        'paper_id': 'p1', 'author_id': 'a', 'age': 3,
+        'publication_year': 1, 'observation_year': 4, 'citations': 2,
+    }])
+    ecosystem = pd.DataFrame([
+        {'year': year, 'topic_entropy_normalized': 0.75, 'occupied_directions': 3,
+         'num_active_researchers': 2 if year < 4 else 1,
+         'num_submissions': 1, 'num_accepted': int(year in (1, 4))}
+        for year in range(1, 5)
+    ])
+    checkpoint = {
+        'year': 4, 'phase': 5,
+        'ecosystem_data': {'agents': [
+            {'id': 'a', 'type': 'university', 'is_active': True,
+             'funding_success_history': {'1': [{'amount': 20}]}},
+            {'id': 'b', 'type': 'university', 'is_active': False},
+            {'id': 'agency', 'type': 'funding_agency'},
+        ]},
+        'paper_tracker': {'papers': [
+            {'id': 'p1', 'author_id': 'a', 'year': 1, 'status': 'accept'},
+            {'id': 'p2', 'author_id': 'a', 'year': 4, 'status': 'accept'},
+            {'id': 'p3', 'author_id': 'a', 'year': 2, 'status': 'reject'},
+        ]},
+        'citation_tracker': {'citations': {'p1': ['p2', 'background']}},
+    }
+    result = summarize_completed_world(agent_year, age, ecosystem, checkpoint)
+    row = result['strategies'][0]
+    assert row['founders'] == 2 and row['active_share_final'] == 0.5
+    assert row['researchers_with_submissions'] == 1
+    assert row['mean_researcher_acceptance_fraction'] == pytest.approx(2 / 3)
+    assert row['citations_to_accepted_papers_at_horizon'] == 2
+    assert row['papers_at_publication_age_three'] == 1
+    assert row['mean_citations_at_publication_age_three'] == 2
+    assert row['mean_cumulative_grants_received'] == 10
+    with pytest.raises(ValueError, match='researcher-year coverage'):
+        summarize_completed_world(agent_year.iloc[1:], age, ecosystem, checkpoint)
+    with pytest.raises(ValueError, match='age-three coverage'):
+        summarize_completed_world(agent_year, age.iloc[:0], ecosystem, checkpoint)
+    bad = copy.deepcopy(checkpoint)
+    bad['citation_tracker']['citations']['p1'].append('p2')
+    with pytest.raises(ValueError, match='Duplicate citation'):
+        summarize_completed_world(agent_year, age, ecosystem, bad)
+
 
 def test_blueprint_exact_strategy_mix():
     bp = build_population_blueprint(12, 5, seed=101)
@@ -341,7 +473,174 @@ def test_canonical_output_paths(tmp_path):
         assert os.path.isdir(d)
 
 
+def test_checkpoint_rng_roundtrip_preserves_next_decisions():
+    import json
+    import random
+    import torch
+    from utopia.utils.seeding import capture_rng_state, restore_rng_state
+    original = capture_rng_state()
+    try:
+        saved = json.loads(json.dumps(original))
+        expected = (random.random(), float(np.random.normal()), float(torch.rand(())))
+        restore_rng_state(saved)
+        actual = (random.random(), float(np.random.normal()), float(torch.rand(())))
+        assert actual == expected
+        restore_rng_state({'python': saved['python']})
+        assert random.random() == expected[0]
+    finally:
+        restore_rng_state(original)
+
+
 def test_derive_seed_stable_and_distinct():
     assert derive_seed(11, 'phase1_directions', 3, 0, 0) == derive_seed(11, 'phase1_directions', 3, 0, 0)
     assert derive_seed(11, 'phase1_directions', 3, 0, 0) != derive_seed(11, 'phase1_directions', 3, 0, 1)
     assert derive_seed(11, 'a') != derive_seed(12, 'a')
+
+
+def test_fulltext_review_uses_complete_indexed_body_without_changing_paper(tmp_path):
+    import json
+    from utopia.data.rag import FullTextCorpus
+    from utopia.simulation import Simulation
+    from utopia.agents.base_agent import SimulationAgent
+    body = 'Introduction 正文\n' + 'research evidence ' * 6000 + '\nAppendix END'
+    prefix = b'other paper\n'
+    (tmp_path/'papers.txt').write_bytes(prefix + body.encode())
+    (tmp_path/'index.json').write_text(json.dumps({'text_file':'papers.txt','papers':{
+        '1606.04422': {'offset':len(prefix),'nbytes':len(body.encode())}}}))
+    simulation = Simulation.__new__(Simulation)
+    simulation.fulltext_corpus = FullTextCorpus(tmp_path/'index.json')
+    paper = dict(id='https://arxiv.org/abs/1606.04422v2', title='Title',
+                 abstract='Short abstract',topics=['ML'])
+    reviewer = SimulationAgent.__new__(SimulationAgent)
+    reviewer.expertise = ['ML']
+    reviewer.get_memory_context = lambda: 'Original reviewer memory'
+    prompt, _ = reviewer.get_review_prompt(simulation.review_input(paper))
+    assert 'Full paper text:\n'+body in prompt
+    assert 'Original reviewer memory' in prompt
+    assert 'full_text' not in paper
+    assert 'Abstract:\nShort abstract' in reviewer.get_review_prompt(paper)[0]
+    with pytest.raises(KeyError):
+        simulation.review_input(dict(paper,id='missing'))
+    (tmp_path/'papers.txt').write_bytes(prefix)
+    with pytest.raises(ValueError,match='incomplete full text'):
+        simulation.review_input(paper)
+
+
+@pytest.mark.parametrize('source_case', ['pdf', 'withdrawn_pdf', 'html'])
+def test_missing_scievo_body_fetches_all_pdf_pages_and_resumes_offline(tmp_path, monkeypatch, source_case):
+    import json
+    import pymupdf
+    import requests
+    from types import SimpleNamespace
+    from utopia.data.rag import FullTextCorpus
+    with pymupdf.open() as pdf:
+        for text in ['Introduction full text', 'Appendix final-page evidence']:
+            page = pdf.new_page()
+            page.insert_text((72, 72), text)
+        source = pdf.tobytes()
+    (tmp_path/'index.json').write_text(json.dumps({'text_file': 'base.txt', 'papers': {}}))
+    calls = []
+    def download(url, timeout):
+        calls.append(url)
+        if source_case != 'pdf' and not url.endswith('v1'):
+            return SimpleNamespace(status_code=404)
+        if source_case == 'html':
+            if '/pdf/' in url:
+                return SimpleNamespace(status_code=404)
+            html = '<html><head><style>HIDDEN CSS</style></head><body>Introduction full text<p>Appendix final-page evidence</p><script>HIDDEN JS</script></body></html>'
+            return SimpleNamespace(status_code=200, content=html.encode(), text=html, raise_for_status=lambda: None)
+        return SimpleNamespace(status_code=200, content=source, raise_for_status=lambda: None)
+    monkeypatch.setattr(requests, 'get', download)
+    corpus = FullTextCorpus(tmp_path/'index.json', cache_dir=tmp_path/'supplement')
+    text = corpus.text('https://arxiv.org/abs/2501.00001v2')
+    assert 'Introduction full text' in text
+    assert 'Appendix final-page evidence' in text
+    if source_case == 'html':
+        assert (tmp_path/'supplement/2501.00001.html').is_file()
+        assert 'HIDDEN' not in text
+    else:
+        assert (tmp_path/'supplement/2501.00001.pdf').read_bytes() == source
+    resumed = FullTextCorpus(tmp_path/'index.json', cache_dir=tmp_path/'supplement')
+    assert resumed.text('2501.00001') == text
+    expected = ['https://arxiv.org/pdf/2501.00001']
+    if source_case != 'pdf':
+        expected.append(expected[0] + 'v1')
+    if source_case == 'html':
+        expected.append('https://arxiv.org/html/2501.00001v1')
+    assert calls == expected
+    index = json.loads((tmp_path/'supplement/index.json').read_text())
+    assert index['papers']['2501.00001']['source_url'] == expected[-1]
+    assert index['papers']['2501.00001']['pages'] == (None if source_case == 'html' else 2)
+    assert index['papers']['2501.00001']['nbytes'] == len(text.encode())
+
+
+@pytest.mark.parametrize('backend', ['bedrock','auto'])
+def test_backend_arguments_preserve_explicit_batch_and_output_budget(backend):
+    args = parse_arguments(['--backend',backend,'--model','openai.gpt-5.6-luna',
+                            '--batch_size','256','--completion_token_floor','32768',
+                            '--input_tokens_per_minute','600000',
+                            '--output_tokens_per_minute','45000',
+                            '--fulltext_index','corpus/index.json'])
+    assert args.backend == backend
+    assert args.batch_size == 256
+    assert args.completion_token_floor == 32768
+    assert args.fulltext_index == 'corpus/index.json'
+    assert args.input_tokens_per_minute == 600000
+    assert args.output_tokens_per_minute == 45000
+
+
+@pytest.mark.parametrize("query_dtype", ["float16", "float32"])
+def test_submission_retrieval_matches_cached_embedding_dtype(query_dtype):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    import pandas as pd
+    import torch
+    from utopia.data.rag import RAG
+
+    rag = RAG.__new__(RAG)
+    rag.device = "cpu"
+    rag.use_langchain = False
+    rag.start_year = 2016
+    rag.current_sim_year = 1
+    rag.config = SimpleNamespace(normalize_embeddings=True, batch_size=2, num_retrieved_docs=1)
+    rag.document_embeddings = torch.tensor([[-1., 0.], [1., 0.], [0., -1.], [0., 1.], [1., 1.]])
+    rag.document_status = pd.DataFrame({
+        "status": ["accept", "unsubmitted", "reject", "unsubmitted", "unsubmitted"],
+        "publication_year": [2016, 2016, 2016, 2016, 2017],
+    })
+    rag.sentence_transformer_model = Mock()
+    rag.sentence_transformer_model.encode.return_value = torch.tensor(
+        [[1., 0.], [0., 1.]], dtype=getattr(torch, query_dtype))
+
+    result = rag.batch_retrieve(["first direction", "second direction"])
+
+    assert result["topk_indices"].tolist() == [[1], [3]]
+    assert result["similarity_scores"].dtype == torch.float32
+    torch.testing.assert_close(result["similarity_scores"], torch.eye(2))
+
+
+def test_paper_checkpoint_preserves_author_order_and_shared_objects(tmp_path):
+    records = [dict(id=pid, title=pid, abstract="full abstract", author_id=authors,
+                    author_type="university", year=year, conference="venue", topics=[],
+                    tags=[], status="reject", review_history=[])
+               for pid, authors, year in [("older", ["a", "b"], 1), ("newer", ["a"], 2)]]
+    legacy = {"output_dir": str(tmp_path), "papers": records}
+    tracker = PaperTracker.from_dict(legacy)
+    tracker.papers_by_author["a"].reverse()
+    tracker.papers_by_author = dict(reversed(list(tracker.papers_by_author.items())))
+    restored = PaperTracker.from_dict(tracker.to_dict())
+    assert list(restored.papers_by_author) == ["b", "a"]
+    assert [p.id for p in restored.get_papers_by_author("a")] == ["newer", "older"]
+    assert restored.get_papers_by_author("a")[1] is restored.get_papers_by_author("b")[0]
+    assert [p.id for p in PaperTracker.from_dict(legacy).get_papers_by_author("a")] == ["older", "newer"]
+    assert restored.to_dict()["papers"] == tracker.to_dict()["papers"]
+
+
+@pytest.mark.parametrize("order", [{"a": ["missing"]}, {"a": ["only", "only"]}, {}])
+def test_paper_checkpoint_rejects_lost_or_duplicate_ids(tmp_path, order):
+    record = dict(id="only", title="paper", abstract="text", author_id="a",
+                  author_type="university", year=1, conference="venue", topics=[],
+                  tags=[], status="reject", review_history=[])
+    with pytest.raises(ValueError):
+        PaperTracker.from_dict({"output_dir": str(tmp_path), "papers": [record],
+                                "papers_by_author": order})

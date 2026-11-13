@@ -348,7 +348,7 @@ class SequentialCase(unittest.TestCase):
         fatal = audit_module.RequestAuditFailure("scripted terminal accounting failure")
         fatal.received_response = response('{"next_application_id":1}', reasoning="terminal reasoning")
         fatal.request_ticket = {"request_id": 123}
-        with patch.object(model, "_create_completion", side_effect=fatal):
+        with patch.object(model, "create_completion", side_effect=fatal):
             with self.assertRaises(audit_module.RequestAuditFailure) as caught:
                 self.generate(model, values)
         self.assertIs(caught.exception, fatal)
@@ -363,7 +363,7 @@ class SequentialCase(unittest.TestCase):
         values, _ = self.register(1)
         model = self.model()
         fatal = audit_module.RequestAuditFailure("scripted input overflow")
-        with patch.object(model, "_create_completion", side_effect=fatal):
+        with patch.object(model, "create_completion", side_effect=fatal):
             with self.assertRaises(audit_module.RequestAuditFailure):
                 self.generate(model, values)
         rows = [json.loads(line) for line in self.handle.path.read_text().splitlines()]

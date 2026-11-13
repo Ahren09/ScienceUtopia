@@ -1132,7 +1132,7 @@ def validate_structured_transport(simulator):
     # The shared method reads this attribute; do not construct a real client,
     # whose initializer contacts the model server.
     probe = SimpleNamespace(enable_thinking=True)
-    body = simulator.VLLMServerModel._build_extra_body(probe, response_format)
+    body = simulator.VLLMServerModel.build_extra_body(probe, response_format)
     if ('guided_json' in body or body.get('structured_outputs', {}).get('json') != schema):
         raise ValueError('v6 requires the shared client structured_outputs.json compatibility fix')
 

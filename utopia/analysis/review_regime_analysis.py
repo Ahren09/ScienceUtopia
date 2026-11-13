@@ -32,6 +32,360 @@ logger = logging.getLogger('review_regime_analysis')
 MIN_SLOTS = 2  # a (paper, regime, arm) cell is valid with >= 2 parsed slots
 
 
+def analyze_review_sensitivity(corpus_dir, output_dir, stage, n_boot=10000, seed=42):
+    """Paper-level paired estimates for a complete review or recognition stage."""
+    from difflib import SequenceMatcher
+    import re
+    import unicodedata
+    from utopia.analysis.statistics import paired_spearman_ci
+
+    if stage not in ('main', 'recognition'):
+        raise ValueError('Analyze main reviews or independent recognition')
+    expected_count = 10800 if stage == 'main' else 1200
+    tasks = pd.read_parquet(corpus_dir / f'replay_tasks_{stage}.parquet')
+    responses = {}
+    for line in (output_dir / 'responses.jsonl').read_text().splitlines():
+        row = json.loads(line)
+        if row.get('success'):
+            responses[row['task_uid']] = row
+    if set(responses) != set(tasks.task_uid) or len(responses) != expected_count:
+        raise ValueError(f'Need all {expected_count} task IDs; found {len(responses)}')
+    common = {
+        'n_papers': 600, 'n_responses': expected_count,
+        'model': next(iter(responses.values()))['model'], 'sampling_unit': 'paper',
+    }
+    if stage == 'main':
+        scores = pd.DataFrame([{
+            'task_uid': row['task_uid'], 'score': float(row['response']['overall_score']),
+        } for row in responses.values()])
+        scores = tasks.drop(columns='prompt').merge(scores, on='task_uid', validate='one_to_one')
+        counts = scores.groupby(['paper_id', 'condition']).size()
+        if len(counts) != 3600 or not counts.eq(3).all():
+            raise ValueError('Need three profiles for every paper and all six conditions')
+        paper = scores.pivot_table(index='paper_id', columns='condition', values='score')
+        result = {
+            **common,
+            'means': {condition: float(paper[condition].mean()) for condition in paper},
+            'paired_score_difference_from_original': {
+                condition: paired_boot((paper[condition] - paper.original).to_numpy(),
+                                       n_boot=n_boot, seed=seed)
+                for condition in paper if condition != 'original'},
+            'rank_agreement_with_original': {
+                condition: paired_spearman_ci(
+                    paper.original, paper.original, paper[condition], n_boot=n_boot,
+                    seed=seed)['history']
+                for condition in paper if condition != 'original'},
+        }
+    else:
+        references = {
+            row['paper_id']: row['title']
+            for row in json.loads((corpus_dir / 'papers.json').read_text())
+        }
+        def normalize_title(text):
+            return ' '.join(re.findall(r'\w+', unicodedata.normalize('NFKC', text).casefold()))
+        values = []
+        for row in responses.values():
+            target = normalize_title(references[row['paper_id']])
+            guess = normalize_title(row['response']['title'])
+            values.append({
+                'paper_id': row['paper_id'], 'condition': row['condition'],
+                'exact': float(guess == target),
+                'similar': float(SequenceMatcher(None, guess, target).ratio() >= 0.90),
+                'declared': float(row['response']['recognized']),
+            })
+        frame = pd.DataFrame(values)
+        paper = frame.pivot(index='paper_id', columns='condition', values='exact')
+        result = {
+            **common,
+            'exact_identification_rate': paper.mean().to_dict(),
+            'similar_title_rate': frame.groupby('condition').similar.mean().to_dict(),
+            'declared_recognition_rate': frame.groupby('condition').declared.mean().to_dict(),
+            'paired_exact_difference': paired_boot(
+                (paper.paraphrased_abstract - paper.original_abstract).to_numpy(),
+                n_boot=n_boot, seed=seed),
+            'interpretation': 'Successful source identification from the supplied abstract',
+        }
+        frame.to_csv(output_dir / 'recognition_details.csv', index=False)
+    if len(paper) != 600:
+        raise ValueError('Need all 600 paper-level rows')
+    paper.to_csv(output_dir / 'paper_scores.csv')
+    write_json_file(result, output_dir / 'analysis.json')
+    return result
+
+
+def analyze_historical_directions(corpus_dir, output_dir, n_boot=10000, seed=42):
+    """Paired author-level accuracy on the complete fixed cohort."""
+    tasks = pd.read_parquet(corpus_dir / 'replay_tasks_main.parquet')
+    responses = {}
+    with (output_dir / 'responses.jsonl').open() as stream:
+        for line in stream:
+            row = json.loads(line)
+            if row.get('success'):
+                responses[row['task_uid']] = row
+    if set(responses) != set(tasks.task_uid) or len(responses) != 3000:
+        raise ValueError(f'Need all 3000 valid responses; found {len(responses)}')
+    frame = tasks[['task_uid', 'author_id', 'condition']].merge(pd.DataFrame([{
+        'task_uid': row['task_uid'], 'prediction': row['response']['topic'],
+    } for row in responses.values()]), on='task_uid', validate='one_to_one')
+    paper = frame.pivot(index='author_id', columns='condition', values='prediction')
+    gold = pd.read_parquet(corpus_dir / 'hidden_targets.parquet').set_index('author_id')
+    paper = paper.join(gold, how='inner', validate='one_to_one')
+    if len(paper) != 1000:
+        raise ValueError('Need all 1000 author IDs')
+    conditions = ['history', 'expertise_only', 'shuffled_history', 'last_topic']
+    for condition in conditions:
+        paper[condition + '_correct'] = (paper[condition] == paper.target_topic).astype(float)
+        paper[condition + '_any_topic'] = [
+            float(prediction in json.loads(topics))
+            for prediction, topics in zip(paper[condition], paper.target_topics)
+        ]
+        paper[condition + '_switch'] = (paper[condition] != paper.last_topic).astype(float)
+    result = {
+        'n_authors': 1000, 'n_model_responses': 3000,
+        'n_unique_target_papers': int(paper.target_paper_id.nunique()),
+        'model': next(iter(responses.values()))['model'],
+        'sampling_unit': 'author; all conditions retained in each paired resample',
+        'target': 'First 2021 CS paper; primary CS category is the primary endpoint',
+        'accuracy': {
+            condition: paired_boot(paper[condition + '_correct'].to_numpy(), n_boot=n_boot, seed=seed)
+            for condition in conditions
+        },
+        'any_topic_accuracy': {
+            condition: float(paper[condition + '_any_topic'].mean()) for condition in conditions
+        },
+        'history_minus_baseline_accuracy': {
+            condition: paired_boot(
+                (paper.history_correct - paper[condition + '_correct']).to_numpy(),
+                n_boot=n_boot, seed=seed)
+            for condition in conditions if condition != 'history'
+        },
+        'predicted_topic_switch_rate': {
+            condition: float(paper[condition + '_switch'].mean()) for condition in conditions
+        },
+        'observed_topic_switch_rate': float((paper.target_topic != paper.last_topic).mean()),
+    }
+    paper.to_csv(output_dir / 'author_predictions.csv')
+    write_json_file(result, output_dir / 'analysis.json')
+    logger.info('Historical direction analysis: %s', result['accuracy'])
+    return result
+
+
+def analyze_human_reviews(corpus_dir, output_dir, n_boot=10000, seed=42):
+    """Require all planned paper/profile/condition IDs before benchmark analysis."""
+    from utopia.analysis.statistics import paired_spearman_ci
+
+    if (corpus_dir / 'evaluation_gold.jsonl').exists():
+        return analyze_review_decisions(corpus_dir, output_dir, n_boot=n_boot, seed=seed)
+    tasks = pd.read_parquet(corpus_dir / 'replay_tasks_main.parquet')
+    responses = {}
+    with (output_dir / 'responses.jsonl').open() as stream:
+        for line in stream:
+            row = json.loads(line)
+            if row.get('success'):
+                responses[row['task_uid']] = row
+    expected = set(tasks.task_uid)
+    if set(responses) != expected or len(expected) != 1200:
+        raise ValueError(f"Need all 1200 valid task IDs, found {len(responses)}")
+    frame = pd.DataFrame([{
+        'task_uid': row['task_uid'],
+        'score': float(row['response']['overall_score']),
+    } for row in responses.values()])
+    frame = tasks.drop(columns='prompt').merge(frame, on='task_uid', validate='one_to_one')
+    counts = frame.groupby(['paper_id', 'condition']).size()
+    if not counts.eq(3).all() or len(counts) != 400:
+        raise ValueError('Require three profiles for each paper and condition')
+    paper = frame.pivot_table(index='paper_id', columns='condition', values='score')
+    gold = pd.read_parquet(corpus_dir / 'human_gold.parquet')
+    paper = paper.reset_index().merge(gold, on='paper_id', validate='one_to_one')
+    if len(paper) != 200:
+        raise ValueError('Require all 200 paper-level human references')
+    correlations = paired_spearman_ci(
+        paper.human_mean, paper.expertise_only, paper.history, n_boot=n_boot, seed=seed,
+    )
+    differences = paired_boot(
+        (paper.history - paper.expertise_only).to_numpy(), n_boot=n_boot, seed=seed,
+    )
+    result = {
+        'n_papers': 200, 'n_generated_reviews': 1200,
+        'n_human_reviews': int(paper.n_human_reviews.sum()),
+        'model': 'Qwen/Qwen3.5-397B-A17B-FP8',
+        'sampling_unit': 'paper, with both conditions and all profiles kept together',
+        'spearman': correlations, 'paired_score_difference': differences,
+        'mean_scores': {
+            name: float(paper[name].mean())
+            for name in ('history', 'expertise_only', 'human_mean')
+        },
+        'model_score_scale': [1, 5],
+        'human_score_scale': 'original benchmark rating scale',
+        'profile_semantics': 'retrieved experts, not the anonymous human reviewers',
+    }
+    paper.to_csv(output_dir / 'paper_scores.csv', index=False)
+    write_json_file(result, output_dir / 'analysis.json')
+    logger.info('Human review analysis complete: %s', correlations)
+    return result
+
+
+def fit_review_calibration(calibration_scores, calibration_labels):
+    """Fit an unregularized two-parameter logistic mapping on calibration data."""
+    from scipy.optimize import minimize
+    from scipy.special import expit
+
+    scores = np.asarray(calibration_scores, dtype=float)
+    labels = np.asarray(calibration_labels, dtype=float)
+    if scores.shape != labels.shape or set(labels) != {0, 1}:
+        raise ValueError('Calibration needs aligned scores and both decision classes')
+    design = np.column_stack([np.ones(len(scores)), scores])
+
+    def objective(parameters):
+        logits = design @ parameters
+        return float(np.mean(np.logaddexp(0, logits) - labels * logits))
+
+    def gradient(parameters):
+        return design.T @ (expit(design @ parameters) - labels) / len(labels)
+
+    rate = float(labels.mean())
+    fitted = minimize(objective, [np.log(rate / (1 - rate)), 0.0],
+                      jac=gradient, method='BFGS', options={'gtol': 1e-8})
+    if not fitted.success and np.max(np.abs(gradient(fitted.x))) > 1e-6:
+        raise ValueError(f'Calibration did not converge: {fitted.message}')
+    return {'intercept': float(fitted.x[0]), 'slope': float(fitted.x[1]),
+            'base_rate': rate, 'n_calibration': len(labels),
+            'objective': 'unregularized binary cross entropy'}
+
+
+def analyze_review_decisions(corpus_dir, output_dir, n_boot=10000, seed=42):
+    """Evaluate a complete external review corpus with a separate calibration set."""
+    from scipy.special import expit
+    from scipy.stats import spearmanr
+    from sklearn.metrics import roc_auc_score, balanced_accuracy_score, confusion_matrix
+    from utopia.agents.conference import Conference, ConferenceStatus
+
+    manifest = json.loads((corpus_dir / 'corpus_manifest.json').read_text())
+    tasks = pd.read_parquet(corpus_dir / 'replay_tasks_main.parquet')
+    responses = {}
+    for line in (output_dir / 'responses.jsonl').read_text().splitlines():
+        row = json.loads(line)
+        if row.get('success'):
+            responses[row['task_uid']] = row
+    expected = set(tasks.task_uid)
+    if (len(tasks) != len(expected) or len(expected) != manifest['n_tasks']
+            or set(responses) != expected):
+        raise ValueError(f"Need all {manifest['n_tasks']} prescribed valid review IDs")
+    if {row['model'] for row in responses.values()} != {manifest['model']}:
+        raise ValueError('Responses must use the prescribed model')
+    values = pd.DataFrame([{
+        'task_uid': uid, 'score': float(row['response']['overall_score']),
+    } for uid, row in responses.items()])
+    if not np.isfinite(values.score).all() or not values.score.between(1, 5).all():
+        raise ValueError('Review scores must be finite and within the native 1-5 scale')
+    frame = tasks.drop(columns='prompt').merge(values, on='task_uid', validate='one_to_one')
+    counts = frame.groupby('paper_id').size()
+    if (len(counts) != manifest['n_papers']
+            or not counts.eq(manifest['profiles_per_paper']).all()
+            or set(frame.condition) != {manifest['condition']}):
+        raise ValueError('Require every prescribed profile and one condition per paper')
+    paper = frame.groupby('paper_id').score.agg(list).rename('model_scores').reset_index()
+    paper['model_mean'] = paper.model_scores.map(np.mean)
+    gold = pd.read_json(corpus_dir / 'evaluation_gold.jsonl', lines=True).rename(
+        columns={'id': 'paper_id', 'mean_rating': 'human_mean'})
+    if gold.paper_id.duplicated().any() or set(gold.paper_id) != set(paper.paper_id):
+        raise ValueError('Human references and generated papers must have identical IDs')
+    paper = paper.merge(gold[['paper_id', 'split', 'accepted', 'human_mean', 'ratings',
+                              'status', 'primary_area']], on='paper_id', validate='one_to_one')
+    if set(paper.split) != {'calibration', 'test'}:
+        raise ValueError('Require separate calibration and test papers')
+    calibration = paper[paper.split == 'calibration'].copy()
+    test = paper[paper.split == 'test'].copy().sort_values('paper_id').reset_index(drop=True)
+    fitted = fit_review_calibration(calibration.model_mean, calibration.accepted)
+    paper['accept_probability'] = expit(fitted['intercept'] + fitted['slope'] * paper.model_mean)
+    test['accept_probability'] = expit(fitted['intercept'] + fitted['slope'] * test.model_mean)
+    conference = Conference(
+        conference_id='external_review_calibration', name='External review replay',
+        topics=[], acceptance_rate=fitted['base_rate'], use_configured_rate=True,
+        status=ConferenceStatus.UNDER_REVIEW,
+    )
+    conference.submitted_papers = [
+        {'id': row.paper_id, 'author_id': row.paper_id} for row in test.itertuples()
+    ]
+    conference.reviews = {
+        row.paper_id: [{'overall_score': score} for score in row.model_scores]
+        for row in test.itertuples()
+    }
+    conference.make_acceptance_decisions(tiebreak_seed=seed, acceptance_mode='rate')
+    accepted_ids = {row['id'] for row in conference.decisions['accept']}
+    test['quota_prediction'] = test.paper_id.isin(accepted_ids).astype(int)
+    vectors = test[['model_mean', 'human_mean', 'accepted',
+                    'accept_probability', 'quota_prediction']].to_numpy(dtype=float)
+
+    def metrics(sample):
+        model, human, labels, probability, prediction = vectors[sample].T
+        left, right = np.triu_indices(len(sample), 1)
+        human_order = np.sign(human[left] - human[right])
+        model_order = np.sign(model[left] - model[right])
+        eligible = human_order != 0
+        pairwise = np.mean(np.where(model_order[eligible] == 0, 0.5,
+                                   model_order[eligible] == human_order[eligible]))
+        both_classes = len(np.unique(labels)) == 2
+        return {
+            'spearman': float(spearmanr(model, human).statistic),
+            'acceptance_auroc': float(roc_auc_score(labels, model)) if both_classes else np.nan,
+            'human_mean_acceptance_auroc': float(roc_auc_score(labels, human)) if both_classes else np.nan,
+            'pairwise_ordering': float(pairwise),
+            'quota_accuracy': float(np.mean(prediction == labels)),
+            'quota_balanced_accuracy': float(balanced_accuracy_score(labels, prediction)) if both_classes else np.nan,
+            'calibrated_brier': float(np.mean((probability - labels) ** 2)),
+            'base_rate_brier': float(np.mean((fitted['base_rate'] - labels) ** 2)),
+            'brier_difference': float(np.mean((probability - labels) ** 2
+                                             - (fitted['base_rate'] - labels) ** 2)),
+        }
+
+    point = metrics(np.arange(len(test)))
+    rng = np.random.default_rng(seed)
+    draws = pd.DataFrame([metrics(rng.integers(0, len(test), len(test))) for _ in range(n_boot)])
+    estimates = {}
+    for name, value in point.items():
+        valid = draws[name][np.isfinite(draws[name])]
+        estimates[name] = {
+            'estimate': value, 'ci_lo': float(valid.quantile(0.025)),
+            'ci_hi': float(valid.quantile(0.975)), 'valid_bootstrap_draws': len(valid),
+        }
+    reliability = []
+    bins = np.minimum((test.accept_probability.to_numpy() * 5).astype(int), 4)
+    for index in range(5):
+        subset = test.loc[bins == index]
+        reliability.append({
+            'lower': index / 5, 'upper': (index + 1) / 5, 'n_papers': len(subset),
+            'mean_probability': float(subset.accept_probability.mean()) if len(subset) else None,
+            'accept_rate': float(subset.accepted.mean()) if len(subset) else None,
+        })
+    matrix = confusion_matrix(test.accepted, test.quota_prediction, labels=[0, 1])
+    human = test.human_mean.to_numpy()
+    left, right = np.triu_indices(len(test), 1)
+    threshold = min(row['final_score'] for row in conference.decisions['accept'])
+    result = {
+        'n_papers': len(paper), 'n_generated_reviews': len(responses),
+        'n_human_reviews': int(paper.ratings.map(len).sum()),
+        'n_calibration': len(calibration), 'n_test': len(test),
+        'test_accepted': int(test.accepted.sum()), 'test_rejected': int((1 - test.accepted).sum()),
+        'model': manifest['model'], 'condition': manifest['condition'],
+        'input_scope': 'pre-review archived title and abstract; retrieved expertise profiles',
+        'model_score_scale': [1, 5], 'human_score_categories': [0, 2, 4, 6, 8, 10],
+        'metrics': estimates, 'calibration': fitted, 'reliability_equal_width_bins': reliability,
+        'confusion_matrix_rows_true_columns_predicted_reject_accept': matrix.tolist(),
+        'quota_accepted': len(accepted_ids), 'quota_threshold': float(threshold),
+        'quota_threshold_tied_papers': int(np.isclose(test.model_mean, threshold, rtol=0, atol=1e-12).sum()),
+        'pairwise_eligible_pairs': int(np.count_nonzero(human[left] != human[right])),
+        'test_score_means_by_decision': test.groupby('accepted')[['model_mean', 'human_mean']].mean().to_dict(),
+        'bootstrap': 'Test papers sampled together; fitted calibration and quota decisions held fixed',
+        'n_boot': n_boot, 'seed': seed, 'conference_id_for_ties': conference.conference_id,
+    }
+    paper = paper.merge(test[['paper_id', 'quota_prediction']], on='paper_id', how='left')
+    paper.to_csv(output_dir / 'paper_scores.csv', index=False)
+    write_json_file(result, output_dir / 'analysis.json')
+    logger.info('External review decision analysis complete: %s', estimates)
+    return result
+
+
 # --------------------------------------------------------------------------
 # Pure estimators (unit-tested)
 # --------------------------------------------------------------------------

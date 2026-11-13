@@ -141,6 +141,122 @@ def test_cli_defaults_are_legacy():
 
 # ---------------------------------------------------------------- 2. new mechanisms
 
+def test_resubmission_analysis_separates_reused_reports_and_reads_gzip(tmp_path):
+    import gzip
+    from utopia.analysis.resubmission_stats import compute_stats
+
+    def attempt(year, venue, reused=False):
+        return {'year': year, 'conference': venue, 'reviews': [
+            {'reviewer_id': reviewer, 'overall_score': 3, 'reused': reused}
+            for reviewer in ('a0', 'a1')]}
+
+    papers = [
+        {'author_id': 'a0', 'status': 'accept',
+         'review_history': [attempt(1, 'c0'), attempt(2, 'c0', True)]},
+        {'author_id': 'a1', 'status': 'accept', 'review_history': [attempt(1, 'c1')]},
+        {'author_id': 'a0', 'status': 'accept', 'review_history': [attempt(6, 'c0')]},
+        {'author_id': 'a1', 'status': 'accept',
+         'review_history': [attempt(6, 'c1'), attempt(7, 'c1', True)]},
+        {'author_id': 'a0', 'status': 'reject', 'review_history': [attempt(10, 'c0')]},
+    ]
+    for year in range(1, 11):
+        checkpoint = {
+            'paper_tracker': {'papers': papers if year == 10 else []},
+            'ecosystem_data': {'agents': [
+                {'id': 'a0', 'can_author': True, 'can_review': True,
+                 'is_active': True, 'resources': 100},
+                {'id': 'a1', 'can_author': True, 'can_review': True,
+                 'is_active': year < 10, 'resources': 10},
+            ]},
+        }
+        with gzip.open(tmp_path / f'checkpoint_year_{year}.json.gz', 'wt') as stream:
+            json.dump(checkpoint, stream)
+    stats = compute_stats(str(tmp_path), 10)
+    assert stats['total_new_reports'] == 10
+    assert stats['total_reused_reports'] == 4
+    assert stats['new_reports_by_year'][2] == 0
+    assert stats['reused_reports_by_year'][2] == 2
+    assert stats['total_reports_by_year'][2] == 2
+    assert stats['reviews_per_active_reviewer_by_year'][10] == 2
+    assert stats['reviews_per_pool_member_by_year'][10] == 1
+    assert 2 not in stats['mean_reviews_per_reviewer_year']
+    (tmp_path / 'checkpoint_year_9.json.gz').unlink()
+    with pytest.raises(FileNotFoundError):
+        compute_stats(str(tmp_path), 10)
+
+
+def test_venue_rates_are_topic_matched_and_survive_checkpoint_round_trip():
+    from utopia.agents.conference import make_venue_variants
+    base = create_default_conference_system().conferences[:2]
+    uniform = make_venue_variants(base, 'uniform')
+    hidden = make_venue_variants(base, 'heterogeneous_hidden')
+    visible = make_venue_variants(base, 'heterogeneous_visible')
+    assert len(hidden) == 6
+    assert [c.conference_id for c in hidden] == [c.conference_id for c in visible]
+    assert [c.conference_id for c in hidden] == [c.conference_id for c in uniform]
+    for offset in (0, 3):
+        group = hidden[offset:offset + 3]
+        assert len({tuple(c.topics) for c in group}) == 1
+        assert [c.acceptance_rate for c in group] == [0.15, 0.30, 0.45]
+        assert [c.prestige for c in group] == [3, 2, 1]
+    assert all(c.acceptance_rate == 0.30 for c in uniform)
+    assert all(not c.show_attributes for c in hidden)
+    assert all(c.show_attributes for c in visible)
+    for conf in visible:
+        restored = Conference.from_dict(conf.to_dict())
+        assert restored.acceptance_rate == conf.acceptance_rate
+        assert restored.show_attributes and restored.prestige == conf.prestige
+
+
+def test_venue_visibility_enters_both_submission_decisions():
+    from utopia.agents.conference import make_venue_variants
+    agent, confs, tracker, direction, candidates, paper, rejected = golden_inputs()
+    hidden = make_venue_variants(confs, 'heterogeneous_hidden')
+    visible = make_venue_variants(confs, 'heterogeneous_visible')
+    for builder in (
+        lambda venues: agent.get_resubmission_prompt(rejected, venues)[0],
+        lambda venues: agent.get_paper_submission_prompt(
+            candidates, 1, venues, direction, tracker)[0],
+    ):
+        hidden_text, visible_text = builder(hidden), builder(visible)
+        assert 'Acceptance rate:' not in hidden_text and 'prestige:' not in hidden_text
+        assert 'Acceptance rate: 15%' in visible_text and 'prestige: 3' in visible_text
+        without_attributes = '\n'.join(
+            line for line in visible_text.split('\n') if not line.startswith('  Acceptance rate:'))
+        assert without_attributes == hidden_text
+
+
+def test_reused_reviews_reach_decisions_without_new_model_calls():
+    from utopia.agents.conference import ConferenceSystem
+    reports = [{'overall_score': float(i + 2), 'justification': 'Original report.',
+                'reviewer_id': f'reviewer_{i}', 'year': 1} for i in range(3)]
+    paper = {'id': 'p', 'title': 'Unchanged paper', 'abstract': 'Same abstract.',
+             'topics': ['cs.AI'], 'author_id': 'author', 'year': 2, 'conference': 'C',
+             'type': 'resubmission', 'review_history': [{'year': 1, 'reviews': reports}]}
+    conf = Conference(conference_id='C', name='C', topics=['cs.AI'], year=2)
+    conf.submitted_papers = [paper]
+    received = []
+    author = SimpleNamespace(process_received_reviews=lambda *args, **kwargs: received.append(args))
+    def unexpected_call(*args, **kwargs):
+        raise AssertionError('Review reuse must not generate new reports')
+    sim = stub_sim(
+        conference_system=ConferenceSystem([conf]),
+        llm=SimpleNamespace(generate_batch=unexpected_call),
+        ecosystem=SimpleNamespace(get_agent_by_id=lambda aid: author),
+        args=SimpleNamespace(review_reuse=True), _capacity_mode_on=False,
+    )
+    sim.reuse_paper_reviews = lambda item, year: Simulation.reuse_paper_reviews(sim, item, year)
+    results = {}
+    scores = Simulation._run_phase_3_peer_review(sim, 2, results)
+    assert scores == {'C': {'p': 3.0}}
+    assert results['peer_review']['new_reports'] == 0
+    assert results['peer_review']['reused_reports'] == 3
+    assert results['peer_review']['total_reports'] == 3
+    assert len(received) == 1
+    assert all(r['year'] == 1 and 'reused' not in r for r in reports)
+    assert all(r['source_year'] == 1 and r['year'] == 2 for r in conf.reviews['p'])
+
+
 def test_standardized_policy_drops_memory_and_inserts_block():
     agent, confs, tracker, direction, cands, paper, rejected = golden_inputs()
     agent.memory_bank.append({'type': 'harsh_reviews_received', 'year': 1, 'thought': 'UNFAIR_MARKER'})

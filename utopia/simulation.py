@@ -49,12 +49,12 @@ from utopia.analysis.analyze_all_results import SimulationAnalyzer
 from utopia.arguments import parse_arguments
 from utopia.config import SIMULATION_CONFIG
 from utopia.data.paper_tracker import PaperTracker
-from utopia.data.rag import RAG, RAGConfig
+from utopia.data.rag import FullTextCorpus, RAG, RAGConfig
 from utopia.data.tracker import CitationTracker, AgentTracker, FundingTracker
 from utopia.metrics.tracker import calculate_gini_coefficient, calculate_conference_score_metrics
-from utopia.models.models import GPT, BaseLLM, VLLMModel, VLLMServerModel, Gemini
+from utopia.models.models import GPT, BaseLLM, VLLMModel, VLLMServerModel, BedrockModel, Gemini
 from utopia.runtime.setup import project_setup
-from utopia.utils.seeding import set_seed, derive_seed
+from utopia.utils.seeding import set_seed, derive_seed, capture_rng_state, restore_rng_state
 from utopia.runtime.provenance import write_run_manifest
 
 
@@ -336,6 +336,10 @@ class Simulation:
             args: Command-line arguments object (optional)
         """
         self.llm: BaseLLM = llm
+        fulltext_index = getattr(args, 'fulltext_index', None)
+        self.fulltext_corpus = (FullTextCorpus(
+            fulltext_index, cache_dir=os.path.join(args.data_cache_dir, 'fulltext'))
+            if fulltext_index else None)
         self.num_years = num_years
         self.output_dir = output_dir
         self.current_year = 1
@@ -2772,6 +2776,12 @@ class Simulation:
                                        year=year, project=project_id(agent)):
                 self.funding_tracker.record_funding_consumption(year, annual_cost, agent.get_type())
 
+    def review_input(self, paper):
+        """Attach the indexed body only to the review input, not to checkpoints."""
+        if getattr(self, 'fulltext_corpus', None) is None:
+            return paper
+        return dict(paper, full_text=self.fulltext_corpus.text(paper['id']))
+
     def _run_phase_3_peer_review(self, year: int, year_results: Dict) -> Dict[str, Dict[str, float]]:
         """Phase 3: Conduct peer reviews
 
@@ -2811,6 +2821,11 @@ class Simulation:
                                    if self._capacity_mode_on else None)
             for conference in self.conference_system.conferences:
                 for paper in conference.submitted_papers:
+                    if getattr(self.args, 'review_reuse', False) and paper.get('review_history'):
+                        for review in self.reuse_paper_reviews(paper, year):
+                            conference.add_review(paper['id'], review)
+                            reviews_by_reviewer[review['reviewer_id']].append(review['overall_score'])
+                        continue
                     if capacity_assignment is not None:
                         selected_reviewers = capacity_assignment[paper['id']]
                     else:
@@ -2831,7 +2846,8 @@ class Simulation:
                         # reviewer: SimulationAgent
                         author_info = self._build_author_info_for_review(reviewer, paper)
                         prompt, response_format = reviewer.get_review_prompt(
-                            paper, author_info=author_info, review_policy=self.review_policy)
+                            self.review_input(paper), author_info=author_info, review_policy=self.review_policy,
+                            prompt_variant=getattr(self.args, 'review_prompt_variant', 'original'))
 
                         if peer_review_response_format is None:
                             peer_review_response_format = response_format
@@ -2931,7 +2947,7 @@ class Simulation:
                         review = None
                         while True:
                             try:
-                                review = reviewer.review_paper(paper, author_info=author_info)
+                                review = reviewer.review_paper(self.review_input(paper), author_info=author_info)
                                 conference.add_review(paper['id'], review)
                                 reviews_by_reviewer[reviewer.id].append(review['overall_score'])
 
@@ -2980,6 +2996,13 @@ class Simulation:
             'reviews_conducted': sum(len(c.reviews) for c in self.conference_system.conferences),
             'score_metrics': conference_score_metrics,
         }
+        reports = [review for conference in self.conference_system.conferences
+                   for reviews in conference.reviews.values() for review in reviews]
+        year_results['peer_review'].update({
+            'new_reports': sum(not report.get('reused', False) for report in reports),
+            'reused_reports': sum(bool(report.get('reused', False)) for report in reports),
+            'total_reports': len(reports),
+        })
 
         # Process received reviews for authors
         logger.info(f"Year {year} Phase 3: Processing author experiences from received reviews...")
@@ -2994,6 +3017,19 @@ class Simulation:
                                                         average_scores_of_venue=average_scores[conference.conference_id])
 
         return average_scores
+
+    def reuse_paper_reviews(self, paper, year):
+        """Reuse the last complete report set; the resubmission phase still charges its fee."""
+        from copy import deepcopy
+        previous = paper['review_history'][-1]['reviews']
+        if len(previous) != self.reviews_per_paper:
+            raise ValueError(f"Cannot reuse incomplete report set for {paper['id']}")
+        reports = deepcopy(previous)
+        for review in reports:
+            review['reused'] = True
+            review['source_year'] = review.get('source_year', review['year'])
+            review['year'] = year
+        return reports
 
     def _cast_review_score(self, value):
         """--review_score_mode: 'int' (legacy truncation) or 'float' (keep decimals)."""
@@ -3418,12 +3454,23 @@ class Simulation:
         MAX_FUNDING_EVAL_RETRIES = 3
         final_eval_results = []
         final_eval_metadata = []
+        strict = getattr(getattr(self, 'args', None), 'strict_funding_rankings', False)
+        if strict:
+            from utopia.funding.validation import inspect_funding_result
 
         for attempt in range(MAX_FUNDING_EVAL_RETRIES):
             if not all_funding_proposal_eval_prompts:
                 break
 
             if hasattr(self.llm, 'generate_batch'):
+                panel_formats = {}
+                if strict:
+                    if not getattr(self.llm, 'supports_response_formats', False):
+                        raise ValueError("Strict panel schemas require a backend with per-request schema support")
+                    panel_formats['response_formats'] = [
+                        FundingAgency.mapped_evaluation_format(meta['apps'])
+                        for meta in all_eval_metadata
+                    ]
                 # Ranking ALL panel applications produces long JSON after thinking
                 # tokens; the 2048 default truncated ~13% of program-years in E3.
                 eval_results = self.llm.generate_batch(
@@ -3431,6 +3478,7 @@ class Simulation:
                     max_tokens=8192,
                     desc=f"{len(all_funding_proposal_eval_prompts)} funding evaluations (attempt {attempt+1}/{MAX_FUNDING_EVAL_RETRIES})",
                     seed_ctx=('phase5_funding_eval', year, attempt),
+                    **panel_formats,
                 )
             else:
                 eval_results = []
@@ -3443,7 +3491,11 @@ class Simulation:
             retry_metadata = []
 
             for i, (result, msg_hist) in enumerate(eval_results):
-                if FundingAgency.validate_funding_result(result, all_eval_metadata[i]['apps']):
+                apps = all_eval_metadata[i]['apps']
+                valid = FundingAgency.validate_funding_result(result, apps)
+                if strict:
+                    valid = valid and inspect_funding_result(result, apps)['valid']
+                if valid:
                     final_eval_results.append((result, msg_hist))
                     final_eval_metadata.append(all_eval_metadata[i])
                     continue
@@ -3453,6 +3505,11 @@ class Simulation:
                     retry_prompts.append(all_funding_proposal_eval_prompts[i])
                     retry_metadata.append(all_eval_metadata[i])
                     continue
+                if strict:
+                    raise RuntimeError(
+                        f"Incomplete funding ranking in year {year}, program {program_id}, "
+                        f"panel {all_eval_metadata[i]['panel_index']}; saved replies retained"
+                    )
                 # Preserve final failures for the funding evaluator's fallback.
                 final_eval_results.append((result, msg_hist))
                 final_eval_metadata.append(all_eval_metadata[i])
@@ -3882,6 +3939,11 @@ class Simulation:
                 agents=research_agents,
                 num_conferences=num_conferences
             )
+            from utopia.agents.conference import make_venue_variants
+            selected_conferences = make_venue_variants(
+                selected_conferences, getattr(self.args, 'venue_regime', 'baseline'),
+                seed=getattr(self.args, 'seed', 42),
+            )
 
             # Create conference system with selected conferences
             self.conference_system = ConferenceSystem(conferences=selected_conferences)
@@ -3944,6 +4006,7 @@ class Simulation:
         checkpoint_data = {
             'year': year,
             'phase': phase,
+            'rng_state': capture_rng_state(),
             'ecosystem_data': self.ecosystem.to_dict(),
             'conference_system': self.conference_system.to_dict(),
             'citation_tracker': self.citation_tracker.to_dict(),
@@ -4154,6 +4217,9 @@ class Simulation:
                 self._collaboration_pairs = {int(k): v for k, v in pa_data['collaboration_pairs'].items()}
                 logger.info(f"  Loaded {len(self._collaboration_pairs)} collaboration pair records")
 
+        if checkpoint_data.get('rng_state'):
+            restore_rng_state(checkpoint_data['rng_state'])
+
         logger.info(f"Checkpoint loaded successfully from year {checkpoint_data['year']}")
         logger.info(f"  Loaded {len(self.ecosystem.agent_population)} agents")
         logger.info(f"  Loaded {len(self.submitted_paper_ids)} submitted paper IDs")
@@ -4173,6 +4239,9 @@ class Simulation:
 def main():
     """Main entry point"""
 
+    import signal
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
     project_setup()
 
     args = parse_arguments()
@@ -4183,7 +4252,18 @@ def main():
 
     # Auto-select LLM based on model name
     t0 = time.time()
-    if "gpt" in args.model:
+    if args.backend == 'bedrock':
+        llm = BedrockModel(
+            model_name=args.model, max_concurrent_requests=args.batch_size,
+            run_seed=args.seed, stop_at_utc=args.stop_at_utc,
+            response_cache_path=(os.path.join(args.log_dir, 'model_replies.jsonl')
+                                 if args.save_model_replies else None),
+            completion_token_floor=args.completion_token_floor or 32768,
+            input_tokens_per_minute=args.input_tokens_per_minute,
+            output_tokens_per_minute=args.output_tokens_per_minute,
+            api_budget_usd=args.api_budget_usd,
+        )
+    elif "gpt" in args.model:
         logger.info(f"Using OpenAI API for model: {args.model}")
         llm = GPT(model_name=args.model)
 
@@ -4197,6 +4277,12 @@ def main():
             base_url=args.vllm_url,
             max_concurrent_requests=args.batch_size,
             run_seed=args.seed,
+            response_cache_path=(
+                os.path.join(args.log_dir, 'model_replies.jsonl')
+                if args.save_model_replies else None),
+            stop_at_utc=args.stop_at_utc,
+            completion_token_floor=args.completion_token_floor,
+            thinking_token_budget=args.thinking_token_budget,
         )
     else:
         # Any non-OpenAI model uses vLLM (e.g., "Qwen/Qwen3-8B", "meta-llama/Llama-3-8B")

@@ -21,7 +21,7 @@ Run:
     python -m utopia.analysis.resubmission_stats
 """
 
-from utopia.utils.data_utils import write_json as write_json_file
+from utopia.utils.data_utils import read_json, write_json as write_json_file
 
 from utopia.analysis.statistics import bootstrap_ci
 import argparse
@@ -31,12 +31,13 @@ from pathlib import Path
 
 import numpy as np
 from scipy.stats import mannwhitneyu
-
-
-
+def read_checkpoint(run_dir: str, year: int) -> dict:
+    """Read the requested year; a missing year is not replaced by an earlier one."""
+    path = Path(run_dir) / f'checkpoint_year_{year}.json'
+    return read_json(path if path.exists() else path.with_suffix('.json.gz'))
 
 def compute_stats(run_dir: str, num_years: int) -> dict:
-    final = json.load(open(Path(run_dir) / f'checkpoint_year_{num_years}.json'))
+    final = read_checkpoint(run_dir, num_years)
     papers = final['paper_tracker']['papers']
     histories = [p['review_history'] for p in papers if p.get('review_history')]
 
@@ -164,7 +165,8 @@ def compute_stats(run_dir: str, num_years: int) -> dict:
 
     # --- reviewer load and concentration ---
     load_per_reviewer_year = Counter((r['reviewer_id'], e['year'])
-                                     for h in histories for e in h for r in e['reviews'])
+                                     for h in histories for e in h for r in e['reviews']
+                                     if not r.get('reused', False))
     load_by_year = defaultdict(list)
     for (_, y), n in load_per_reviewer_year.items():
         load_by_year[y].append(n)
@@ -229,7 +231,7 @@ def compute_stats(run_dir: str, num_years: int) -> dict:
     active_reviewer_pool_by_year = {}  # is_active & can_review
     reviewer_pool_by_year = {}       # all can_review (the actual sampling pool)
     for y in years:
-        cp = json.load(open(Path(run_dir) / f'checkpoint_year_{y}.json'))
+        cp = read_checkpoint(run_dir, y)
         all_agents = cp['ecosystem_data']['agents']
         population_by_year[y] = sum(1 for a in all_agents if a.get('can_author'))
         active_by_year[y] = sum(1 for a in all_agents
@@ -242,12 +244,15 @@ def compute_stats(run_dir: str, num_years: int) -> dict:
         for a in agents:
             rate['low' if a['resources'] < med else 'high'].append(new_subs.get((a['id'], y), 0))
 
-    # Reviews assigned per year / reviewer denominator. Numerator counts every
-    # individual review written that year (3 per submission event, typically).
+    # New reports measure reviewing work. Reused reports remain decision inputs
+    # but do not add another report to the original reviewer's workload.
     reviews_per_year = Counter()
+    reused_reviews_per_year = Counter()
     for h in histories:
         for e in h:
-            reviews_per_year[e['year']] += len(e['reviews'])
+            for review in e['reviews']:
+                counter = reused_reviews_per_year if review.get('reused', False) else reviews_per_year
+                counter[e['year']] += 1
     reviews_per_active_reviewer = {
         y: (reviews_per_year.get(y, 0) / active_reviewer_pool_by_year[y]
             if active_reviewer_pool_by_year[y] else float('nan')) for y in years}
@@ -257,8 +262,7 @@ def compute_stats(run_dir: str, num_years: int) -> dict:
 
     return {
         'run_dir': run_dir, 'num_years': num_years,
-        'n_agents': len(json.load(open(Path(run_dir) / 'checkpoint_year_1.json'))
-                        ['ecosystem_data']['agents']),
+        'n_agents': len(read_checkpoint(run_dir, 1)['ecosystem_data']['agents']),
         'n_papers': len(papers),
         'submissions_per_year': dict(zip(years, counts)),
         'mean_yoy_inflation_pct': float(np.mean(yoy)),
@@ -290,10 +294,18 @@ def compute_stats(run_dir: str, num_years: int) -> dict:
         'active_reviewer_pool_by_year': active_reviewer_pool_by_year,
         'reviewer_pool_by_year': reviewer_pool_by_year,
         'reviews_assigned_by_year': {y: reviews_per_year.get(y, 0) for y in years},
+        'new_reports_by_year': {y: reviews_per_year.get(y, 0) for y in years},
+        'reused_reports_by_year': {y: reused_reviews_per_year.get(y, 0) for y in years},
+        'total_reports_by_year': {
+            y: reviews_per_year.get(y, 0) + reused_reviews_per_year.get(y, 0) for y in years},
+        'total_new_reports': sum(reviews_per_year.values()),
+        'total_reused_reports': sum(reused_reviews_per_year.values()),
         'reviews_per_active_reviewer_by_year': reviews_per_active_reviewer,
         'reviews_per_pool_member_by_year': reviews_per_pool_member,
         'mean_reviews_per_reviewer_year': mean_load,
-        'reviewer_load_growth_pct': (mean_load[num_years] - mean_load[1]) / mean_load[1] * 100,
+        'reviewer_load_growth_pct': (
+            (mean_load[num_years] - mean_load[1]) / mean_load[1] * 100
+            if mean_load.get(1) and num_years in mean_load else None),
         'burden_ratio_top10pct_authors': burden_ratio,
         'mean_review_score_by_year': score_drift,
         'venue_volume_split': {'grouped_by': 'year1_submission_volume',

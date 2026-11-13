@@ -23,6 +23,44 @@ from utopia.constants import COI_NOTE
 logger = logging.getLogger(__name__)
 
 
+def apply_review_prompt_variant(prompt, variant='original'):
+    """Change wording or distribution instructions while preserving the paper block."""
+    if variant == 'original':
+        return prompt
+    opening = (
+        'You are a peer reviewer for an academic conference. Review the following paper '
+        'based on your expertise and past experiences (e.g. your own past submissions, '
+        'received reviews, your funding situations, your status level).'
+    )
+    variants = {
+        'paraphrase_1': (
+            'Act as a peer reviewer for an academic conference. Evaluate the paper below '
+            'using your expertise and previous experiences, including your submissions, '
+            'reviews you received, funding circumstances, and status.'
+        ),
+        'paraphrase_2': (
+            'Assess the submission below in your role as an academic conference reviewer. '
+            'Draw on your subject expertise and past experience with submitting papers, '
+            'receiving reviews, funding, and status.'
+        ),
+    }
+    if variant in variants:
+        if opening not in prompt:
+            raise ValueError('Expected original review introduction')
+        prompt = prompt.replace(opening, variants[variant], 1)
+        replacement = ('Include the following in your review:' if variant == 'paraphrase_1'
+                       else 'Your review should contain:')
+        return prompt.replace('Provide a comprehensive review with:', replacement, 1)
+    if variant == 'no_distribution':
+        import re
+        prompt = re.sub(r' \(top \d+(?:\.\d+)?%\)', '', prompt)
+        return prompt.replace(
+            '>60% papers receive a score of 2.0-2.5 or lower. Use this to calibrate your scores. ',
+            '', 1,
+        )
+    raise ValueError(f'Unknown review prompt variant: {variant}')
+
+
 class RoundIntention(BaseModel):
     intention: str
 
@@ -444,7 +482,8 @@ Respond in JSON format. An example response is below (DO NOT directly copy the e
         return prompt, response_format
     
     def get_review_prompt(self, paper: Dict, author_info: Dict = None,
-                          review_policy: str = 'persona') -> Tuple[str, Dict]:
+                          review_policy: str = 'persona',
+                          prompt_variant: str = 'original') -> Tuple[str, Dict]:
         """Build review prompt for a paper (without calling LLM)
 
         Args:
@@ -460,6 +499,10 @@ Respond in JSON format. An example response is below (DO NOT directly copy the e
             Prompt string for review generation, response format
         """
         assert review_policy in ('persona', 'standardized'), review_policy
+        paper_text = paper.get('full_text', paper['abstract'])
+        paper_label = 'Full paper text' if 'full_text' in paper else 'Abstract'
+        if not isinstance(paper_text, str) or not paper_text.strip():
+            raise ValueError(f"Empty review input for paper {paper.get('id')}")
         expertise = [e.topic if hasattr(e, 'topic') else str(e) for e in getattr(self, 'expertise', [])]
         memory_context = self.get_memory_context() if review_policy == 'persona' else ""
 
@@ -488,8 +531,8 @@ Your Expertise: {', '.join(expertise)}
 
 Title: {paper['title']}
 
-Abstract:
-{paper['abstract']}
+{paper_label}:
+{paper_text}
 
 Paper Topics: {', '.join(paper['topics'])}
 
@@ -517,6 +560,8 @@ Provide a comprehensive review with:
             assert prompt.count(anchor) == 1, "review-prompt anchor not unique"
             prompt = prompt.replace(
                 anchor, f"## Your Review Approach\n{STANDARDIZED_REVIEW_POLICY}\n\n{anchor}")
+        if prompt_variant != 'original':
+            prompt = apply_review_prompt_variant(prompt, prompt_variant)
         response_format = {
             'type': 'json_schema',
             'json_object': {
@@ -644,6 +689,9 @@ Below are the candidate conferences you can resubmit to. For each paper, you MUS
         for conference in conferences:
             prompt += f"""- \"{conference.conference_id}\": primary topics: {', '.join(conference.topics[:3])} | less preferred topics: {', '.join(conference.topics[3:])}
 """
+            if getattr(conference, 'show_attributes', False):
+                prompt += (f"  Acceptance rate: {conference.acceptance_rate:.0%}; "
+                           f"prestige: {conference.prestige:g} (higher is more prestigious).\n")
 
         prompt += """
 ## Your Task
@@ -843,6 +891,9 @@ Below are the candidate conferences you can submit to. You MUST CHOOSE EXACTLY O
         for conference in conferences:
             prompt += f"""- \"{conference.conference_id}\": primary topics: {', '.join(conference.topics[:3])} | less preferred topics: {', '.join(conference.topics[3:])}
 """
+            if getattr(conference, 'show_attributes', False):
+                prompt += (f"  Acceptance rate: {conference.acceptance_rate:.0%}; "
+                           f"prestige: {conference.prestige:g} (higher is more prestigious).\n")
         # Generate Conference enum dynamically from available conferences
         Conference = Enum('Conference', {cid: cid for cid in candidate_conference_ids}, type=str)
 

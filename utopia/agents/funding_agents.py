@@ -367,6 +367,39 @@ class FundingAgency(SimulationAgent):
         return batch_prompts, response_format, metadata_list
 
     @staticmethod
+    def mapped_evaluation_format(apps):
+        """Constrain each emitted application/applicant pair to the input panel."""
+        items = []
+        for index, app in enumerate(apps):
+            items.append({
+                'type': 'object',
+                'properties': {
+                    'application_id': {'const': index},
+                    'applicant_id': {'const': app['applicant_id']},
+                    'rank': {'type': 'integer', 'minimum': 1, 'maximum': len(apps)},
+                    'reason': {'type': 'string'},
+                },
+                'required': ['application_id', 'applicant_id', 'rank', 'reason'],
+                'additionalProperties': False,
+            })
+        return {
+            'type': 'json_schema',
+            'json_object': {
+                'name': 'FundingEvaluationResponse',
+                'strict': True,
+                'schema': {
+                    'type': 'object',
+                    'properties': {'ranked_applications': {
+                        'type': 'array', 'items': {'anyOf': items},
+                        'minItems': len(apps), 'maxItems': len(apps),
+                    }},
+                    'required': ['ranked_applications'],
+                    'additionalProperties': False,
+                },
+            },
+        }
+
+    @staticmethod
     def _build_program_prompt(program: 'FundingProgram', apps: List[Dict],
                               submitted_papers_dict: Dict[str, Dict]) -> str:
         """Build one ranking prompt for a program (or one panel of it)."""

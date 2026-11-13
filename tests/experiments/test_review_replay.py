@@ -28,6 +28,225 @@ PAPER = {'title': 'A Study of Widgets', 'abstract': 'We study widgets thoroughly
 EXPERTISE = ['graph mining', 'optimization']
 
 
+def test_external_replay_queues_pending_ids_and_saves_out_of_order(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import utopia.models.models as models
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(rr, 'ACTIVE_STUDY', 'historical_direction')
+    corpus = tmp_path / 'corpus'
+    corpus.mkdir()
+    tasks = pd.DataFrame([
+        {'task_uid': f'u{i}', 'author_id': str(i), 'condition': 'history', 'prompt': f'p{i}'}
+        for i in range(4)])
+    tasks.to_parquet(corpus / 'replay_tasks_main.parquet', index=False)
+    cfg = {
+        'model': 'fixture', 'n_tasks': 4, 'response_kind': 'prediction',
+        'response_format': {'json_object': {'schema': {
+            'type': 'object', 'properties': {'topic': {'type': 'string'}},
+            'required': ['topic']}}},
+    }
+    (corpus / 'corpus_manifest.json').write_text(json.dumps(cfg))
+    prereg = tmp_path / 'protocol.json'
+    prereg.write_text('{}')
+    monkeypatch.setattr(rr, 'PREREG_V1', str(prereg))
+    args = SimpleNamespace(corpus_dir=str(corpus), model='fixture', stage='main',
+                           output_name='review_replay_fixture', batch_size=2,
+                           max_tokens=8192, vllm_url='http://fixture/v1')
+    docs = rr.external_output_dir(args)
+    docs.mkdir(parents=True)
+    result_path = docs / 'responses.jsonl'
+    saved = {'task_uid': 'u2', 'success': True, 'response': {'topic': 'old'}, 'model': 'fixture'}
+    result_path.write_text(json.dumps(saved) + '\n')
+    calls = []
+
+    class ReplayModel:
+        def __init__(self, **kwargs):
+            assert kwargs['max_concurrent_requests'] == 2
+            self.call_stats = {}
+
+        def generate_batch(self, prompts, **kwargs):
+            calls.append(kwargs['item_ids'])
+            assert prompts == ['p0', 'p1', 'p3']
+            for index in (2, 0, 1):
+                kwargs['on_result'](index, ({'topic': 'new'}, []), {
+                    'success': True, 'cache_replay': False,
+                    'finish_reason': 'stop', 'max_tokens': 8192})
+                persisted = [json.loads(line) for line in result_path.read_text().splitlines()]
+                assert persisted[-1]['task_uid'] == kwargs['item_ids'][index]
+
+    monkeypatch.setattr(models, 'VLLMServerModel', ReplayModel)
+    rr.generate_external_tasks(args)
+    assert calls == [['u0', 'u1', 'u3']]
+    rows = [json.loads(line) for line in result_path.read_text().splitlines()]
+    assert rows[0] == saved
+    assert [row['task_uid'] for row in rows] == ['u2', 'u3', 'u0', 'u1']
+    assert json.loads((docs / 'completion.json').read_text())['n_valid'] == 4
+    rr.generate_external_tasks(args)
+    assert len(calls) == 1
+
+
+def test_human_review_tasks_keep_gold_and_identity_hidden():
+    source = {
+        'paper_data': {'title': 'Target Paper', 'abstract': 'Target abstract.',
+                       'evaluation_format': 'GOLD_DERIVED_FIELD'},
+        'review_data': [{'rating': '8: accept', 'weaknesses': 'SECRET_GOLD'}],
+        'reviewer_data': {
+            str(i): {
+                'domain': ['optimization'], 'name': 'SECRET_NAME',
+                'reviewer_match_similarity': i,
+                'publications': [
+                    {'title': 'Target Paper', 'abstract': 'SELF_PAPER_LEAK'},
+                    {'title': 'Earlier work', 'abstract': 'Earlier abstract.'},
+                ],
+            } for i in range(4)
+        },
+    }
+    tasks = rr.human_review_tasks({'paper': source})
+    assert len(tasks) == 6 and tasks.task_uid.is_unique
+    assert set(tasks.profile_id) == {'1', '2', '3'}
+    for text in tasks.prompt:
+        for secret in ('GOLD_DERIVED_FIELD', 'SECRET_GOLD', 'SECRET_NAME', 'SELF_PAPER_LEAK'):
+            assert secret not in text
+    for _, pair in tasks.groupby('slot'):
+        history = pair[pair.condition == 'history'].prompt.iloc[0]
+        baseline = pair[pair.condition == 'expertise_only'].prompt.iloc[0]
+        background = history[history.index('## Reviewer Publication Background'):
+                             history.index('## Review Instructions')]
+        assert history.replace(background, '') == baseline
+
+
+def test_paired_spearman_preserves_direction_and_sampling_unit():
+    result = statistics.paired_spearman_ci(
+        [1, 2, 3, 4, 5, 6], [6, 5, 4, 3, 2, 1], [1, 2, 3, 4, 5, 6],
+        n_boot=100, seed=42,
+    )
+    assert result['history']['estimate'] == pytest.approx(1)
+    assert result['expertise_only']['estimate'] == pytest.approx(-1)
+    assert result['history_minus_expertise']['estimate'] == pytest.approx(2)
+    assert result['history']['n_papers'] == 6
+
+
+def test_review_calibration_recovers_known_bin_probabilities():
+    from scipy.special import expit
+
+    scores = np.repeat([1.0, 2.0, 3.0], 10)
+    labels = np.array([1] * 2 + [0] * 8 + [1] * 5 + [0] * 5 + [1] * 8 + [0] * 2)
+    fit = ra.fit_review_calibration(scores, labels)
+    probabilities = expit(fit['intercept'] + fit['slope'] * np.array([1.0, 2.0, 3.0]))
+    assert probabilities == pytest.approx([0.2, 0.5, 0.8], abs=1e-6)
+    reversed_fit = ra.fit_review_calibration(scores, 1 - labels)
+    assert reversed_fit['slope'] == pytest.approx(-fit['slope'], abs=1e-6)
+    with pytest.raises(ValueError, match='both decision classes'):
+        ra.fit_review_calibration(scores, np.zeros(30))
+
+
+def test_external_review_analysis_keeps_test_labels_out_of_calibration(tmp_path):
+    corpus, output = tmp_path / 'corpus', tmp_path / 'output'
+    corpus.mkdir()
+    output.mkdir()
+    calibration_scores = [1.0] * 10 + [2.0] * 10 + [3.0] * 10
+    calibration_labels = [1] * 2 + [0] * 8 + [1] * 5 + [0] * 5 + [1] * 8 + [0] * 2
+    scores = calibration_scores + [1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5]
+    labels = calibration_labels + [0, 0, 0, 1, 0, 1, 1, 1]
+    tasks, responses, gold = [], [], []
+    for i, (score, label) in enumerate(zip(scores, labels)):
+        paper_id = f'paper{i:02d}'
+        gold.append({
+            'id': paper_id, 'split': 'calibration' if i < 30 else 'test',
+            'accepted': label, 'mean_rating': score * 2, 'ratings': [score * 2] * 3,
+            'status': 'Poster' if label else 'Reject', 'primary_area': 'test',
+        })
+        for slot in range(3):
+            uid = f'{paper_id}|{slot}|expertise_only'
+            tasks.append({'task_uid': uid, 'paper_id': paper_id, 'slot': slot,
+                          'condition': 'expertise_only', 'prompt': 'Paper input'})
+            responses.append({'task_uid': uid, 'model': 'fixture', 'success': True,
+                              'response': {'overall_score': score}})
+    pd.DataFrame(tasks).to_parquet(corpus / 'replay_tasks_main.parquet', index=False)
+    (corpus / 'corpus_manifest.json').write_text(json.dumps({
+        'n_tasks': len(tasks), 'n_papers': len(scores), 'profiles_per_paper': 3,
+        'model': 'fixture', 'condition': 'expertise_only',
+    }))
+    (output / 'responses.jsonl').write_text('\n'.join(map(json.dumps, responses)) + '\n')
+    gold_path = corpus / 'evaluation_gold.jsonl'
+    gold_path.write_text('\n'.join(map(json.dumps, gold)) + '\n')
+    first = ra.analyze_review_decisions(corpus, output, n_boot=20)
+    assert first['metrics']['acceptance_auroc']['estimate'] == pytest.approx(15 / 16)
+    assert first['metrics']['quota_accuracy']['estimate'] == pytest.approx(0.75)
+    for row in gold:
+        if row['split'] == 'test':
+            row['accepted'] = 1 - row['accepted']
+    gold_path.write_text('\n'.join(map(json.dumps, gold)) + '\n')
+    second = ra.analyze_review_decisions(corpus, output, n_boot=20)
+    assert second['calibration'] == first['calibration']
+    assert second['metrics']['acceptance_auroc']['estimate'] == pytest.approx(1 / 16)
+    (output / 'responses.jsonl').write_text('\n'.join(map(json.dumps, responses[:-1])) + '\n')
+    with pytest.raises(ValueError, match='prescribed valid review IDs'):
+        ra.analyze_review_decisions(corpus, output, n_boot=20)
+
+
+def test_historical_direction_inputs_exclude_future_and_shuffle_only_history():
+    cohort = [{
+        'author_id': author, 'history_donor_id': donor,
+        'history': [{'year': year, 'title': author + '_history',
+                     'abstract': author + '_abstract', 'topics': ['cs.CV']}
+                    for year in (2017, 2018, 2020)],
+        'target': {'title': 'SECRET_2021_TARGET'},
+    } for author, donor in [('a', 'b'), ('b', 'a')]]
+    tasks, fmt = rr.historical_direction_tasks(cohort)
+    assert len(tasks) == 6 and tasks.task_uid.is_unique
+    assert len(fmt['json_object']['schema']['properties']['topic']['enum']) == 40
+    assert all('SECRET_2021_TARGET' not in prompt for prompt in tasks.prompt)
+    rows = tasks[tasks.author_id == 'a'].set_index('condition')
+    assert 'a_history' in rows.loc['history', 'prompt']
+    assert 'b_history' not in rows.loc['history', 'prompt']
+    assert 'b_history' in rows.loc['shuffled_history', 'prompt']
+    assert 'a_history' not in rows.loc['shuffled_history', 'prompt']
+    assert '_history' not in rows.loc['expertise_only', 'prompt']
+    cohort[0]['history'][0]['year'] = 2021
+    with pytest.raises(ValueError, match='pre-2021'):
+        rr.historical_direction_tasks(cohort)
+
+
+def test_review_wording_variants_keep_the_same_paper_and_scoring_rubric():
+    from utopia.agents.base_agent import SimulationAgent
+    from utopia.constants import REVIEW_CRITERIA
+    agent = SimulationAgent(reputation=5, agent_id='reviewer', llm=None)
+    agent.expertise = ['optimization']
+    original, schema = agent.get_review_prompt(PAPER)
+    paper_block = original.split('## Paper', 1)[1].split('## Review Instructions', 1)[0]
+    for variant in ('paraphrase_1', 'paraphrase_2'):
+        text, actual_schema = agent.get_review_prompt(PAPER, prompt_variant=variant)
+        assert text != original and REVIEW_CRITERIA in text
+        assert text.split('## Paper', 1)[1].split('## Review Instructions', 1)[0] == paper_block
+        assert actual_schema == schema
+    text, actual_schema = agent.get_review_prompt(PAPER, prompt_variant='no_distribution')
+    assert '%' not in text
+    assert '(1-5 scale)' in text and '1-sentence justification' in text
+    assert 'Scores in decimals' in text and actual_schema == schema
+
+
+def test_review_sensitivity_hides_titles_and_shares_rewrites_across_profiles():
+    papers = [{'paper_id': 'paper1', 'title': 'SECRET_TARGET_TITLE',
+               'abstract': 'Original scientific abstract.', 'topics': ['ML'],
+               'profile_ids': ['a', 'b', 'c']}]
+    reviews, probes = rr.review_sensitivity_tasks(
+        papers, {key: ['optimization'] for key in ['a', 'b', 'c']},
+        {'paper1': 'Rewritten scientific abstract.'})
+    assert len(reviews) == 18 and reviews.task_uid.is_unique
+    assert len(probes) == 2 and probes.task_uid.is_unique
+    for _, row in reviews.iterrows():
+        if row.condition.startswith('title_hidden'):
+            assert 'SECRET_TARGET_TITLE' not in row.prompt
+        else:
+            assert 'SECRET_TARGET_TITLE' in row.prompt
+        if row.condition == 'title_hidden_paraphrased':
+            assert 'Rewritten scientific abstract.' in row.prompt
+            assert 'Original scientific abstract.' not in row.prompt
+    assert all('SECRET_TARGET_TITLE' not in prompt for prompt in probes.prompt)
+
+
 # ------------------------------------------------------------- prompt adapter
 
 def test_policy_block_inserted_before_anchor_once():

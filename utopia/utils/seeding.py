@@ -53,3 +53,29 @@ def set_seed(seed: int = 42, use_torch: bool = True):
 
         except ImportError:
             print("Fail to import torch. Skipping torch seed setting")
+
+
+def capture_rng_state():
+    """Save process randomness in the native JSON checkpoint."""
+    import numpy as np
+    import torch
+
+    name, keys, position, has_gauss, cached_gauss = np.random.get_state()
+    return {'python': random.getstate(),
+            'numpy': [name, keys.tolist(), position, has_gauss, cached_gauss],
+            'torch': torch.get_rng_state().tolist()}
+
+
+def restore_rng_state(state):
+    """Restore saved streams, including Python-only recovered legacy state."""
+    import numpy as np
+    import torch
+
+    if 'python' in state:
+        version, keys, gaussian = state['python']
+        random.setstate((version, tuple(keys), gaussian))
+    if 'numpy' in state:
+        name, keys, position, has_gauss, cached_gauss = state['numpy']
+        np.random.set_state((name, np.asarray(keys, dtype=np.uint32), position, has_gauss, cached_gauss))
+    if 'torch' in state:
+        torch.set_rng_state(torch.tensor(state['torch'], dtype=torch.uint8))
