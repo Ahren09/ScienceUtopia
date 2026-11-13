@@ -4247,6 +4247,11 @@ class Simulation:
                 saved_fulltext.pop('index_sha256', None)
             if current_reference:
                 current_reference.pop('index_sha256', None)
+            for reference in (saved_fulltext, current_reference):
+                if reference and isinstance(reference.get('tokenizer'), dict):
+                    reference['tokenizer'] = {
+                        key: value for key, value in reference['tokenizer'].items()
+                        if key != 'tokenizer_json_sha256'}
             if saved_fulltext != current_reference:
                 raise PortableCheckpointError("Checkpoint full-text corpus differs from configured corpus")
             if checkpoint_data.get('year') != year or checkpoint_data.get('phase') != (0 if year == 0 else 5):

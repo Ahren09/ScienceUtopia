@@ -503,6 +503,29 @@ class TestPortableContinuation(unittest.TestCase):
         with self.assertRaises(PortableStop):
             client._create_completion(messages=[{"content": "unused"}])
 
+    def test_fulltext_uses_paper_membership_without_hash_gates(self):
+        from utopia.data.fulltext import FORMAT, FullTextCorpus
+        text = b"Full original paper."
+        (self.root / "texts.utf8").write_bytes(text)
+        record = {"metadata": {"id": "2101.00001", "publication_year": 2021}}
+        abstracts = self.root / "abstracts.jsonl"
+        abstracts.write_text(json.dumps(record) + "\n")
+        index = {
+            "format": FORMAT, "years": [2021], "max_text_tokens": 100,
+            "text_file": "texts.utf8", "abstracts_file": "abstracts.jsonl",
+            "abstracts_sha256": "historical-metadata",
+            "papers": {"2101.00001": {"token_count": 4, "offset": 0,
+                                     "nbytes": len(text), "sha256": "old-value"}},
+        }
+        path = self.root / "index.json"
+        path.write_text(json.dumps(index))
+        corpus = FullTextCorpus(path, expected_sha256="old-index")
+        self.assertEqual(corpus.text("2101.00001v1"), text.decode())
+        self.assertEqual(corpus.abstract_records(2021, 1), [record])
+        abstracts.write_text(json.dumps(record) + "\n" + json.dumps(record) + "\n")
+        with self.assertRaises(ValueError):
+            corpus.abstract_records(2021, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
