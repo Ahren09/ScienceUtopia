@@ -17,7 +17,7 @@ REVIEW_CRITERIA = """
 - 2: Needs major revisions (top 50%)
 - 1: Reject
 
-NOTE: 
+NOTE:
 * This is a VERY rigorous top-tier conference. >60% papers receive a score of 2.0-2.5 or lower. Use this to calibrate your scores. Be careful about giving high scores.
 * Scores in decimals like 1.5 is allowed.
 """

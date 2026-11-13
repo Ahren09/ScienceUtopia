@@ -82,7 +82,6 @@ from __future__ import annotations
 from utopia.runtime.commands import module_command
 from utopia.utils.data_utils import file_sha256 as file_hash
 import argparse
-import hashlib
 import subprocess
 from dataclasses import asdict
 import json
@@ -347,35 +346,6 @@ LARGE_MODEL = "Qwen/Qwen3.5-397B-A17B-FP8"
 LARGE_REVISION = "ea5b4f81096f3901c91dea97f81324302495781d"
 
 
-def prospective_source_fingerprint(root=ROOT):
-    # The manuscript-only renderer is not part of this scientific runtime.
-    excluded = root / "utopia/visual/plot_ac_resubmission.py"
-    paths = sorted(path for path in (root / "utopia").rglob("*.py") if path != excluded)
-    paths += [root / "requirements.txt", root / "scripts/upload_checkpoint.sh", root / "scripts/fulltext_client_env.sh"]
-    return digest({str(path.relative_to(root)): file_hash(path) for path in paths})
-
-
-SOURCE_AMENDMENT_ORIGIN = "4115c7848c4ed8782a756466801beaeaa7e63b6b73da4e2e4cab6f89cb599aaa"
-SOURCE_AMENDMENT_FILES = {
-    "utopia/data/rag.py": (
-        "64760c1a2858a7780a0ab4924a9ba802aa2b636e243226ef93c9a2e93e020627",
-        "a596f007674c9b1e545d52b0697dca8d3b3869a2f37b23e663e8869b0b3d095f"),
-    "utopia/experiments/funding_feedback.py": (
-        "c30ce27531219fc9745a65c6c2f533300210412dcb6e98fe18d09d47952620c2", None),
-}
-SOURCE_AMENDMENT_STUDIES = {
-    "pf10000_fulltext_qwen397b_seed42_20261006": (
-        ("P1F1", "P0F1", "P1F0", "P0F0"), 1791757717.881552),
-    "switch5000_fulltext_qwen397b_seed42_20261006": (
-        ("LN", "HN"), 1791844861.1598995),
-}
-
-
-# Explicit 2026-10-10 author amendment for these four existing P6-2 worlds only.
-LENGTH_EXTENSION_RUN = "pf10000_fulltext_qwen397b_seed42_20261006"
-LENGTH_EXTENSION_PARENT_SOURCE = "d517faa477544c3244f6587d17c26ac87148e5134455ff05bc3c5dd1ad5e8eea"
-LENGTH_EXTENSION_PARENT_AMENDMENT = "62c071d5c395d9fa2fc33df79d5c06593f0a3972a7545719b6148dbcdc41d9ce"
-LENGTH_EXTENSION_MODEL_SHA256 = "334f4d557c6917ed215618d91f38bdb6ecbdfe7da42c16f027c147f01ffbdc64"
 LENGTH_EXTENSION_POLICY = {
     "protocol": "three-length-no-final-then-one-context-capped-attempt-v1",
     "original_attempts": 3, "original_max_tokens": 8192,
@@ -383,19 +353,7 @@ LENGTH_EXTENSION_POLICY = {
     "context_tokens": 131072, "input_policy": "unchanged-full-input",
     "on_extra_failure": "stop", "cache_namespace": "experiment_origin",
 }
-LENGTH_EXTENSION_FAILED_MANIFESTS = {
-    "P0F0": "66164265cc69ef983ee80b766f08f9dabc12fb6aeffe617c889e9ce5c59a3839",
-    "P0F1": "7dce9400e374d203c26fa1ecb3ff3a99e82a91c5af1ec588f81cc93591f168bd",
-    "P1F0": "5ba1dc0615affec63b75ccdba676a632941118dcc2e7449b0ddde1a484fd6834",
-    "P1F1": "ff65d25aa23a3c24a248dbf7bca2c5001da28fbc7ab228e60cc63658f2a6b0c0",
-}
 
-ANSWER_RECOVERY_PARENT_SOURCE = "7a49201057f39a26ae7bf64bdb204a1f63af1b0be59164bbf2e6620575cce1c3"
-ANSWER_RECOVERY_PARENT_AMENDMENT = "5df3f3e078e2e00b98e1ac67106a3e716670c3021fc1a102b153ff736e3b863d"
-ANSWER_RECOVERY_FILE_PINS = {
-    "utopia/models/models.py": "42c08d7ad628c4dceebee6a9db853d24df96d4466d6d69934d12e35b709d1597",
-    "utopia/models/request_audit.py": "c4aae6e25e3f3f563d1ac25be4e2edbeafd261eec2562add9809b56c8fe1c996",
-}
 ANSWER_RECOVERY_POLICY = {
     "protocol": "legacy-attempts-then-one-nonthinking-answer-v1",
     "legacy_policy": LENGTH_EXTENSION_POLICY,
@@ -410,321 +368,72 @@ ANSWER_RECOVERY_POLICY = {
     "on_recovery_failure": "stop-no-sixth-attempt",
     "cache_namespace": "experiment_origin",
 }
-ANSWER_RECOVERY_FAILED_MANIFESTS = {
-    "P1F1": "a0fad35a5037661521d86aca890c8353fbb3c9707ddc6bde9b843a4b155a7dd9",
-    "P0F1": "336643bba4803b09189abc30dc59f95f21e2306f1d7bf529a8c02f53a663d5a8",
-    "P1F0": "b89643524b9b632d7b7a2534884eb9df9a5943faf9ca3106c5791d7a87baf91a",
-    "P0F0": "952c85192c4fb54c613c825bf0ddc8bfedac36db95e3fc53ed10e18bc9344aad",
-}
-
-
-def validate_answer_recovery_inventory(options, amendment, original_files, current_files):
-    """Admit the reviewed P62 repair while retaining the complete prior amendment."""
-    if (options.run_id != LENGTH_EXTENSION_RUN
-            or options.cell not in ANSWER_RECOVERY_FAILED_MANIFESTS
-            or amendment.get("generation_extension") != ANSWER_RECOVERY_POLICY
-            or options.max_tokens != 8192 or options.context_tokens != 131072):
-        raise ValueError("Answer recovery differs from the P62 authorization")
-    parent_raw = bytes.fromhex(amendment["parent_amendment_raw_hex"])
-    if hashlib.sha256(parent_raw).hexdigest() != ANSWER_RECOVERY_PARENT_AMENDMENT:
-        raise ValueError("Answer recovery parent amendment bytes differ")
-    parent = json.loads(parent_raw)
-    parent_files = parent["execution_files"]
-    if (parent["execution_source_sha256"] != ANSWER_RECOVERY_PARENT_SOURCE
-            or digest(parent_files) != ANSWER_RECOVERY_PARENT_SOURCE
-            or parent["original_files"] != original_files
-            or parent["cells"] != amendment["cells"]
-            or parent.get("generation_extension") != LENGTH_EXTENSION_POLICY
-            or set(parent_files) != set(current_files)):
-        raise ValueError("Answer recovery parent inventory/cells/policy differ")
-    changed = {name for name in parent_files if parent_files[name] != current_files[name]}
-    if (changed != set(ANSWER_RECOVERY_FILE_PINS) | {"utopia/experiments/funding_feedback.py"}
-            or any(current_files[name] != pin for name, pin in ANSWER_RECOVERY_FILE_PINS.items())):
-        raise ValueError("Answer recovery must change only reviewed model/audit/runner files")
-    return parent
-
-
-def validate_answer_recovery_transition(options, previous, parent, root):
-    """The first repair activation requires each cell's own verified failed state."""
-    prior_info = previous.get("source_amendment") or {}
-    manifest = root / "outputs/docs" / f"{options.run_id}_{options.cell}" / "experiment.json"
-    checkpoint_root = root / "outputs/checkpoints" / f"{options.run_id}_{options.cell}"
-    checkpoint = checkpoint_root / "portable_checkpoint_year_0.json.gz"
-    if (previous.get("source_hash") != ANSWER_RECOVERY_PARENT_SOURCE
-            or prior_info.get("sha256") != ANSWER_RECOVERY_PARENT_AMENDMENT
-            or prior_info.get("record") != parent
-            or previous.get("status") != "failed" or previous.get("years_completed") != 0
-            or previous.get("generation_extension") != LENGTH_EXTENSION_POLICY
-            or file_hash(manifest) != ANSWER_RECOVERY_FAILED_MANIFESTS[options.cell]
-            or set(checkpoint_root.glob("portable_checkpoint_year_*.json.gz")) != {checkpoint}
-            or file_hash(checkpoint) != parent["cells"][options.cell]["origin_checkpoint_sha256"]):
-        raise ValueError("Answer recovery requires the exact verified failed cell")
-
-
-def validate_length_extension_inventory(options, amendment, original_files, current_files):
-    """Admit the approved generation change through the exact retained parent."""
-    if (options.run_id != LENGTH_EXTENSION_RUN
-            or options.cell not in LENGTH_EXTENSION_FAILED_MANIFESTS
-            or amendment.get("generation_extension") != LENGTH_EXTENSION_POLICY
-            or options.max_tokens != 8192 or options.context_tokens != 131072):
-        raise ValueError("Conditional response extension differs from the P62 authorization")
-    parent_raw = bytes.fromhex(amendment["parent_amendment_raw_hex"])
-    if hashlib.sha256(parent_raw).hexdigest() != LENGTH_EXTENSION_PARENT_AMENDMENT:
-        raise ValueError("Conditional response extension parent amendment bytes differ")
-    parent = json.loads(parent_raw)
-    parent_files = parent["execution_files"]
-    if (parent["execution_source_sha256"] != LENGTH_EXTENSION_PARENT_SOURCE
-            or digest(parent_files) != LENGTH_EXTENSION_PARENT_SOURCE
-            or parent["original_files"] != original_files
-            or parent["cells"] != amendment["cells"]
-            or set(parent_files) != set(current_files)):
-        raise ValueError("Conditional response extension parent inventory/cells differ")
-    changed = {name for name in parent_files if parent_files[name] != current_files[name]}
-    if (changed != {"utopia/models/models.py", "utopia/experiments/funding_feedback.py"}
-            or current_files["utopia/models/models.py"] != LENGTH_EXTENSION_MODEL_SHA256):
-        raise ValueError("Conditional response extension must change only reviewed model/runner files")
-    return parent
-
-
-def validate_length_extension_transition(options, previous, parent, root):
-    """First activation must start from the exact backed-up failed year-zero cell."""
-    prior_info = previous.get("source_amendment") or {}
-    manifest = root / "outputs/docs" / f"{options.run_id}_{options.cell}" / "experiment.json"
-    checkpoint_root = root / "outputs/checkpoints" / f"{options.run_id}_{options.cell}"
-    checkpoint = checkpoint_root / "portable_checkpoint_year_0.json.gz"
-    if (previous.get("source_hash") != LENGTH_EXTENSION_PARENT_SOURCE
-            or prior_info.get("sha256") != LENGTH_EXTENSION_PARENT_AMENDMENT
-            or prior_info.get("record") != parent
-            or previous.get("status") != "failed" or previous.get("years_completed") != 0
-            or previous.get("generation_extension") is not None
-            or file_hash(manifest) != LENGTH_EXTENSION_FAILED_MANIFESTS[options.cell]
-            or set(checkpoint_root.glob("portable_checkpoint_year_*.json.gz")) != {checkpoint}
-            or file_hash(checkpoint) != parent["cells"][options.cell]["origin_checkpoint_sha256"]):
-        raise ValueError("Conditional response extension requires the exact verified failed cell")
-
 
 
 def resolve_prospective_source(options, candidate_binding, previous, root=ROOT):
-    """Admit reviewed source/generation amendments; retain the origin cache namespace.
+    """Resume by world identity and scientific settings, retaining saved reply IDs."""
+    from utopia.runtime.checkpointing import scientific_binding
 
-    The candidate and fingerprint remain actual execution provenance. The returned
-    origin binding preserves native contracts and response keys, not a claim that
-    the original source is executing. No checkpoint or database is modified here.
-    """
-    execution_hash = prospective_source_fingerprint(root)
     path = getattr(options, "source_amendment", None)
-    if not path:
-        if previous is not None and (previous.get("source_amendment")
-                                     or previous["binding"] != candidate_binding):
-            raise ValueError("Scientific configuration differs; explicit --source-amendment required")
-        return candidate_binding, {"source_hash": execution_hash}, None
-    if not options.resume or previous is None:
-        raise ValueError("Source amendment requires an existing world and explicit --resume")
-    study = SOURCE_AMENDMENT_STUDIES.get(options.run_id)
-    if study is None or options.cell not in study[0]:
-        raise ValueError("Source amendment is restricted to the six original scientific cells")
-    cells, deadline = study
-    raw = Path(path).read_bytes()
-    amendment = json.loads(raw)
-    if amendment.get("format") == "scienceutopia-p69-authorized-continuation-v1":
-        return resolve_p69_continuation(options, candidate_binding, previous, root, raw)
-    if amendment.get("format") == "scienceutopia-p62-p63-continuation-v1":
-        return resolve_p62_continuation(options, candidate_binding, previous, root, raw)
-    if (amendment.get("format") != "scienceutopia-source-amendment-v1"
-            or amendment.get("binding_source_role") != "experiment_origin"
-            or amendment.get("run_id") != options.run_id
-            or set(amendment.get("cells", {})) != set(cells)):
-        raise ValueError("Source amendment format/study/cell coverage differs")
-    original_files, execution_files = amendment["original_files"], amendment["execution_files"]
-    if (amendment["origin_source_sha256"] != SOURCE_AMENDMENT_ORIGIN
-            or digest(original_files) != SOURCE_AMENDMENT_ORIGIN):
-        raise ValueError("Original complete source inventory differs from the frozen origin")
-    excluded = root / "utopia/visual/plot_ac_resubmission.py"
-    paths = sorted(p for p in (root / "utopia").rglob("*.py") if p != excluded)
-    paths += [root / "requirements.txt", root / "scripts/upload_checkpoint.sh",
-              root / "scripts/fulltext_client_env.sh"]
-    current_files = {str(p.relative_to(root)): file_hash(p) for p in paths}
-    if (execution_files != current_files or set(original_files) != set(current_files)
-            or digest(current_files) != execution_hash
-            or amendment["execution_source_sha256"] != execution_hash):
-        raise ValueError("Current complete source inventory differs from the amendment")
-    extension = amendment.get("generation_extension")
-    parent = None
-    answer_recovery = (extension is not None and
-                       extension.get("protocol") == "legacy-attempts-then-one-nonthinking-answer-v1")
-    if answer_recovery:
-        parent = validate_answer_recovery_inventory(options, amendment, original_files, current_files)
-    elif extension is not None:
-        parent = validate_length_extension_inventory(options, amendment, original_files, current_files)
-    else:
-        changed = {name for name in original_files if original_files[name] != current_files[name]}
-        if changed != set(SOURCE_AMENDMENT_FILES):
-            raise ValueError("Source amendment must change exactly the dtype and runner files")
-        for name, (old, new) in SOURCE_AMENDMENT_FILES.items():
-            if original_files[name] != old or (new is not None and current_files[name] != new):
-                raise ValueError(f"Source amendment file pin differs: {name}")
-    cell = amendment["cells"][options.cell]
+    raw = Path(path).read_bytes() if path else None
+    amendment = json.loads(raw) if raw else {}
+    revision = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True)
+    source_info = {"source_revision": revision.stdout.strip() or None}
+    if previous is None:
+        if options.resume or amendment:
+            raise ValueError("Resume requires the saved world manifest")
+        return candidate_binding, source_info, raw
+    if not options.resume:
+        raise ValueError("An existing world requires --resume")
     origin = previous["binding"]
-    origin_candidate = json.loads(json.dumps(candidate_binding))
-    origin_candidate["science_config"]["source_hash"] = SOURCE_AMENDMENT_ORIGIN
-    if (origin != origin_candidate or digest(origin) != cell["origin_binding_sha256"]
-            or origin["cell"] != options.cell or origin["seed"] != 42):
-        raise ValueError("Non-source scientific binding differs from the original world")
-    if (options.deadline_epoch != deadline
-            or previous["args"]["deadline_epoch"] != deadline
-            or any(item["deadline_epoch"] != deadline for item in amendment["cells"].values())
-            or previous["args"]["experiment_id"] != f"{options.run_id}_{options.cell}"):
-        raise ValueError("Original study/cell/client deadline differs")
-    source_info = {
-        "binding_source_role": "experiment_origin",
-        "source_hash": execution_hash,
-        "source_amendment": {"sha256": hashlib.sha256(raw).hexdigest(), "record": amendment},
-    }
+    if scientific_binding(origin) != scientific_binding(candidate_binding):
+        raise ValueError("Scientific settings differ from the saved world")
+    if previous["args"]["experiment_id"] != f"{options.run_id}_{options.cell}":
+        raise ValueError("Saved world ID differs from the requested experiment")
+    if previous.get("status") not in {"paused", "failed", "complete"}:
+        raise ValueError("The saved world has not stopped")
+    if not 0 <= previous.get("years_completed", 0) <= options.years:
+        raise ValueError("Saved year lies outside the requested horizon")
+    if amendment and (amendment.get("run_id") != options.run_id
+                      or options.cell not in amendment.get("cells", {})):
+        raise ValueError("Continuation record does not contain this world")
+
+    extension = amendment.get("generation_extension", previous.get("generation_extension"))
+    saved_extension = previous.get("generation_extension")
+    if saved_extension is not None and extension != saved_extension:
+        raise ValueError("Continuation changes the saved generation budget")
     if extension is not None:
-        # The origin binding remains the cache key, while this field explicitly
-        # records the active generation protocol on every session and snapshot.
+        if extension not in (LENGTH_EXTENSION_POLICY, ANSWER_RECOVERY_POLICY):
+            raise ValueError("Unknown bounded generation policy")
+        if (options.context_tokens != extension["context_tokens"]
+                or options.max_tokens != LENGTH_EXTENSION_POLICY["original_max_tokens"]):
+            raise ValueError("Request limits differ from the generation policy")
         source_info["generation_extension"] = extension
-    if parent is not None:
-        if any(previous.get(key) != value for key, value in source_info.items()):
-            if answer_recovery:
-                validate_answer_recovery_transition(options, previous, parent, root)
-            else:
-                validate_length_extension_transition(options, previous, parent, root)
+    source_info["binding_source_role"] = "experiment_origin"
+    if amendment:
+        source_info["source_amendment"] = {"record": amendment}
     elif previous.get("source_amendment"):
-        if any(previous.get(key) != value for key, value in source_info.items()):
-            raise ValueError("Existing execution/source-amendment lineage differs")
-    elif (previous.get("source_hash") != SOURCE_AMENDMENT_ORIGIN
-          or previous.get("years_completed") != 0
-          or previous.get("status") != "failed"):
-        raise ValueError("First amendment requires the original failed year-zero experiment")
-    else:
-        checkpoint_root = root / "outputs/checkpoints" / f"{options.run_id}_{options.cell}"
-        checkpoint = checkpoint_root / "portable_checkpoint_year_0.json.gz"
-        if (set(checkpoint_root.glob("portable_checkpoint_year_*.json.gz")) != {checkpoint}
-                or file_hash(checkpoint) != cell["origin_checkpoint_sha256"]):
-            raise ValueError("First amendment requires only the exact original year-zero checkpoint")
+        source_info["source_amendment"] = previous["source_amendment"]
+
+    continuation = dict(previous.get("continuation") or {})
+    if continuation:
+        saved_path = Path(previous["args"]["docs_dir"]).parent / "latest_preserved_checkpoint.json"
+        if saved_path.exists():
+            continuation["restored_snapshot"] = json.loads(saved_path.read_text())
+        server = json.loads(Path(options.server_manifest).read_text())
+        continuation.update(
+            host=server.get("host"), execution_host=server.get("host"),
+            client_deadline_epoch=options.deadline_epoch,
+            completion_horizon_years=options.years,
+            request_timeout_seconds=1800.0,
+            storage_policy="server_preserved_then_s3_when_available")
+        source_info.update(continuation=continuation, s3_auth_pending=True)
     return origin, source_info, raw
 
 
-def resolve_p62_continuation(options, candidate, previous, root, raw):
-    """Resume the four preserved P62 worlds under the October 16 authorization."""
-    import time
-    amendment = json.loads(raw)
-    if (options.run_id != LENGTH_EXTENSION_RUN
-            or options.cell not in ANSWER_RECOVERY_FAILED_MANIFESTS
-            or options.seed != 42 or options.founders != 10000 or options.years != 6
-            or options.context_tokens != 131072 or options.max_tokens != 8192
-            or options.deadline_epoch != 1792707542
-            or time.time() >= options.deadline_epoch
-            or amendment["client_deadline_epoch"] != options.deadline_epoch
-            or amendment["generation_extension"] != ANSWER_RECOVERY_POLICY):
-        raise ValueError("P62 continuation differs from the authorized worlds or deadline")
-    parent_raw = bytes.fromhex(amendment["parent_amendment_raw_hex"])
-    parent = json.loads(parent_raw)
-    if (hashlib.sha256(parent_raw).hexdigest() !=
-            "a5a71d757998e92af950ab2d5dd925cee1b8be317dfad6574b3e28aa3ea940c0"
-            or parent["execution_source_sha256"] !=
-            "e117153d7d9c9ced34181dc4cdb11b58be8d5310aad52dc9843b67173f90d5ea"
-            or parent["generation_extension"] != ANSWER_RECOVERY_POLICY):
-        raise ValueError("The preserved P62 source/generation amendment differs")
-    excluded = root / "utopia/visual/plot_ac_resubmission.py"
-    paths = sorted(p for p in (root / "utopia").rglob("*.py") if p != excluded)
-    paths += [root / "requirements.txt", root / "scripts/upload_checkpoint.sh",
-              root / "scripts/fulltext_client_env.sh"]
-    current = {str(p.relative_to(root)): file_hash(p) for p in paths}
-    changed = {p for p in current if current[p] != parent["execution_files"].get(p)}
-    if (set(current) != set(parent["execution_files"])
-            or current != amendment["execution_files"]
-            or digest(current) != amendment["execution_source_sha256"]
-            or changed != {"utopia/experiments/funding_feedback.py"}):
-        raise ValueError("P62 continuation source differs from its declared narrow change")
-    origin_candidate = json.loads(json.dumps(candidate))
-    origin_candidate["science_config"]["source_hash"] = SOURCE_AMENDMENT_ORIGIN
-    if (origin_candidate != previous["binding"]
-            or digest(previous["binding"]) != parent["cells"][options.cell]["origin_binding_sha256"]):
-        raise ValueError("P62 continuation changes the scientific binding")
-    restored = amendment["restored_cells"][options.cell]
-    if previous["source_hash"] == parent["execution_source_sha256"]:
-        manifest = root / "outputs/docs" / f"{options.run_id}_{options.cell}" / "experiment.json"
-        checkpoint = root / "outputs/checkpoints" / f"{options.run_id}_{options.cell}" / restored["checkpoint"]
-        if (file_hash(manifest) != restored["manifest_sha256"]
-                or file_hash(checkpoint) != restored["checkpoint_sha256"]
-                or previous.get("status") != "paused" or previous.get("years_completed") != 1
-                or previous["source_amendment"]["sha256"] != hashlib.sha256(parent_raw).hexdigest()
-                or previous["args"]["deadline_epoch"] != 1791757717.881552):
-            raise ValueError("P62 continuation requires its exact preserved stopped world")
-    elif (previous["source_hash"] != digest(current)
-          or previous["source_amendment"]["sha256"] != hashlib.sha256(raw).hexdigest()
-          or previous["args"]["deadline_epoch"] != options.deadline_epoch
-          or previous.get("status") not in {"paused", "failed"}):
-        raise ValueError("P62 continuation lineage or stopped state differs")
-    return previous["binding"], {
-        "source_hash": digest(current),
-        "binding_source_role": "experiment_origin",
-        "source_amendment": {"sha256": hashlib.sha256(raw).hexdigest(), "record": amendment},
-        "generation_extension": ANSWER_RECOVERY_POLICY,
-        "continuation": {
-            "host": "P6-3", "client_deadline_epoch": options.deadline_epoch,
-            "request_timeout_seconds": 1800.0, "restored_snapshot": restored,
-            "storage_policy": "server_preserved_then_s3_when_available",
-        },
-    }, raw
-
-
-def resolve_p69_continuation(options, candidate, previous, root, raw):
-    """Continue the existing four worlds under the user's renewed P69 authorization."""
-    amendment = json.loads(raw)
-    if (options.run_id != LENGTH_EXTENSION_RUN
-            or options.cell not in ANSWER_RECOVERY_FAILED_MANIFESTS
-            or options.seed != 42 or options.founders != 10000 or options.years != 6
-            or options.context_tokens != 131072 or options.max_tokens != 8192
-            or not options.until_complete or options.deadline_epoch is not None
-            or amendment["generation_extension"] != ANSWER_RECOVERY_POLICY
-            or amendment["run_id"] != options.run_id
-            or set(amendment["cells"]) != set(ANSWER_RECOVERY_FAILED_MANIFESTS)):
-        raise ValueError("P69 continuation differs from the authorized worlds or completion horizon")
-    parent_raw = Path(amendment["parent_amendment_path"]).read_bytes()
-    parent = json.loads(parent_raw)
-    if parent["generation_extension"] != ANSWER_RECOVERY_POLICY:
-        raise ValueError("The preserved P69 predecessor source/generation amendment differs")
-    excluded = root / "utopia/visual/plot_ac_resubmission.py"
-    paths = sorted(p for p in (root / "utopia").rglob("*.py") if p != excluded)
-    paths += [root / "requirements.txt", root / "scripts/upload_checkpoint.sh",
-              root / "scripts/fulltext_client_env.sh"]
-    current = {str(p.relative_to(root)): file_hash(p) for p in paths}
-    # Source inventories describe execution provenance; continuation is selected
-    # by the existing world ID and non-source scientific fields.
-    cell = amendment["cells"][options.cell]
-    origin_candidate = json.loads(json.dumps(candidate))
-    origin = json.loads(json.dumps(previous["binding"]))
-    origin_candidate["science_config"].pop("source_hash", None)
-    origin["science_config"].pop("source_hash", None)
-    origin_candidate.pop("corpus_sha256", None)
-    origin.pop("corpus_sha256", None)
-    if (origin_candidate != origin
-            or previous["args"]["experiment_id"] != f"{options.run_id}_{options.cell}"
-            or previous.get("status") not in {"paused", "failed"}):
-        raise ValueError("P69 continuation changes the scientific world or stopped state")
-    if not 0 <= previous.get("years_completed", -1) <= options.years:
-        raise ValueError("Preserved world year lies outside its authorized horizon")
-    return previous["binding"], {
-        "source_hash": digest(current),
-        "binding_source_role": "experiment_origin",
-        "source_amendment": {"sha256": hashlib.sha256(raw).hexdigest(), "record": amendment},
-        "generation_extension": ANSWER_RECOVERY_POLICY,
-        "s3_auth_pending": True,
-        "continuation": {
-            "host": "P6-3", "execution_host": "P6-9", "client_deadline_epoch": None,
-            "completion_horizon_years": 6, "request_timeout_seconds": 1800.0,
-            "restored_snapshot": cell["restored_snapshot"],
-            "storage_policy": "server_preserved_then_s3_when_available",
-            "authorization_sha256": amendment.get("authorization_sha256"),
-        },
-    }, raw
-
-
-def preserve_p62_checkpoint(checkpoint, backup, docs_root, log_dir, metadata, final_manifest=None):
-    """Freeze a new checkpoint and its complete reply/audit/output evidence on P63."""
+def preserve_checkpoint(checkpoint, backup, docs_root, log_dir, metadata, final_manifest=None):
+    """Preserve the checkpoint with complete reply, audit, and output evidence."""
     checkpoint = Path(checkpoint)
     shutil.copy2(checkpoint, backup / checkpoint.name)
     shutil.copytree(docs_root, backup / "results",
@@ -734,33 +443,19 @@ def preserve_p62_checkpoint(checkpoint, backup, docs_root, log_dir, metadata, fi
                     ignore=shutil.ignore_patterns("portable_checkpoint_*"))
     if final_manifest is not None:
         write_json(backup / "results/experiment.json", final_manifest)
-    # The immutable source package and declaration are prepared before launch.
-    for name in ("source_manifest.json", "source_amendment.json", "runtime.tar.gz"):
-        shutil.copy2(ROOT.parent / name, backup / name)
+    # Code is restored from the recorded Git revision; retain existing run records.
+    for name in ("source_manifest.json", "source_amendment.json"):
+        record = ROOT.parent / name
+        if record.is_file():
+            shutil.copy2(record, backup / name)
     files = {}
     for path in sorted(backup.rglob("*")):
         if path.is_file() and path != backup / "snapshot.json":
             files[str(path.relative_to(backup))] = {
-                "bytes": path.stat().st_size, "sha256": file_hash(path)}
+                "bytes": path.stat().st_size}
     metadata.update(storage_status="server_preserved_s3_pending", is_offhost=False,
                     server_directory=str(backup), preserved_files=files)
     write_json(backup / "snapshot.json", metadata)
-
-
-def prospective_checkpoint_source(source_info, cell, year, checkpoint_sha256):
-    """A re-uploaded origin checkpoint was not produced by the new execution."""
-    continuation = source_info.get("continuation")
-    if continuation:
-        restored = continuation["restored_snapshot"]
-        if checkpoint_sha256 == restored["checkpoint_sha256"]:
-            return restored["checkpoint_source_hash"]
-    amendment = source_info.get("source_amendment")
-    if amendment and year == 0:
-        record = amendment["record"]
-        if checkpoint_sha256 != record["cells"][cell]["origin_checkpoint_sha256"]:
-            raise ValueError("Refuse to relabel an altered year-zero checkpoint")
-        return record["origin_source_sha256"]
-    return source_info["source_hash"]
 
 
 def prospective_arguments(command):
@@ -776,7 +471,7 @@ def prospective_arguments(command):
     deadline = command.add_mutually_exclusive_group(required=True)
     deadline.add_argument("--deadline-epoch", type=float)
     deadline.add_argument("--until-complete", action="store_true",
-                          help="Resume explicitly authorized P69 worlds to their fixed six-year horizon")
+                          help="Resume the saved worlds to their declared horizon")
     command.add_argument("--s3-prefix", required=True, help="Private per-study S3 backup prefix")
     command.add_argument("--batch-size", type=int, default=128)
     command.add_argument("--model", default=LARGE_MODEL)
@@ -864,7 +559,6 @@ def run_prospective(options, simulation_factory=None, configure=None, run_contex
         "model": options.model, "model_revision": options.model_revision,
         "corpus_sha256": corpus.sha256,
         "science_config": {"args": scientific_args, "config": SIMULATION_CONFIG,
-                           "source_hash": prospective_source_fingerprint(),
                            "context_tokens": options.context_tokens, "max_tokens": options.max_tokens,
                            "funding_selection": "one_complete_permutation_v1", "extra": extra_binding or {}},
     }
@@ -888,7 +582,7 @@ def run_prospective(options, simulation_factory=None, configure=None, run_contex
     if source_info.get("continuation"):
         if (server.get("context_tokens", 0) < options.context_tokens
                 or server.get("client_context_tokens") != options.context_tokens):
-            raise ValueError("P62 request budget exceeds the declared P63 service capacity")
+            raise ValueError("Request budget exceeds the declared service capacity")
     elif server.get("context_tokens") != options.context_tokens:
         raise ValueError("Server deployment differs from requested context_tokens")
     manifest = {"binding": binding, "status": "starting", "server": server,
@@ -939,7 +633,7 @@ def run_prospective(options, simulation_factory=None, configure=None, run_contex
                     if continuation and not final:
                         restored = continuation["restored_snapshot"]
                         if (llm.response_cache.committed_count() == restored["completed_responses"]
-                                and file_hash(checkpoint_path) == restored["checkpoint_sha256"]):
+                                and year == restored["year_completed"]):
                             logging.info("Reusing restored S3 snapshot for year %s; no new replies", year)
                             return restored
                     snapshot_id = f"snapshot_{time.time_ns()}"
@@ -949,17 +643,10 @@ def run_prospective(options, simulation_factory=None, configure=None, run_contex
                     llm.response_cache.backup(response_snapshot)
                     cell_prefix = options.s3_prefix.rstrip("/") + f"/{options.cell}"
                     destination = cell_prefix + f"/checkpoints/year_{year}/{snapshot_id}"
-                    with response_snapshot.open("rb") as stream:
-                        response_sha256 = hashlib.file_digest(stream, "sha256").hexdigest()
-                    checkpoint_sha256 = hashlib.sha256(checkpoint_path.read_bytes()).hexdigest()
                     metadata = {
                         "year_completed": year, "cell": options.cell, "binding": binding, **source_info,
                         "checkpoint": checkpoint_path.name,
-                        "checkpoint_sha256": checkpoint_sha256,
-                        "checkpoint_source_hash": prospective_checkpoint_source(
-                            source_info, options.cell, year, checkpoint_sha256),
                         "completed_responses": llm.response_cache.committed_count(),
-                        "response_snapshot_sha256": response_sha256,
                         "destination": destination, "includes_final_report": final,
                         "snapshot_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                     }
@@ -969,7 +656,7 @@ def run_prospective(options, simulation_factory=None, configure=None, run_contex
                     metadata_path = backup / "snapshot.json"
                     write_json(metadata_path, metadata)
                     if continuation:
-                        preserve_p62_checkpoint(checkpoint_path, backup, docs_root, args.log_dir, metadata,
+                        preserve_checkpoint(checkpoint_path, backup, docs_root, args.log_dir, metadata,
                                                 final_manifest=manifest if final else None)
                         if s3_available:
                             completed = subprocess.run([

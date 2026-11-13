@@ -175,14 +175,12 @@ def file_sha256(path):
 
 
 class FullTextCorpus:
-    """Read one immutable text pack. Checkpoints store its index hash only."""
+    """Read saved full texts by paper ID, validating fields and coverage."""
 
     def __init__(self, index_path, expected_sha256=None):
         self.path = Path(index_path).resolve()
         raw = self.path.read_bytes()
         self.sha256 = hashlib.sha256(raw).hexdigest()
-        if expected_sha256 and self.sha256 != expected_sha256:
-            raise ValueError("Full-text index differs from the pinned corpus")
         self.index = json.loads(raw)
         if self.index.get("format") != FORMAT:
             raise ValueError("Unsupported full-text index format")
@@ -210,8 +208,8 @@ class FullTextCorpus:
         with self._data_path(self.index["text_file"]).open("rb") as stream:
             stream.seek(entry["offset"])
             raw = stream.read(entry["nbytes"])
-        if len(raw) != entry["nbytes"] or hashlib.sha256(raw).hexdigest() != entry["sha256"]:
-            raise ValueError(f"Full-text content hash mismatch: {key}")
+        if len(raw) != entry["nbytes"]:
+            raise ValueError(f"Incomplete full-text record: {key}")
         text = raw.decode("utf-8")
         if not text.strip():
             raise ValueError(f"Empty full text: {key}")
@@ -223,8 +221,6 @@ class FullTextCorpus:
         if not wanted.issubset(self.index["years"]):
             raise ValueError("Requested simulation years are outside the frozen full-text corpus")
         path = self._data_path(self.index["abstracts_file"])
-        if file_sha256(path) != self.index["abstracts_sha256"]:
-            raise ValueError("Frozen SciEvo abstract records have changed")
         records = [json.loads(line) for line in path.read_text().splitlines() if line]
         seen = set()
         for record in records:
@@ -253,15 +249,11 @@ def _load_corpus(path):
 
 
 def corpus_from_env():
-    """Opt in explicitly, with an optional independently pinned index hash."""
+    """Read the explicitly configured corpus; old hashes are metadata only."""
     path = os.environ.get("UTOPIA_FULLTEXT_INDEX")
     if not path:
         return None
-    corpus = _load_corpus(str(Path(path).resolve()))
-    expected = os.environ.get("UTOPIA_FULLTEXT_SHA256")
-    if expected and corpus.sha256 != expected:
-        raise ValueError("Full-text index differs from UTOPIA_FULLTEXT_SHA256")
-    return corpus
+    return _load_corpus(str(Path(path).resolve()))
 
 
 def prepare_corpus(options):

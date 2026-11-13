@@ -55,7 +55,7 @@ def main():
                         df['mean'] + 1.96 * df['sem'],
                         color=PALETTE[regime], alpha=0.12, linewidth=0)
         ends[regime] = df['mean'].iloc[-1]
-    
+
     """
     # Annotate the end value
     for regime, y in ends.items():
@@ -64,8 +64,8 @@ def main():
                     textcoords='offset points', va='center', fontsize=6,
                     color=INK)
     """
-        
-    
+
+
     ax.set_xticks(range(2, 11, 2))
     ax.margins(x=0.04)
     ax.set_xlabel('Acceptance year')

@@ -30,7 +30,8 @@ import subprocess
 import sys
 import threading
 import time
-from types import ModuleType
+import tempfile
+from types import ModuleType, SimpleNamespace
 from typing import Dict, List, Optional, Tuple, Union
 import unittest
 from unittest.mock import patch
@@ -69,7 +70,7 @@ def compile_nodes(nodes, namespace, filename):
 def client_definitions():
     path = ROOT / "utopia/models/models.py"
     tree = ast.parse(path.read_text())
-    names = {"BaseLLM", "VLLMServerModel", "parse_json_response"}
+    names = {"BaseLLM", "VLLMServerModel", "parse_json_response", "encode_message_text"}
     nodes = [n for n in tree.body if isinstance(n, (ast.ClassDef, ast.FunctionDef))
              and n.name in names]
     assert {n.name for n in nodes} == names
@@ -419,6 +420,88 @@ print(json.dumps(value))
         for visible, hidden in zip(payloads["P1F1"], payloads["P0F1"]):
             self.assertEqual({k: v for k, v in visible.items() if k != "messages"},
                              {k: v for k, v in hidden.items() if k != "messages"})
+
+
+class TestPortableContinuation(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.binding = {
+            "protocol": "fixture-v1", "cell": "P0F0", "seed": 42,
+            "model": "fixture-model", "model_revision": "fixture-revision",
+            "corpus_sha256": "old-index",
+            "science_config": {"source_hash": "old-code", "founders": 10000},
+        }
+
+    def test_changed_metadata_reuses_saved_reply_ids(self):
+        from utopia.models.response_cache import CompletedResponseCache
+        from utopia.runtime.checkpointing import PortableCheckpointError
+
+        class Response:
+            def model_dump(self, **kwargs):
+                return {"value": "saved", "model": "fixture-model"}
+
+        path = self.root / "responses.sqlite"
+        options = dict(model="fixture-model", seed=7, messages=[{"content": "old"}])
+        cache = CompletedResponseCache(path, binding=self.binding,
+                                       _response_factory=lambda data: SimpleNamespace(**data))
+        cache.create(lambda **kwargs: Response(), seed_ctx=("review", 6), **options)
+        cache.close()
+        changed = deepcopy(self.binding)
+        changed.pop("corpus_sha256")
+        changed["science_config"].pop("source_hash")
+        cache = CompletedResponseCache(path, binding=changed,
+                                       _response_factory=lambda data: SimpleNamespace(**data))
+        self.addCleanup(cache.close)
+        with patch.object(self, "fail") as unexpected_call:
+            reply = cache.create(lambda **kwargs: unexpected_call("recomputed saved ID"),
+                                 seed_ctx=("review", 6),
+                                 **dict(options, messages=[{"content": "updated"}]))
+            unexpected_call.assert_not_called()
+        self.assertEqual(reply.value, "saved")
+        self.assertTrue(reply._portable_cache_hit)
+        self.assertEqual(cache.committed_count(), 1)
+        changed["science_config"]["founders"] = 500
+        with self.assertRaises(PortableCheckpointError):
+            CompletedResponseCache(path, binding=changed)
+
+    def test_resume_preserves_world_and_generation_budget(self):
+        from utopia.experiments.funding_feedback import (
+            ANSWER_RECOVERY_POLICY, resolve_prospective_source,
+        )
+        from utopia.runtime.checkpointing import PortableCheckpointError
+
+        options = SimpleNamespace(resume=True, source_amendment=None,
+                                  run_id="saved", cell="P0F0", years=6,
+                                  context_tokens=131072, max_tokens=8192)
+        previous = {"binding": self.binding, "args": {"experiment_id": "saved_P0F0"},
+                    "status": "paused", "years_completed": 5,
+                    "generation_extension": ANSWER_RECOVERY_POLICY}
+        candidate = deepcopy(self.binding)
+        candidate.pop("corpus_sha256")
+        candidate["science_config"]["source_hash"] = "new-code"
+        binding, source, _ = resolve_prospective_source(
+            options, candidate, previous, root=ROOT)
+        self.assertEqual(binding, self.binding)
+        self.assertEqual(source["generation_extension"], ANSWER_RECOVERY_POLICY)
+        for field, value in (("cell", "P1F1"), ("seed", 43)):
+            wrong = deepcopy(candidate)
+            wrong[field] = value
+            with self.assertRaises((ValueError, PortableCheckpointError)):
+                resolve_prospective_source(options, wrong, previous, root=ROOT)
+        options.max_tokens = 16384
+        with self.assertRaises(ValueError):
+            resolve_prospective_source(options, candidate, previous, root=ROOT)
+
+    def test_stop_precedes_audit_tokenization_and_http(self):
+        from utopia.runtime.checkpointing import PortableStop, RunStop
+        stop = RunStop()
+        stop.request_stop()
+        client = object.__new__(Client)
+        client.response_cache = SimpleNamespace(stop=stop)
+        with self.assertRaises(PortableStop):
+            client._create_completion(messages=[{"content": "unused"}])
 
 
 if __name__ == "__main__":

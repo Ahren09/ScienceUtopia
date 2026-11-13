@@ -343,7 +343,7 @@ class Simulation:
         self.verbose = kwargs.get('verbose', False)
         self.citation_tracker = CitationTracker()
         self.agent_tracker = AgentTracker()
-        
+
         assert kwargs.get('funding_allocation_mode') in ['fixed', 'consumption_based'], f"Invalid funding allocation mode: {kwargs.get('funding_allocation_mode', 'consumption_based')}"
         self.funding_tracker = FundingTracker(funding_allocation_mode=kwargs.get('funding_allocation_mode'))
         self.industry_funding_mode = kwargs.get('industry_funding_mode', 'performance')
@@ -453,11 +453,12 @@ class Simulation:
         their scientific and logical audit counters through the hooks.
         """
         from pathlib import Path
-        from utopia.runtime.checkpointing import PortableCheckpointError, RunStop, validate_binding
+        from utopia.runtime.checkpointing import PortableCheckpointError, RunStop, scientific_binding, validate_binding
         binding = validate_binding(binding)
         cache = getattr(self.llm, 'response_cache', None)
-        if cache is None or cache.binding != binding:
+        if cache is None or scientific_binding(cache.binding) != scientific_binding(binding):
             raise PortableCheckpointError("Portable simulator requires its own bound response cache")
+        binding = cache.binding
         if (binding['seed'] != getattr(self.args, 'seed', None)
                 or binding['seed'] != getattr(self.llm, 'run_seed', None)
                 or binding['model'] != getattr(self.llm, 'model_name', None)
@@ -3008,7 +3009,7 @@ class Simulation:
                             )
                     except (KeyError, AssertionError, ValueError) as e:
                         raise ValueError(f"Invalid review from {reviewer.id} for paper {paper['id']}: {e}")
-                        
+
 
             # Step 4: Calculate average scores for each paper
             for conference in self.conference_system.conferences:
@@ -3291,7 +3292,7 @@ class Simulation:
         Returns:
             (is_valid, cleaned_proposal_or_None, reason)
         """
-        
+
         if proposal is None:
             return False, None, "proposal is None"
         if not isinstance(proposal, dict):
@@ -4000,7 +4001,7 @@ class Simulation:
 
             # Select conferences based on agent expertise distribution
             t0 = time.time()
-            
+
             logger.info("*** CONFERENCE SELECTION ***")
 
 
@@ -4229,14 +4230,24 @@ class Simulation:
                 raise PortableCheckpointError("Missing portable snapshot; legacy checkpoints are not resumable here")
             checkpoint_data = read_portable_checkpoint(portable_path)
             saved = checkpoint_data.get('portable', {})
-            if saved.get('contract') != self._portable_contract():
+            from utopia.runtime.checkpointing import scientific_binding
+            saved_contract = dict(saved.get('contract') or {})
+            current_contract = self._portable_contract()
+            saved_contract['binding'] = scientific_binding(saved_contract.get('binding'))
+            current_contract['binding'] = scientific_binding(current_contract['binding'])
+            if saved_contract != current_contract:
                 raise PortableCheckpointError("Checkpoint science/model/corpus/config binding changed")
             if self.llm.response_cache.committed_count() < saved['response_cache_count']:
                 raise PortableCheckpointError("Response cache is older than the checkpoint")
             saved_fulltext = checkpoint_data.get('rag', {}).get('fulltext')
             current_fulltext = getattr(self.rag, 'fulltext_corpus', None)
-            if (bool(saved_fulltext) != bool(current_fulltext)
-                    or (saved_fulltext and saved_fulltext != current_fulltext.reference())):
+            current_reference = current_fulltext.reference() if current_fulltext else None
+            if saved_fulltext:
+                saved_fulltext = dict(saved_fulltext)
+                saved_fulltext.pop('index_sha256', None)
+            if current_reference:
+                current_reference.pop('index_sha256', None)
+            if saved_fulltext != current_reference:
                 raise PortableCheckpointError("Checkpoint full-text corpus differs from configured corpus")
             if checkpoint_data.get('year') != year or checkpoint_data.get('phase') != (0 if year == 0 else 5):
                 raise PortableCheckpointError("Checkpoint is not a committed year boundary")

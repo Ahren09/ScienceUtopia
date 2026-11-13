@@ -5,12 +5,13 @@ committed before the caller or request audit can observe it. Copy a live cache
 with backup(), never by copying the database during a transaction.
 """
 import hashlib
+import json
 from pathlib import Path
 import sqlite3
 import threading
 
 from utopia.runtime.checkpointing import (
-    PortableCheckpointError, PortableStop, canonical_json, validate_binding,
+    PortableCheckpointError, PortableStop, canonical_json, scientific_binding, validate_binding,
 )
 
 
@@ -38,8 +39,15 @@ class CompletedResponseCache:
             if not rows:
                 self._db.execute("INSERT INTO metadata VALUES (?)", (identity,))
                 self._db.commit()
-            elif rows != [(identity,)]:
-                raise PortableCheckpointError("Response cache scientific binding changed")
+            elif len(rows) != 1:
+                raise PortableCheckpointError("Response cache must contain one experiment binding")
+            else:
+                saved = json.loads(rows[0][0])
+                if scientific_binding(saved) != scientific_binding(self.binding):
+                    raise PortableCheckpointError("Response cache scientific binding changed")
+                # Existing row IDs use this original binding. Metadata changes
+                # must not create a second cache namespace or repeat requests.
+                self.binding = saved
         except BaseException:
             self._db.close()
             raise

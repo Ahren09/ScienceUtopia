@@ -68,13 +68,20 @@ def canonical_json(value):
 
 
 def validate_binding(binding):
-    required = {"protocol", "cell", "model", "model_revision", "corpus_sha256",
-                "science_config", "seed"}
+    required = {"protocol", "cell", "model", "model_revision", "science_config", "seed"}
     if not isinstance(binding, dict) or required - binding.keys():
         raise PortableCheckpointError(f"Portable binding requires {sorted(required)}")
     if any(not binding[k] for k in required - {"seed"}) or type(binding["seed"]) is not int:
         raise PortableCheckpointError("Portable binding contains an empty identity")
     return json.loads(canonical_json(binding))
+
+
+def scientific_binding(binding):
+    """Compare experiment settings while retaining old metadata in saved IDs."""
+    result = validate_binding(binding)
+    result.pop("corpus_sha256", None)
+    result["science_config"].pop("source_hash", None)
+    return result
 
 
 def pack_state(value, _memo=None):

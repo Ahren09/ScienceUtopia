@@ -637,10 +637,12 @@ class VLLMServerModel(BaseLLM):
         return build_vllm_extra_body(schema, enable_thinking=self.enable_thinking)
 
     def _create_completion(self, *, seed_ctx=None, item_index=0, attempt=0, **payload):
+        cache = getattr(self, 'response_cache', None)
+        if cache is not None and cache.stop is not None:
+            cache.stop.check()
         # Audit and HTTP must see identical UTF-8 text; histories remain untouched.
         payload["messages"] = encode_message_text(payload["messages"])
         audit = self.request_audit
-        cache = getattr(self, 'response_cache', None)
         callback = self.client.chat.completions.create
         if cache is not None:
             raw_callback = callback
@@ -901,7 +903,8 @@ class VLLMServerModel(BaseLLM):
 
         start_time = time.time()
         results = [None] * len(prompts)
-        with ThreadPoolExecutor(max_workers=self.max_concurrent_requests) as executor:
+        executor = ThreadPoolExecutor(max_workers=self.max_concurrent_requests)
+        try:
             futures = {executor.submit(_call_single, (i, p)): i for i, p in enumerate(prompts)}
             for future in tqdm(as_completed(futures), total=len(prompts), desc=label):
                 idx, result, n_retries, success, tokens = future.result()
@@ -914,6 +917,8 @@ class VLLMServerModel(BaseLLM):
                     self.call_stats['n_first_attempt_success'] += 1
                 if not success:
                     self.call_stats['n_failures'] += 1
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
         self.call_stats['elapsed_seconds'] += time.time() - start_time
 
         logger.info(f"Batch generation complete: {len(results)} responses")
