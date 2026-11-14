@@ -342,6 +342,83 @@ print(json.dumps(value))
         self.assertEqual(wire.payloads, [])
         self.assertEqual(client.call_stats["n_prompts"], 0)
 
+    def test_review_required_fields_reuse_cached_attempts_and_only_fill_missing_id(self):
+        from utopia.models.response_cache import CompletedResponseCache
+
+        truncated = '{\n    "overall_score": 3.5'
+        valid = {"overall_score": 3.5, "justification": "Complete review."}
+        client, wire = self.make_client(WireRecorder(
+            lambda body, index: truncated if index == 0 else json.dumps(valid)))
+        fmt = next(value for value in FORMATS.values()
+                   if value["json_object"]["schema"]["title"] == "PaperReview")
+        ctx = ("phase3_reviews", 6)
+        prompts = ["incomplete review", "saved complete review"]
+        with tempfile.TemporaryDirectory() as directory:
+            cache = CompletedResponseCache(Path(directory) / "responses.sqlite", binding={
+                "protocol": "fixture-v1", "cell": "P1F0", "seed": 42,
+                "model": client.model_name, "model_revision": "fixture-revision",
+                "corpus_sha256": "fixture", "science_config": {"founders": 10000},
+            })
+            try:
+                client.response_cache = cache
+                for index, prompt in enumerate(prompts):
+                    extra = dict(client._build_extra_body(fmt),
+                                 seed=SEED_MODULE.derive_seed(42, *ctx, index, 0))
+                    client._create_completion(
+                        seed_ctx=ctx, item_index=index, attempt=0,
+                        model=client.model_name, temperature=0.7, max_tokens=8192,
+                        messages=[{"role": "user", "content": f"{IMPORTANT_NOTES}\n\n{prompt}"}],
+                        extra_body=extra)
+                saved = cache._db.execute(
+                    "SELECT identity, data FROM replies ORDER BY rowid").fetchall()
+                options = dict(response_format=fmt, seed_ctx=ctx,
+                               system_prompt=None, max_tokens=8192)
+                result = client.generate_batch(prompts, **options)
+                self.assertEqual([value for value, _ in result], [valid, valid])
+                self.assertEqual(len(wire.payloads), 3)
+                self.assertEqual(wire.payloads[-1]["seed"],
+                                 SEED_MODULE.derive_seed(42, *ctx, 0, 1))
+                self.assertEqual(
+                    {k: v for k, v in wire.payloads[-1].items() if k != "seed"},
+                    {k: v for k, v in wire.payloads[0].items() if k != "seed"})
+                self.assertEqual(cache.committed_count(), 3)
+                for identity, data in saved:
+                    self.assertEqual(cache._db.execute(
+                        "SELECT data FROM replies WHERE identity=?", (identity,)).fetchone()[0], data)
+                client.generate_batch(prompts, **options)
+                self.assertEqual(len(wire.payloads), 3)
+                self.assertEqual(cache.committed_count(), 3)
+            finally:
+                cache.close()
+
+    def test_review_required_fields_keep_original_attempt_and_recovery_limits(self):
+        fmt = next(value for value in FORMATS.values()
+                   if value["json_object"]["schema"]["title"] == "PaperReview")
+        ctx = ("phase3_reviews", 6)
+
+        def create(callback, *, seed_ctx, item_index, attempt, **payload):
+            return callback(**payload)
+
+        for recovery in (False, True):
+            with self.subTest(recovery=recovery):
+                client, wire = self.make_client(WireRecorder(
+                    lambda body, index: '{"overall_score": 3.5}'))
+                if recovery:
+                    client.answer_recovery_max_tokens = 32768
+                    client.request_audit = SimpleNamespace(
+                        context_tokens=131072, create=create,
+                        count_input=lambda messages, template: (11, None))
+                result = client.generate_batch(
+                    ["incomplete review"], response_format=fmt, seed_ctx=ctx, max_tokens=8192)
+                self.assertIsNone(result[0][0])
+                attempts = [0, 1, 2, 4] if recovery else [0, 1, 2]
+                self.assertEqual([body["seed"] for body in wire.payloads],
+                                 [SEED_MODULE.derive_seed(42, *ctx, 0, i) for i in attempts])
+                if recovery:
+                    self.assertEqual(wire.payloads[-1]["chat_template_kwargs"],
+                                     {"enable_thinking": False})
+                    self.assertEqual(wire.payloads[-1]["max_tokens"], 32768)
+
     def test_concurrent_batch_preserves_result_order_and_item_seeds(self):
         def respond(body, index):
             return json.dumps({"prompt": body["messages"][-1]["content"]})

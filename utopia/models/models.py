@@ -798,6 +798,12 @@ class VLLMServerModel(BaseLLM):
         if self.max_tokens_override is not None:
             max_tokens = self.max_tokens_override
         base_extra_body = self._build_extra_body(response_format)
+        review_fields = ("overall_score", "justification")
+        schema = (response_format or {}).get("json_object", {}).get("schema", {})
+        validate_review_fields = (
+            seed_ctx and seed_ctx[0] == "phase3_reviews"
+            and all(field in schema.get("required", []) for field in review_fields)
+        )
 
         max_retries = 3
         extend_length = getattr(self, 'length_exhaustion_max_tokens', None) is not None
@@ -873,6 +879,13 @@ class VLLMServerModel(BaseLLM):
                         response_json = parse_json_response(response_text)
                     if response_json is None and (response_format is not None or getattr(self, 'response_cache', None) is not None):
                         raise ValueError("Parsed JSON is None but structured output was expected")
+                    # Check the existing required review fields before accepting
+                    # an item, including replayed or answer-recovery replies.
+                    if validate_review_fields and (
+                        not isinstance(response_json, dict)
+                        or not all(field in response_json for field in review_fields)
+                    ):
+                        raise ValueError("Peer review JSON must contain overall_score and justification")
                     success = True
                     break
                 except Exception as e:
