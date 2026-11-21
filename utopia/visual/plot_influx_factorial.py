@@ -41,15 +41,8 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from utopia.visual.common import (
-    GRID,
-    INK,
-    MUTED,
-    VIVID_COOL,
-    VIVID_GOLD,
-    VIVID_WARM,
-    nature_style,
-)
+from utopia.visual.common import (GRID, INK, MUTED, VIVID_COOL, VIVID_GOLD,
+                                       VIVID_WARM, nature_style)
 
 DEFAULT_STATS = {
     'A': 'outputs/docs/resubmission_stats_influx2x2_A_noinflux_noresub_seed42/resubmission_stats.json',
@@ -78,22 +71,22 @@ CELL_NICE = {
 FIRST_COLOR, RESUB_COLOR = VIVID_GOLD, VIVID_WARM
 
 
-def series(stats: dict, field: str, years) -> list:
+def _series(stats: dict, field: str, years) -> list:
     d = stats[field]
     return [d.get(y, d.get(str(y), 0)) for y in years]
 
 
-def factorial_lines(ax, stats_by_cell, field, years):
+def _factorial_lines(ax, stats_by_cell, field, years):
     for cell in CELL_ORDER:
-        ax.plot(years, series(stats_by_cell[cell], field, years),
+        ax.plot(years, _series(stats_by_cell[cell], field, years),
                 linewidth=1.2, label=CELL_NICE[cell], **CELL_STYLE[cell])
 
 
-def end_labels(ax, stats_by_cell, field, years, fmt, offsets):
+def _end_labels(ax, stats_by_cell, field, years, fmt, offsets):
     """Direct year-10 value labels at line ends (D bold)."""
     x = years[-1]
     for cell in CELL_ORDER:
-        y = series(stats_by_cell[cell], field, years)[-1]
+        y = _series(stats_by_cell[cell], field, years)[-1]
         ax.annotate(fmt(y), xy=(x, y), xytext=(4, offsets.get(cell, 0)),
                     textcoords='offset points', ha='left', va='center',
                     fontsize=6, color=CELL_STYLE[cell]['color'],
@@ -101,8 +94,8 @@ def end_labels(ax, stats_by_cell, field, years, fmt, offsets):
 
 
 def volume_panel(ax, stats_by_cell: dict, years):
-    factorial_lines(ax, stats_by_cell, 'submissions_per_year', years)
-    end_labels(ax, stats_by_cell, 'submissions_per_year', years,
+    _factorial_lines(ax, stats_by_cell, 'submissions_per_year', years)
+    _end_labels(ax, stats_by_cell, 'submissions_per_year', years,
                 lambda v: f'{v:,.0f}', {'A': -2, 'B': 0, 'C': 2, 'D': 0})
     ax.set_xlabel('Year', labelpad=1)
     ax.set_ylabel('Submission events')
@@ -124,6 +117,8 @@ def composition_panel(ax, stats: dict, years):
            label='First submissions', edgecolor='white', linewidth=0.3)
     ax.bar(years, resubs, bottom=firsts, width=0.72, color=RESUB_COLOR,
            label='Resubmissions', edgecolor='white', linewidth=0.3)
+    total10 = firsts[-1] + resubs[-1]
+    share = resubs[-1] / total10 * 100
 
     ax.margins(y=0.12)
     ax.set_xlabel('Year', labelpad=1)
@@ -136,8 +131,8 @@ def composition_panel(ax, stats: dict, years):
 
 
 def burden_panel(ax, stats_by_cell: dict, years):
-    factorial_lines(ax, stats_by_cell, 'reviews_per_active_reviewer_by_year', years)
-    end_labels(ax, stats_by_cell, 'reviews_per_active_reviewer_by_year', years,
+    _factorial_lines(ax, stats_by_cell, 'reviews_per_active_reviewer_by_year', years)
+    _end_labels(ax, stats_by_cell, 'reviews_per_active_reviewer_by_year', years,
                 lambda v: f'{v:.2f}', {'A': 4, 'B': -4, 'C': 2, 'D': -2})
     ax.set_xlabel('Year', labelpad=1)
     ax.set_ylabel('Reviews per active reviewer')
